@@ -845,6 +845,27 @@ describe('Router · 路由表（会话级）', () => {
 });
 
 describe('Router · 路由表（机器级）', () => {
+  test('session.create 指定不支持的引擎：拒绝，不建会话', async () => {
+    const h = await makeHarness();
+    await h.router.handle(
+      { type: 'session.create', ...c2a(), reqId: 'q', cwd: '/a', model: 'm', permissionMode: 'default', engine: 'nope' },
+      phone,
+    );
+    expect(h.created).toHaveLength(0);
+    expect(h.byType('session.create.response')).toHaveLength(0);
+    expect(h.byType('error.fatal')[0]).toMatchObject({ kind: 'config' });
+  });
+
+  test('session.create 显式指定 claude 与省略等价', async () => {
+    const h = await makeHarness();
+    await h.router.handle(
+      { type: 'session.create', ...c2a(), reqId: 'q', cwd: '/a', model: 'm', permissionMode: 'default', engine: 'claude' },
+      phone,
+    );
+    expect(h.created).toHaveLength(1);
+    expect(h.byType('session.create.response')).toHaveLength(1);
+  });
+
   test('session.create → acquire + 机器级 session.create.response（reqId）+ 记 state', async () => {
     const h = await makeHarness();
     await h.router.handle(
@@ -2197,6 +2218,17 @@ describe('Router · 回退', () => {
     h.state.rememberSession('old', params);
     return h;
   }
+
+  test('引擎不支持回退：预览与执行都回 unavailable，不回退', async () => {
+    const h = await rewindHarness();
+    await h.router.handle({ type: 'input.send', ...c2a('old'), clientMsgId: 'c1', text: 'hi' }, phone);
+    (h.created[0] as unknown as { rewindBlocker: unknown }).rewindBlocker = undefined;
+    await h.router.handle({ type: 'session.rewind.preview', ...c2a('old'), reqId: 'p1', targetMessageId: 'u1' }, phone);
+    await h.router.handle({ type: 'session.rewind', ...c2a('old'), reqId: 'r1', targetMessageId: 'u1', mode: 'both' }, phone);
+    expect(h.byType('session.rewind.preview.response')[0]).toMatchObject({ ok: false, error: { code: 'unavailable' } });
+    expect(h.byType('session.rewind.response')[0]).toMatchObject({ ok: false, error: { code: 'unavailable' } });
+    expect(h.byType('session.rewound')).toHaveLength(0);
+  });
 
   test('预览：定向回请求方；对话与代码都可用，路径相对 cwd，不改任何东西', async () => {
     const h = await rewindHarness();

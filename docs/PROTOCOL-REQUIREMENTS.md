@@ -293,6 +293,14 @@ agent 侧所有产出 SessionMeta 的出口（list、session.created、session.u
 - `push_hint: run_done | run_error` → 同理
 - 开放：会话名要进推送就得让 server 知道明文名 → 折衷：client 配对时给每个会话生成推送别名？或推送只报机器名（原型文案按机器名 + 事件类型即可成立）
 
+## 8. 多引擎（agent ≥ 0.21.0）
+
+- `machine.info.engines[]`：机器上的引擎（`id`、`displayName`、`version`、`available`、`capabilities`）。缺失 = 旧 agent，只有 Claude Code。
+- `SessionMeta.engine`：创建后不变，省略 = Claude Code。`SessionMeta.engineMode`：非 Claude 引擎自己的权限模式，这类会话以它为准，`permissionMode` 只是给旧 client 的近似值。Claude 会话不用它：Claude 引擎忽略收到的 `engineMode`，以 `permissionMode` 为准。
+- `session.create` 可带 `engine`、`engineMode`；不支持的引擎回 `error.fatal`（`kind: config`），不建会话。`session.setPermissionMode` 可带 `engineMode`。
+- 引擎 id 和 `engineMode` 是开放字符串，不做枚举；原因见 DECISIONS D20。
+- 引擎不支持的请求由 agent 拒绝：回退回 `unavailable`，刷新 context 回 `failed`。
+
 ## 协议约定汇总
 
 1. ✅ **离线态**：方案 A（排队发送 + 可撤回 + 默认 24h TTL 可配置）

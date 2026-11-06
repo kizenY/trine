@@ -55,6 +55,8 @@ import {
   ExtWirePickItemSchema,
   ExtWireViewSchema,
   HistoryItemSchema,
+  EngineIdSchema,
+  EngineModeSchema,
   MachineInfoSchema,
   MachineStatsSchema,
   McpServerStatusSchema,
@@ -796,6 +798,10 @@ export const SessionCreateSchema = z.object({
   cwd: z.string().min(1),
   model: z.string().min(1),
   permissionMode: PermissionModeSchema,
+  /** 新建到哪个引擎（multi-engine，agent ≥ 0.21.0）；省略 = Claude Code */
+  engine: EngineIdSchema.optional(),
+  /** 非 Claude 引擎自己的权限模式，见 SessionMeta.engineMode；Claude 忽略 */
+  engineMode: EngineModeSchema.optional(),
 });
 
 /**
@@ -932,6 +938,8 @@ export const SessionSetPermissionModeSchema = z.object({
   type: z.literal('session.setPermissionMode'),
   ...c2aBase,
   mode: PermissionModeSchema,
+  /** 非 Claude 引擎自己的权限模式，见 SessionMeta.engineMode；Claude 忽略 */
+  engineMode: EngineModeSchema.optional(),
 });
 
 export const SessionSetCwdSchema = z.object({

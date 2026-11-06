@@ -113,6 +113,7 @@
  * 期间只有 `input.queued`。回显的位置因此就是它真正进入对话的位置，client 也能据
  * 回显判断「撤回来不及了」。没执行就离开队列的（撤回 / 停止）发 `input.cancelled`。
  */
+import type { EngineSession } from '../engine/types.ts';
 import { randomUUID } from 'node:crypto';
 import {
   query,
@@ -274,7 +275,7 @@ interface Round {
  * 生命周期：`constructor` → 首次 `send()` 惰性起 query → 多轮 → `close()`。
  * 起进程是惰性的：新建会话但没发消息时不该占着一个子进程。
  */
-export class ClaudeSession {
+export class ClaudeSession implements EngineSession {
   readonly sessionId: string;
   #cwd: string;
   #model: string;

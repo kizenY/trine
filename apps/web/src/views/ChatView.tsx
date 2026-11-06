@@ -91,6 +91,7 @@ import {
   type UserEntry,
 } from '@/lib/reducer.ts';
 import { timelineKey } from '@/lib/storage.ts';
+import { capabilitiesOf } from '@/lib/engine-model.ts';
 import { formatCost } from '@/lib/format.ts';
 import { waitingForOfTool } from '@/lib/waiting.ts';
 import { ExtHeadEntry, ExtPanelSheet } from '@/components/ext/ExtPanel.tsx';
@@ -306,11 +307,14 @@ export function ChatView(): React.JSX.Element {
   // ---------------------------------------------------------------------
 
   const attach = useAttachmentDrafts(key);
-  const attachDisabledReason = agentSupportsAttachments(machine?.info?.agentVersion)
-    ? undefined
-    : machine?.info === undefined
+  const engineCaps = capabilitiesOf(machine?.info, meta);
+  const attachDisabledReason = !agentSupportsAttachments(machine?.info?.agentVersion)
+    ? machine?.info === undefined
       ? '还不知道这台 agent 的版本，暂时不能添加附件'
-      : '这台 agent 版本过旧（需要 0.11.0 以上），不支持附件';
+      : '这台 agent 版本过旧（需要 0.11.0 以上），不支持附件'
+    : engineCaps.attachments === true
+      ? undefined
+      : '这个引擎不支持附件';
 
   const send = useCallback(
     (text: string) => {
@@ -455,6 +459,7 @@ export function ChatView(): React.JSX.Element {
     client !== null &&
     machine?.online === true &&
     agentSupportsRewind(machine.info?.agentVersion) &&
+    (engineCaps.rewind?.length ?? 0) > 0 &&
     !running &&
     bgRunning === 0;
   const openRewind = useCallback((entry: UserEntry) => setRewindTarget(entry), []);
@@ -511,7 +516,7 @@ export function ChatView(): React.JSX.Element {
             { label: '模型', value: res.model === '' ? '默认' : res.model },
             { label: '工作目录', value: res.cwd },
             { label: '权限模式', value: res.permissionMode },
-            { label: '本会话成本', value: formatCost(res.costUsd) },
+            ...(engineCaps.cost === true ? [{ label: '本会话成本', value: formatCost(res.costUsd) }] : []),
             {
               label: '上下文',
               value:
@@ -709,9 +714,13 @@ export function ChatView(): React.JSX.Element {
           runningToolId={runningToolId}
           runningElapsedMs={runningElapsedMs}
           handlers={handlers}
-          planOptions={agentSupportsPlanOptions(machine?.info?.agentVersion)}
+          planOptions={agentSupportsPlanOptions(machine?.info?.agentVersion) && engineCaps.planMode === true}
           // machine.info 还没到时不下「版本过旧」的结论（评审 m4）
-          subagentHistory={machine?.info == null ? null : agentSupportsSubagentHistory(machine.info.agentVersion)}
+          subagentHistory={
+            machine?.info == null
+              ? null
+              : agentSupportsSubagentHistory(machine.info.agentVersion) && engineCaps.subagentHistory === true
+          }
           onRewind={canRewind ? openRewind : undefined}
           records={extRecords}
           recordsHideOlder={timeline.history?.hasMore === true}
@@ -742,52 +751,58 @@ export function ChatView(): React.JSX.Element {
       )}
       {running && hbView !== null && <HeartbeatFooter view={hbView} />}
 
-      <Composer
-        value={draft}
-        onChange={(text) => setDraft(key, text)}
-        onSend={send}
-        onStop={() => client?.stopRun(machineId, sessionId)}
-        onSlashPick={onSlashPick}
-        running={running}
-        // 离线提示只此一处（评审 m6）：会话页里同屏两条同义提示（顶部横幅 +
-        // 这一条）。留贴着输入行为的这条，顶部横幅在会话页不再出；排队数并进来，
-        // 免得两处各说一半
-        offlineHint={offline ? composerOfflineHint(machine) : null}
-        sources={{
-          slashCommands: caps?.slashCommands ?? [],
-          ...(onRename === undefined ? { unavailable: ['rename'] as const } : {}),
-        }}
-        snippets={prefs.promptSnippets}
-        onManageSnippets={() => navigate('/settings')}
-        sendKey={prefs.sendKey}
-        pending={pendingEntries.length > 0 ? <PendingTray entries={pendingEntries} onAction={onPendingAction} /> : undefined}
-        insertRequest={insertRequest}
-        extraPicker={
-          composerExts !== null && composerExts.length > 0
-            ? {
-                label: composerPickerLabel(composerExts),
-                render: (close) => (
-                  <ExtComposerPicker
-                    machineId={machineId}
-                    sessionId={sessionId}
-                    extensions={composerExts}
-                    onClose={close}
-                    onInsert={(text) => setInsertRequest((r) => ({ id: (r?.id ?? 0) + 1, text }))}
-                  />
-                ),
-              }
-            : undefined
-        }
-        onEditLast={editLastPending}
-        attachments={{
-          drafts: attach.drafts,
-          ready: attach.ready,
-          onAdd: attach.add,
-          onRemove: attach.remove,
-          onRetry: attach.retry,
-          disabledReason: attachDisabledReason,
-        }}
-      />
+      {engineCaps.interactive !== true ? (
+        <p className="text-text-3 px-4 py-3 text-center text-[13px]" data-testid="composer-readonly">
+          这个会话目前只能查看，不能在 trine 里发消息
+        </p>
+      ) : (
+        <Composer
+          value={draft}
+          onChange={(text) => setDraft(key, text)}
+          onSend={send}
+          onStop={() => client?.stopRun(machineId, sessionId)}
+          onSlashPick={onSlashPick}
+          running={running}
+          // 离线提示只此一处（评审 m6）：会话页里同屏两条同义提示（顶部横幅 +
+          // 这一条）。留贴着输入行为的这条，顶部横幅在会话页不再出；排队数并进来，
+          // 免得两处各说一半
+          offlineHint={offline ? composerOfflineHint(machine) : null}
+          sources={{
+            slashCommands: caps?.slashCommands ?? [],
+            ...(onRename === undefined ? { unavailable: ['rename'] as const } : {}),
+          }}
+          snippets={prefs.promptSnippets}
+          onManageSnippets={() => navigate('/settings')}
+          sendKey={prefs.sendKey}
+          pending={pendingEntries.length > 0 ? <PendingTray entries={pendingEntries} onAction={onPendingAction} /> : undefined}
+          insertRequest={insertRequest}
+          extraPicker={
+            composerExts !== null && composerExts.length > 0
+              ? {
+                  label: composerPickerLabel(composerExts),
+                  render: (close) => (
+                    <ExtComposerPicker
+                      machineId={machineId}
+                      sessionId={sessionId}
+                      extensions={composerExts}
+                      onClose={close}
+                      onInsert={(text) => setInsertRequest((r) => ({ id: (r?.id ?? 0) + 1, text }))}
+                    />
+                  ),
+                }
+              : undefined
+          }
+          onEditLast={editLastPending}
+          attachments={{
+            drafts: attach.drafts,
+            ready: attach.ready,
+            onAdd: attach.add,
+            onRemove: attach.remove,
+            onRetry: attach.retry,
+            disabledReason: attachDisabledReason,
+          }}
+        />
+      )}
 
       {dragging && (
         <div
@@ -881,7 +896,7 @@ function InfoCardSlot({
       <InfoCard
         title="会话状态"
         rows={card.rows}
-        foot="本地即时渲染——数据来自 agent 的状态上报，不往返 Claude、不产生成本"
+        foot="本地即时渲染——数据来自 agent 的状态上报，不往返模型、不产生成本"
         onDismiss={onDismiss}
       />
     );

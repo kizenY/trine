@@ -52,7 +52,7 @@ export function runStateNote(entry: RunStateEntry): { text: string; tone: 'muted
     case 'running':
       return entry.detail === undefined || entry.detail === ''
         ? null
-        : { text: `⟳ ${entry.detail}，Claude 继续`, tone: 'muted', testId: 'entry-run-trigger' };
+        : { text: `⟳ ${entry.detail}，继续运行`, tone: 'muted', testId: 'entry-run-trigger' };
     default:
       return null;
   }

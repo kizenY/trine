@@ -16,7 +16,7 @@ import type { PermissionMode, SessionState } from '@trine/core';
 import { waitingForTool } from '@trine/core/permission';
 import type { CreateSessionArgs } from '../bridge/manager.ts';
 import type { PendingPermissionSnapshot, PermissionVerdict } from '../bridge/permission.ts';
-import type { ClaudeSession } from '../bridge/session.ts';
+import type { EngineSession } from '../engine/types.ts';
 import type { EventBody } from '../bridge/types.ts';
 import { AgentApp, type AgentAppDeps } from '../app/app.ts';
 import type { SpawnFn } from '../app/claude-cli.ts';
@@ -28,7 +28,7 @@ import { FakeTranscripts } from './fake-transcripts.ts';
  * `plan:` 开头的挂一个 ExitPlanMode（input.plan = 冒号后文本），批准后与真 CLI
  * 同形：权限模式切到 setMode（没给则 default）并回调 onMeta。
  */
-export class EchoSession {
+export class EchoSession implements EngineSession {
   state: SessionState = 'idle';
   costUsd = 0;
   /**
@@ -55,6 +55,10 @@ export class EchoSession {
   ) {
     this.lastActivityAt = now();
     this.#permissionMode = args.permissionMode;
+  }
+
+  get permissionMode(): PermissionMode {
+    return this.#permissionMode;
   }
 
   get sessionId(): string {
@@ -295,7 +299,7 @@ export async function startEchoAgent(
       options.commandsQueryFn ??
       ((() => ({ supportedCommands: async () => [], close: () => {} })) as unknown as typeof query),
     createSession: (args) =>
-      new EchoSession(args, args.emit, undefined, recording) as unknown as ClaudeSession,
+      new EchoSession(args, args.emit, undefined, recording),
     restart: options.restart ?? {
       env: {},
       repoRoot: null,

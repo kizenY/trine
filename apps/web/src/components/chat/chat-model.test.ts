@@ -340,9 +340,9 @@ describe('permissionResultText', () => {
 
   test('失效态给原因与恢复办法', () => {
     const r = permissionResultText(perm({ state: 'invalidated', reason: 'agent 重启' }), 'web-1');
-    expect(r.text).toBe('⌀ 请求已失效（agent 重启）——如需继续，直接发消息让 Claude 重试');
+    expect(r.text).toBe('⌀ 请求已失效（agent 重启）——如需继续，直接发消息让它重试');
     expect(permissionResultText(perm({ state: 'invalidated' }), 'web-1').text).toBe(
-      '⌀ 请求已失效——如需继续，直接发消息让 Claude 重试',
+      '⌀ 请求已失效——如需继续，直接发消息让它重试',
     );
   });
 });

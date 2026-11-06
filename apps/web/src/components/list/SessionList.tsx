@@ -24,6 +24,7 @@ import { useLocation } from 'react-router';
 import { ChevronRightIcon, MoreHorizontalIcon, PinIcon } from 'lucide-react';
 import type { SessionMeta } from '@trine/core';
 import type { MachineState } from '@/store/types.ts';
+import { capabilitiesOf } from '@/lib/engine-model.ts';
 import { cn } from '@/lib/utils.ts';
 import { Button } from '@/components/ui/button.tsx';
 import {
@@ -260,6 +261,7 @@ export function SessionList({
         meta={meta}
         variant={variant}
         showMachine={showMachine}
+        showCost={capabilitiesOf(machines[machineId]?.info, meta).cost === true}
         active={location.pathname === `/s/${machineId}/${meta.sessionId}`}
         {...(linkState === undefined ? {} : { linkState })}
         {...(now === undefined ? {} : { now })}

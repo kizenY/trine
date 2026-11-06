@@ -55,7 +55,7 @@ export function RenameDialog({
       <DialogContent data-testid="rename-dialog" className="max-w-[min(28rem,calc(100vw-2rem))]">
         <DialogHeader>
           <DialogTitle>重命名会话</DialogTitle>
-          <DialogDescription>与本机 claude 的 /rename 同一份标题，所有设备可见。</DialogDescription>
+          <DialogDescription>与本机 CLI 里看到的是同一份标题，所有设备可见。</DialogDescription>
         </DialogHeader>
         <form
           onSubmit={(e) => {

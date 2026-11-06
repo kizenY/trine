@@ -35,7 +35,7 @@ import { FileAccess } from '../files/access.ts';
 import { FileService } from '../files/service.ts';
 import { EventEmitter } from '../bridge/emitter.ts';
 import { SessionManager, type CreateSessionArgs } from '../bridge/manager.ts';
-import type { ClaudeSession } from '../bridge/session.ts';
+import type { EngineSession } from '../engine/types.ts';
 import { createHeadlessProbe, type HeadlessProbe } from '../bridge/session-origin.ts';
 import type { EventBody, OutboundEvent } from '../bridge/types.ts';
 import { SessionLinksStore } from '../ext/links-store.ts';
@@ -61,6 +61,7 @@ import {
   type SpawnFn,
 } from './claude-cli.ts';
 import { ClaudeLatestChecker } from './claude-latest.ts';
+import { claudeEngineSummary } from '../engine/claude.ts';
 import { AGENT_VERSION, buildMachineInfo } from './machine-info.ts';
 import {
   findUp,
@@ -92,7 +93,7 @@ function headlessProbeOption(deps: AgentAppDeps): { headlessProbe?: HeadlessProb
 
 export interface AgentAppDeps {
   /** 注入假会话工厂（测试） */
-  createSession?: (args: CreateSessionArgs) => ClaudeSession;
+  createSession?: (args: CreateSessionArgs) => EngineSession;
   listSessionsFn?: typeof listSessions;
   getSessionInfoFn?: typeof getSessionInfo;
   renameSessionFn?: typeof renameSession;
@@ -615,6 +616,7 @@ export class AgentApp {
       restart: this.#restart === undefined ? undefined : this.#restartInfo(),
       claudeLatest: this.#claudeLatest?.current,
       files: this.#filesMaxBytes === undefined ? undefined : { maxBytes: this.#filesMaxBytes },
+      engines: [claudeEngineSummary(this.claudeVersion)],
     });
   }
 

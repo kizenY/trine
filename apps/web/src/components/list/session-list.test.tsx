@@ -594,3 +594,34 @@ describe('临时会话提示', () => {
     expect(onShowTemp.mock.calls).toEqual([[false]]);
   });
 });
+
+describe('引擎能力：费用', () => {
+  test('引擎不回报费用的会话不显示费用；Claude 会话照常', () => {
+    const list = (engineMeta: SessionMeta, info: unknown) => {
+      const withInfo = { m: { ...machines.m, info } } as unknown as Record<string, MachineState>;
+      return (
+        <SessionList sessions={{ m: { a: engineMeta } }} machines={withInfo} query={{ ...DEFAULT_LIST_QUERY, groupBy: 'none' }} now={2} />
+      );
+    };
+    const engines = [
+      { id: 'claude', displayName: 'Claude Code', available: true, capabilities: { cost: true } },
+      { id: 'other', displayName: 'Other', available: true, capabilities: {} },
+    ];
+    const show = (element: React.ReactElement): string => {
+      host = document.createElement('div');
+      document.body.appendChild(host);
+      root = createRoot(host);
+      router = createMemoryRouter([{ path: '*', element }], { initialEntries: ['/'] });
+      act(() => root!.render(<RouterProvider router={router!} />));
+      const text = host.textContent ?? '';
+      act(() => root!.unmount());
+      host.remove();
+      root = null;
+      host = null;
+      router = null;
+      return text;
+    };
+    expect(show(list(meta({ sessionId: 'a', costUsd: 1.5 }), { engines }))).toContain('1.5');
+    expect(show(list(meta({ sessionId: 'a', costUsd: 1.5, engine: 'other' }), { engines }))).not.toContain('1.5');
+  });
+});

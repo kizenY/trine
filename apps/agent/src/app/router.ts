@@ -105,6 +105,7 @@ import type {
   McpServerStatus,
   SlashCommand,
 } from '@trine/core';
+import { CLAUDE_ENGINE_ID } from '@trine/core';
 import { AttachmentError, type AttachmentStore, type PreparedInput } from '../bridge/attachments.ts';
 import { FileAccessError } from '../files/access.ts';
 import type { FileService } from '../files/service.ts';
@@ -123,7 +124,7 @@ import {
   type SessionManager,
   type SessionSeed,
 } from '../bridge/manager.ts';
-import type { ClaudeSession } from '../bridge/session.ts';
+import { isRewindable, type EngineSession } from '../engine/types.ts';
 import type { EventBody, EventBodyOf } from '../bridge/types.ts';
 import { LinkLimitError, type SessionLinksStore } from '../ext/links-store.ts';
 import type { SessionRecordsStore } from '../ext/records-store.ts';
@@ -324,7 +325,7 @@ export class Router {
   /** 命令链：key = sessionId 或 MACHINE_CHAIN */
   readonly #chains = new Map<string, Promise<void>>();
   /** 正在 resume 中的会话（链外去重） */
-  readonly #resolving = new Map<string, Promise<ClaudeSession | undefined>>();
+  readonly #resolving = new Map<string, Promise<EngineSession | undefined>>();
   /** run.resumeAt 定时器，同会话覆盖 */
   readonly #resumeTimers = new Map<string, unknown>();
   #listCache: { at: number; promise: Promise<Map<string, ListedSession>> } | undefined =
@@ -699,6 +700,7 @@ export class Router {
           this.#deps.emitter.emit(body, sessionId, { to: sender.deviceId });
         };
         try {
+          if (session.refreshContextNow === undefined) throw new Error('这个引擎不支持刷新 context 用量');
           const context = await session.refreshContextNow();
           reply({ type: 'session.context.response', reqId: event.reqId, ok: true, context });
         } catch (err) {
@@ -820,7 +822,9 @@ export class Router {
     event: Extract<ClientToAgentEvent, { type: 'session.history.request' }>,
     sender: Recipient,
   ): Promise<void> {
-    const pending = this.#deps.manager.get(sessionId)?.pendingRewind ?? this.#deps.state.pendingRewind(sessionId);
+    const live = this.#deps.manager.get(sessionId);
+    const pending =
+      (live !== undefined && isRewindable(live) ? live.pendingRewind : undefined) ?? this.#deps.state.pendingRewind(sessionId);
     const messages = cutAtRewind(await this.#readTranscript(sessionId), pending?.dropFrom);
     const attachments = (await this.#deps.attachments?.historyIndex(sessionId)) ?? new Map();
     const page = paginateHistory(toHistoryItems(messages, attachments), { before: event.before, limit: event.limit });
@@ -918,7 +922,7 @@ export class Router {
   /** 回退预览 / 执行（见文件头「回退」） */
   async #rewind(
     sessionId: string,
-    session: ClaudeSession,
+    session: EngineSession,
     event: Extract<ClientToAgentEvent, { type: 'session.rewind.preview' | 'session.rewind' }>,
     sender: Recipient,
   ): Promise<void> {
@@ -934,6 +938,16 @@ export class Router {
       this.#log(`[router] ${event.type} 失败 session=${sessionId}: ${message}`);
       return { ok: false as const, error: { code: 'io' as const, message: `agent 处理失败：${message}`.slice(0, 300) } };
     };
+    // 能力在 agent 端强制：旧标签页可能对不支持回退的引擎发请求
+    if (!isRewindable(session)) {
+      const error = { code: 'unavailable' as const, message: '这个引擎不支持回退' };
+      reply(
+        event.type === 'session.rewind.preview'
+          ? { type: 'session.rewind.preview.response', reqId: event.reqId, ok: false, error }
+          : { type: 'session.rewind.response', reqId: event.reqId, ok: false, error },
+      );
+      return;
+    }
     if (event.type === 'session.rewind.preview') {
       const result = await previewRewind(deps, session, event.targetMessageId).catch(failed);
       reply({ type: 'session.rewind.preview.response', reqId: event.reqId, ...result });
@@ -1014,7 +1028,7 @@ export class Router {
 
   /** 只作用于已活跃实例的三类事件 */
   async #dispatchActive(
-    session: ClaudeSession,
+    session: EngineSession,
     event: SessionEvent,
     sender: Recipient,
   ): Promise<void> {
@@ -1055,7 +1069,7 @@ export class Router {
    * 运行中改不了）。运行中 / 等权限 / 有排队消息时拒绝：release 会作废挂起的
    * 权限请求、丢掉排队消息，那是「静默丢用户输入」，宁可让用户等跑完再切。
    */
-  async #setCwd(sessionId: string, session: ClaudeSession, cwd: string): Promise<void> {
+  async #setCwd(sessionId: string, session: EngineSession, cwd: string): Promise<void> {
     const busy =
       session.state === 'running' ||
       session.state === 'waiting_permission' ||
@@ -1081,7 +1095,7 @@ export class Router {
       permissionMode: meta.permissionMode,
       started,
     };
-    const rewindPoint = session.pendingRewind;
+    const rewindPoint = isRewindable(session) ? session.pendingRewind : undefined;
     manager.acquire({ sessionId, ...params, resume: started, ...(rewindPoint === undefined ? {} : { rewindPoint }) });
     state.rememberSession(sessionId, params);
     // acquire(resume:true) 不广播，这里手动发 session.updated 让所有 client 看到新 cwd
@@ -1120,7 +1134,7 @@ export class Router {
    * 取活跃实例；没有就按需 resume（见文件头）。返回 undefined 表示已向 client
    * 报了机器级 error.fatal，调用方直接返回即可。
    */
-  resolveSession(sessionId: string): Promise<ClaudeSession | undefined> {
+  resolveSession(sessionId: string): Promise<EngineSession | undefined> {
     // 永久删除过的会话绝不复活（链上的帧已在 #handleSession 拦下，这里兜链外调用者）
     if (this.#deps.flags.isDeleted(sessionId)) {
       this.#log(`[router] 拒绝 resume 已删除的会话 ${sessionId}`);
@@ -1138,7 +1152,7 @@ export class Router {
     return task;
   }
 
-  async #resume(sessionId: string): Promise<ClaudeSession | undefined> {
+  async #resume(sessionId: string): Promise<EngineSession | undefined> {
     let params: SessionParams | undefined;
     try {
       params = await this.#lookupParams(sessionId);
@@ -1268,6 +1282,10 @@ export class Router {
     const { manager, cwdStore } = this.#deps;
     switch (event.type) {
       case 'session.create': {
+        if (event.engine !== undefined && event.engine !== CLAUDE_ENGINE_ID) {
+          this.#emitMachine({ type: 'error.fatal', kind: 'config', message: `这台机器不支持引擎 ${event.engine}` });
+          return;
+        }
         let sessionId: string;
         try {
           sessionId = await this.#createSession(event.cwd, event.model, event.permissionMode);

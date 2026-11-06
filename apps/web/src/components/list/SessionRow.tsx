@@ -39,6 +39,7 @@ export function SessionRow({
   meta,
   variant = 'full',
   showMachine = true,
+  showCost = true,
   active = false,
   now,
   menu,
@@ -54,6 +55,8 @@ export function SessionRow({
   variant?: 'full' | 'compact';
   /** 「全部」过滤下才有意义 */
   showMachine?: boolean;
+  /** 显示费用：引擎不回报费用时为 false（D12：不显示没有的数字） */
+  showCost?: boolean;
   /** PC 侧栏：当前打开的会话高亮 */
   active?: boolean;
   /** 注入「现在」便于测试与统一刷新节拍 */
@@ -166,7 +169,7 @@ export function SessionRow({
               {meta.links.length > 1 && <span className="text-text-3 shrink-0">+{meta.links.length - 1}</span>}
             </span>
           )}
-          {!compact && (
+          {!compact && showCost && (
             <span className="text-text-3 tabular shrink-0 font-mono text-[11px]">
               {formatCost(meta.costUsd)}
             </span>

@@ -63,6 +63,18 @@ export const ContextUsageSchema = z.object({
 });
 export type ContextUsage = z.infer<typeof ContextUsageSchema>;
 
+/** Claude Code 的引擎 id；`SessionMeta.engine` 省略时就是它 */
+export const CLAUDE_ENGINE_ID = 'claude';
+
+/**
+ * 引擎 id（multi-engine，DECISIONS D20）。「引擎」是真正跑模型的编码 agent（Claude Code、
+ * Codex）。用开放字符串而不是枚举：帧是整体校验的，枚举里多一个值会让旧 client 丢掉整帧。
+ */
+export const EngineIdSchema = z.string().min(1).max(64);
+
+/** 引擎自己的权限模式 id，含义由该引擎解释（见 SessionMeta.engineMode） */
+export const EngineModeSchema = z.string().min(1).max(64);
+
 /** 会话列表条目 / 会话元数据快照 */
 export const SessionMetaSchema = z.object({
   sessionId: z.string().min(1),
@@ -125,6 +137,13 @@ export const SessionMetaSchema = z.object({
    * session-links.json；省略 = 没有关联 / 旧 agent。
    */
   links: z.array(SessionLinkSchema).max(64).optional(),
+  /** 会话所属引擎（multi-engine 新增，可选）。创建后不变；省略 = Claude Code */
+  engine: EngineIdSchema.optional(),
+  /**
+   * 引擎自己的权限模式（multi-engine 新增，可选）。带了就以它为准，`permissionMode` 只是给旧
+   * client 看的近似值；Claude 会话不带，`permissionMode` 就是真值。
+   */
+  engineMode: EngineModeSchema.optional(),
 });
 export type SessionMeta = z.infer<typeof SessionMetaSchema>;
 
@@ -376,6 +395,41 @@ export const MachineFilesInfoSchema = z.object({
 });
 export type MachineFilesInfo = z.infer<typeof MachineFilesInfoSchema>;
 
+/** 回退能恢复的内容，对应回退对话框的选项 */
+export const EngineRewindTargetSchema = z.enum(['code', 'conversation', 'both']);
+export type EngineRewindTarget = z.infer<typeof EngineRewindTargetSchema>;
+
+/**
+ * 引擎能力（multi-engine）。只描述「这个引擎能不能做」；旧 agent 能不能做仍由 client 按
+ * agentVersion 判断，两者都满足才显示入口。agent 端同样校验，client 隐藏入口只是体验。
+ * 全部可选、缺省为不支持：新增能力时，旧 agent 不发就是没有。
+ */
+export const EngineCapabilitiesSchema = z.object({
+  /** 能在 trine 里发消息；否则会话只读 */
+  interactive: z.boolean().optional(),
+  rewind: z.array(EngineRewindTargetSchema).max(3).optional(),
+  backgroundTasks: z.boolean().optional(),
+  planMode: z.boolean().optional(),
+  /** 回报美元费用（D12：不回报就不显示，不填 0） */
+  cost: z.boolean().optional(),
+  subagentHistory: z.boolean().optional(),
+  attachments: z.boolean().optional(),
+});
+export type EngineCapabilities = z.infer<typeof EngineCapabilitiesSchema>;
+
+/** 机器上的一个引擎 */
+export const EngineSummarySchema = z.object({
+  id: EngineIdSchema,
+  displayName: z.string().min(1).max(64),
+  version: z.string().max(64).optional(),
+  /** 能新建和续接会话 */
+  available: z.boolean(),
+  /** available 为 false 的原因（给人看） */
+  unavailableReason: z.string().max(300).optional(),
+  capabilities: EngineCapabilitiesSchema,
+});
+export type EngineSummary = z.infer<typeof EngineSummarySchema>;
+
 /** 机器信息（E2E 密文内） */
 export const MachineInfoSchema = z.object({
   name: z.string(),
@@ -399,6 +453,8 @@ export const MachineInfoSchema = z.object({
   claudeLatest: MachineClaudeLatestSchema.optional(),
   /** 文件查看（file-viewer 新增，可选；agent ≥ 0.20.0）。缺失 = 不支持或已关闭，client 隐藏文件入口 */
   files: MachineFilesInfoSchema.optional(),
+  /** 机器上的引擎（multi-engine 新增，可选；agent ≥ 0.21.0）。缺失 = 旧 agent，只有 Claude Code */
+  engines: z.array(EngineSummarySchema).max(16).optional(),
 });
 export type MachineInfo = z.infer<typeof MachineInfoSchema>;
 

@@ -17,7 +17,8 @@ import { relative, isAbsolute } from 'node:path';
 import type { SessionMessage } from '@anthropic-ai/claude-agent-sdk';
 import type { RewindErrorCode, RewindFilesStat, RewindMode } from '@trine/core';
 import { cutAtRewind, humanUserText } from '../bridge/history.ts';
-import type { ClaudeSession, RewindPoint } from '../bridge/session.ts';
+import type { RewindPoint } from '../bridge/session.ts';
+import type { RewindableSession } from '../engine/types.ts';
 import { errorText } from '../bridge/errors.ts';
 import { toSingleLine } from '../bridge/summarize.ts';
 
@@ -61,7 +62,7 @@ const FIRST_MESSAGE_REASON = '这是对话的第一条消息，之前没有可�
 
 export async function previewRewind(
   deps: RewindDeps,
-  session: ClaudeSession,
+  session: RewindableSession,
   targetMessageId: string,
 ): Promise<RewindPreview | RewindFailure> {
   const blocker = session.rewindBlocker();
@@ -89,7 +90,7 @@ export async function previewRewind(
 
 export async function executeRewind(
   deps: RewindDeps,
-  session: ClaudeSession,
+  session: RewindableSession,
   targetMessageId: string,
   mode: RewindMode,
 ): Promise<RewindDone | RewindFailure> {
@@ -136,7 +137,7 @@ export async function executeRewind(
 
 async function locate(
   deps: RewindDeps,
-  session: ClaudeSession,
+  session: RewindableSession,
   targetMessageId: string,
 ): Promise<{ ok: true; target: Located } | RewindFailure> {
   const uuid = session.userMessageUuid(targetMessageId) ?? targetMessageId;
@@ -158,7 +159,7 @@ async function locate(
 
 /** SDK 的改动统计 → 协议形状；路径相对会话 cwd（cwd 之外的保持绝对路径） */
 function stat(
-  session: ClaudeSession,
+  session: RewindableSession,
   result: { filesChanged?: string[]; insertions?: number; deletions?: number },
 ): RewindFilesStat {
   const cwd = session.meta().cwd;

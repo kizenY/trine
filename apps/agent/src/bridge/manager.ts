@@ -31,6 +31,7 @@ import {
   type SDKSessionInfo,
 } from '@anthropic-ai/claude-agent-sdk';
 import { EventEmitter, scopedEmitter } from './emitter.ts';
+import type { EngineSession } from '../engine/types.ts';
 import { ClaudeSession, type RewindPoint, type SessionRuntimeMeta } from './session.ts';
 import type { HeadlessProbe } from './session-origin.ts';
 import type { EventBody } from './types.ts';
@@ -82,7 +83,7 @@ function inRun(state: SessionState): boolean {
  * run_in_background / 后台子 agent）——回收会杀掉子进程，后台任务跟着死，
  * 且它完成后 CLI 还要自发开一轮回报结果。
  */
-function isBusy(session: ClaudeSession): boolean {
+function isBusy(session: EngineSession): boolean {
   return inRun(session.state) || session.queueLength > 0 || session.bgRunningCount > 0;
 }
 
@@ -100,7 +101,7 @@ export interface SessionManagerOptions {
   renameSessionFn?: typeof renameSession;
   deleteSessionFn?: typeof deleteSession;
   /** 注入 ClaudeSession 工厂，测试用假会话替换 */
-  createSession?: (options: CreateSessionArgs) => ClaudeSession;
+  createSession?: (options: CreateSessionArgs) => EngineSession;
   /** 会话拉起的 claude 可执行文件（app 启动时解析）；不给 = SDK 内置 */
   claudeExecutable?: string;
   /** 会话的附件上传目录（会建好），加进 SDK additionalDirectories；不给 = 不加 */
@@ -179,7 +180,7 @@ const DEFAULT_IDLE_TIMEOUT_MS = 15 * 60_000;
  * cwd/model/permissionMode 没有被应用），而不是静默吞掉这个事实。
  */
 export interface AcquireResult {
-  session: ClaudeSession;
+  session: EngineSession;
   reused: boolean;
 }
 
@@ -203,7 +204,7 @@ export class SessionManager {
   readonly #getSessionInfo: typeof getSessionInfo;
   readonly #renameSession: typeof renameSession;
   readonly #deleteSession: typeof deleteSession;
-  readonly #createSession: (options: CreateSessionArgs) => ClaudeSession;
+  readonly #createSession: (options: CreateSessionArgs) => EngineSession;
   readonly #claudeExecutable: string | undefined;
   readonly #uploadsDir: ((sessionId: string) => string) | undefined;
   readonly #sessionEnv: ((sessionId: string) => Record<string, string>) | undefined;
@@ -220,7 +221,7 @@ export class SessionManager {
   readonly #headless = new Set<string>();
 
   /** sessionId → 活跃会话。**这张表就是互斥锁** */
-  readonly #sessions = new Map<string, ClaudeSession>();
+  readonly #sessions = new Map<string, EngineSession>();
   /** 会话元数据（含已关闭但仍在列表里的） */
   readonly #meta = new Map<string, SessionMeta>();
   /** 空闲回收定时器（按需起，unref） */
@@ -377,7 +378,7 @@ export class SessionManager {
   }
 
   /** 取一个已存在的活跃会话；不存在返回 undefined（不隐式新建） */
-  get(sessionId: string): ClaudeSession | undefined {
+  get(sessionId: string): EngineSession | undefined {
     return this.#sessions.get(sessionId);
   }
 
@@ -388,7 +389,7 @@ export class SessionManager {
   planUsage(): Promise<unknown> | undefined {
     for (const session of this.#sessions.values()) {
       if (!session.hasProcess) continue;
-      const pending = session.planUsage();
+      const pending = session.planUsage?.();
       if (pending !== undefined) return pending;
     }
     return undefined;
@@ -469,7 +470,7 @@ export class SessionManager {
    */
   async makeRoom(): Promise<string | undefined> {
     if (this.#sessions.size < this.#maxConcurrent) return undefined;
-    let victim: [string, ClaudeSession] | undefined;
+    let victim: [string, EngineSession] | undefined;
     for (const entry of this.#sessions) {
       if (isBusy(entry[1])) continue;
       if (victim === undefined || entry[1].lastActivityAt < victim[1].lastActivityAt) victim = entry;

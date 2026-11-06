@@ -12,7 +12,7 @@
 import type { SessionMutateErrorCode } from '@trine/core';
 import type { EventEmitter } from '../bridge/emitter.ts';
 import type { SessionManager } from '../bridge/manager.ts';
-import type { ClaudeSession } from '../bridge/session.ts';
+import type { EngineSession } from '../engine/types.ts';
 import type { CapabilitiesCache } from './router.ts';
 import type { SessionFlagsStore } from './session-flags.ts';
 import type { AgentState } from './state.ts';
@@ -77,7 +77,7 @@ function fail(code: SessionMutateErrorCode, message: string): MutationOutcome {
 }
 
 /** 与 setCwd / reapIdle 同口径（评审 M3）：运行中、等批准、有排队消息都算忙 */
-function isBusy(session: ClaudeSession | undefined): boolean {
+function isBusy(session: EngineSession | undefined): boolean {
   if (session === undefined) return false;
   return (
     session.state === 'running' ||

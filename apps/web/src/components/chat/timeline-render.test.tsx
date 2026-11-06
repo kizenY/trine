@@ -199,7 +199,7 @@ describe('Timeline · 扩展记录卡与时间分隔', () => {
 });
 
 describe('Timeline · 自发轮标记', () => {
-  test('run.state running 带 detail → 一行「⟳ …，Claude 继续」；不带 detail 的 running 不画', () => {
+  test('run.state running 带 detail → 一行「⟳ …，继续运行」；不带 detail 的 running 不画', () => {
     const entries: TimelineEntry[] = [
       { kind: 'run_state', id: 'rs-1', state: 'running', seq: 1, ts: T0 },
       { kind: 'run_state', id: 'rs-2', state: 'running', detail: '后台任务“跑测试”已完成', seq: 2, ts: T0 + 1 },
@@ -209,7 +209,7 @@ describe('Timeline · 自发轮标记', () => {
     render({ now: T0, runningElapsedMs: 0 });
     const notes = Array.from(host!.querySelectorAll('[data-testid="entry-run-trigger"]'));
     expect(notes).toHaveLength(1);
-    expect(notes[0]!.textContent).toBe('⟳ 后台任务“跑测试”已完成，Claude 继续');
+    expect(notes[0]!.textContent).toBe('⟳ 后台任务“跑测试”已完成，继续运行');
     expect(host!.querySelectorAll('[data-testid="entry-run-state"]')).toHaveLength(0);
   });
 });

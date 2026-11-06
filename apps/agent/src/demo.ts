@@ -15,6 +15,7 @@
 import { randomUUID } from 'node:crypto';
 import { EventEmitter } from './bridge/emitter.ts';
 import { SessionManager } from './bridge/manager.ts';
+import type { ClaudeSession } from './bridge/session.ts';
 import type { OutboundEvent } from './bridge/types.ts';
 
 /** 演示用的工作目录：临时目录，避免污染真实仓库 */
@@ -234,7 +235,7 @@ async function main(): Promise<void> {
           '⚠ 本轮没有触发权限请求——可能本机 settings 已放行该命令（属正常情况）',
         ),
   );
-  console.log(color.dim(`   已记住的模式：${session.permissions.rememberedPatterns.join(', ') || '(无)'}`));
+  console.log(color.dim(`   已记住的模式：${(session as ClaudeSession).permissions.rememberedPatterns.join(', ') || '(无)'}`));
 
   // --- 第二轮：同类命令验证 remember 命中后不再挂起（决策 2 第 1 条）---
   if (permissionEvents.length > 0) {

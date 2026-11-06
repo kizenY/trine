@@ -12,7 +12,7 @@ import {
   TransportFrameSchema,
   type E2eEvent,
 } from './index.ts';
-import { SessionMetaSchema } from '../types/index.ts';
+import { EngineSummarySchema, SessionMetaSchema } from '../types/index.ts';
 
 const ts = Date.now();
 
@@ -1299,5 +1299,49 @@ describe('Transport 帧', () => {
   test('decodeTransportFrame 拒绝非 JSON 与非法帧', () => {
     expect(() => decodeTransportFrame('not json')).toThrow();
     expect(() => decodeTransportFrame('{"type":"bogus"}')).toThrow();
+  });
+});
+
+describe('multi-engine 字段', () => {
+  test('引擎 id 是开放字符串：未知引擎不让整帧失败', () => {
+    const meta = {
+      sessionId: 's',
+      title: 't',
+      state: 'idle',
+      lastActivityAt: 1,
+      cwd: '/a',
+      model: 'm',
+      permissionMode: 'default',
+      costUsd: 0,
+      engine: 'some-future-engine',
+      engineMode: 'some-future-mode',
+    };
+    const parsed = SessionMetaSchema.parse(meta);
+    expect(parsed.engine).toBe('some-future-engine');
+    expect(parsed.engineMode).toBe('some-future-mode');
+  });
+
+  test('旧帧不带引擎字段仍合法', () => {
+    const parsed = SessionMetaSchema.parse({
+      sessionId: 's',
+      title: 't',
+      state: 'idle',
+      lastActivityAt: 1,
+      cwd: '/a',
+      model: 'm',
+      permissionMode: 'default',
+      costUsd: 0,
+    });
+    expect(parsed.engine).toBeUndefined();
+  });
+
+  test('能力表里不认识的能力被 strip，不让整帧失败', () => {
+    const parsed = EngineSummarySchema.parse({
+      id: 'x',
+      displayName: 'X',
+      available: true,
+      capabilities: { interactive: true, somethingNew: true },
+    });
+    expect(parsed.capabilities).toEqual({ interactive: true });
   });
 });

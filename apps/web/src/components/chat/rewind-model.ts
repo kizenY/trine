@@ -30,7 +30,7 @@ export function rewindChoices(preview: RewindPreviewResult): RewindChoice[] {
     {
       mode: 'conversation',
       label: '只回退对话',
-      hint: '文件保持现状，Claude 忘掉这条消息及之后的内容',
+      hint: '文件保持现状，对话回到这条消息之前',
       available: conversation.available,
       ...(conversation.available ? {} : { reason: conversation.reason ?? '不可用' }),
     },

@@ -133,7 +133,7 @@ export function permissionResultText(
   if (entry.state === 'invalidated') {
     const why = entry.reason === undefined || entry.reason === '' ? '' : `（${entry.reason}）`;
     return {
-      text: `⌀ 请求已失效${why}——如需继续，直接发消息让 Claude 重试`,
+      text: `⌀ 请求已失效${why}——如需继续，直接发消息让它重试`,
       tone: 'muted',
     };
   }
