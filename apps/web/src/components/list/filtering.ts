@@ -8,7 +8,7 @@
  * 列表页、PC 侧栏、归档视图、机器详情四个调用点共用这一个函数；零 React、
  * 零浏览器全局，全部单测覆盖（filtering.test.ts）。
  */
-import type { SessionMeta, SessionState } from '@trine/core';
+import { CLAUDE_ENGINE_ID, type SessionMeta, type SessionState } from '@trine/core';
 import { comparePinned, compareSessions, STATE_RANK, type SessionRowData } from './sorting.ts';
 
 /**
@@ -51,6 +51,8 @@ export interface ListQuery {
   /** 是否显示临时会话（isTempSession）；默认不显示 */
   showTemp: boolean;
   status: StatusFilter;
+  /** 只看某个引擎；省略或 null = 全部 */
+  engine?: string | null;
   /** 原始输入；内部 trim + 不分大小写 */
   search: string;
   groupBy: ListGroupBy;
@@ -153,6 +155,7 @@ export function matchesSearch(
     meta.cwd,
     meta.gitBranch,
     machineName,
+    meta.engine ?? CLAUDE_ENGINE_ID,
   ];
   return fields.some((f) => f !== undefined && f.toLowerCase().includes(needle));
 }
@@ -254,15 +257,15 @@ export function groupRows(
 export function isGroupExpanded(
   group: SessionGroup,
   collapsed: ReadonlySet<string>,
-  query?: Pick<ListQuery, 'search' | 'status'>,
+  query?: Pick<ListQuery, 'search' | 'status' | 'engine'>,
 ): boolean {
   if (query !== undefined && isFiltering(query)) return true;
   return group.waitingCount > 0 || !collapsed.has(group.key);
 }
 
 /** 搜索词非空或状态 chip 不是「全部」 */
-export function isFiltering(query: Pick<ListQuery, 'search' | 'status'>): boolean {
-  return query.search.trim() !== '' || query.status !== 'all';
+export function isFiltering(query: Pick<ListQuery, 'search' | 'status' | 'engine'>): boolean {
+  return query.search.trim() !== '' || query.status !== 'all' || (query.engine ?? null) !== null;
 }
 
 /**
@@ -332,7 +335,11 @@ export function filterSessions(
   const tempShown = query.showTemp ? tempCount : 0;
 
   // 4. 状态
-  const statusRows = kept.filter((r) => matchesStatus(r.meta.state, query.status));
+  const statusRows = kept.filter(
+    (r) =>
+      matchesStatus(r.meta.state, query.status) &&
+      ((query.engine ?? null) === null || (r.meta.engine ?? CLAUDE_ENGINE_ID) === query.engine),
+  );
 
   // 5. 搜索（机器名只在「全部机器」视图下参与——选定机器时每行机器名都一样）
   const needle = query.search.trim().toLowerCase();

@@ -31,6 +31,7 @@ import type { AgentApp, AgentAppDeps } from './app.ts';
 import type { SpawnedProcess, SpawnFn } from './claude-cli.ts';
 import { agentPaths } from './config.ts';
 import { AGENT_VERSION } from './machine-info.ts';
+import { FakeAppServer, fakeThread, rpcError } from '../engine/codex/fake-app-server.ts';
 
 // ---------------------------------------------------------------------------
 // 夹具
@@ -81,6 +82,7 @@ async function createApp(
     spawnFn?: SpawnFn;
     restart?: AgentAppDeps['restart'];
     claudeLatest?: AgentAppDeps['claudeLatest'];
+    spawnCodexAppServer?: AgentAppDeps['spawnCodexAppServer'];
   } = {},
 ): Promise<AgentApp> {
   const { app: created } = await startEchoAgent({
@@ -874,6 +876,56 @@ describe('agent 接线 · 端到端', () => {
 
     await restartAgent();
     await waitFor(() => eventsOf(client).some(late), '重启后补发并处理');
+    client.close();
+  });
+});
+
+
+describe('AgentApp · Codex 只读引擎（假 app-server）', () => {
+  test('machine.info 带两个引擎；列表带 Codex 会话；历史可读；发消息被拒且不建会话', async () => {
+    const fake = new FakeAppServer({
+      'thread/list': () => ({ data: [fakeThread('codex-thread-1')], nextCursor: null }),
+      'thread/read': (p) => {
+        const id = (p as { threadId: string }).threadId;
+        if (id === 'codex-thread-1') return { thread: fakeThread(id) };
+        throw rpcError(-32600, `thread not loaded: ${id}`);
+      },
+      'thread/items/list': () => ({
+        data: [{ turnId: 't', startedAtMs: 100, item: { type: 'agentMessage', id: 'a1', text: 'from codex' } }],
+        nextCursor: null,
+      }),
+      'account/read': () => ({ account: { type: 'chatgpt' }, requiresOpenaiAuth: true }),
+      'account/rateLimits/read': () => ({
+        rateLimitsByLimitId: { codex: { primary: { usedPercent: 5, windowDurationMins: 10080, resetsAt: 2000 } } },
+      }),
+    });
+    await app.stop();
+    app = await createApp({ spawnCodexAppServer: fake.spawn });
+    const client = await pairAndConnect();
+
+    await waitFor(
+      () =>
+        eventsOf(client).some(
+          (e) => e.type === 'machine.info' && e.info.engines?.find((x) => x.id === 'codex')?.rateLimits !== undefined,
+        ),
+      'machine.info 带 Codex 限额',
+    );
+
+    send(client, { type: 'session.list.request', reqId: 'l1' });
+    await waitFor(() => eventsOf(client).some((e) => e.type === 'session.list.response'), '列表应答');
+    const list = eventsOf(client).find((e) => e.type === 'session.list.response');
+    expect(list?.type === 'session.list.response' && list.sessions.find((m) => m.sessionId === 'codex-thread-1')?.engine).toBe('codex');
+
+    send(client, { type: 'session.history.request', sessionId: 'codex-thread-1', reqId: 'h1' });
+    await waitFor(() => eventsOf(client).some((e) => e.type === 'session.history.response'), '历史应答');
+    const history = eventsOf(client).find((e) => e.type === 'session.history.response');
+    expect(history?.type === 'session.history.response' && history.items[0]).toMatchObject({ text: 'from codex' });
+
+    send(client, { type: 'input.send', sessionId: 'codex-thread-1', clientMsgId: 'c1', text: 'hi' });
+    await waitFor(() => eventsOf(client).some((e) => e.type === 'error.fatal'), '发消息被拒');
+    expect(eventsOf(client).some((e) => e.type === 'user.message')).toBe(false);
+    const forbidden = ['thread/start', 'thread/resume', 'turn/start'];
+    expect(fake.calls.filter((c) => forbidden.includes(c.method))).toEqual([]);
     client.close();
   });
 });

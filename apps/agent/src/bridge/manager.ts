@@ -87,8 +87,16 @@ function isBusy(session: EngineSession): boolean {
   return inRun(session.state) || session.queueLength > 0 || session.bgRunningCount > 0;
 }
 
+/** 其他引擎的会话目录（multi-engine）：不经 manager 运行，只并进列表、参与标记合并 */
+export interface ExternalSessions {
+  /** 全部会话。自己处理失败（如退回上次结果），这里抛错只记日志 */
+  list(): Promise<SessionMeta[]>;
+  metaOf(sessionId: string): SessionMeta | undefined;
+}
+
 export interface SessionManagerOptions {
   emitter: EventEmitter;
+  externalSessions?: ExternalSessions;
   /** 并发活跃会话上限（超出即拒绝新建，不静默排队） */
   maxConcurrent?: number;
   /** 空闲多久回收子进程（毫秒） */
@@ -224,11 +232,13 @@ export class SessionManager {
   readonly #sessions = new Map<string, EngineSession>();
   /** 会话元数据（含已关闭但仍在列表里的） */
   readonly #meta = new Map<string, SessionMeta>();
+  readonly #external: ExternalSessions | undefined;
   /** 空闲回收定时器（按需起，unref） */
   #reapTimer: unknown = undefined;
 
   constructor(options: SessionManagerOptions) {
     this.#emitter = options.emitter;
+    this.#external = options.externalSessions;
     this.#maxConcurrent = options.maxConcurrent ?? DEFAULT_MAX_CONCURRENT;
     this.#idleTimeoutMs = options.idleTimeoutMs ?? DEFAULT_IDLE_TIMEOUT_MS;
     this.#now = options.now ?? (() => Date.now());
@@ -488,11 +498,21 @@ export class SessionManager {
    * （调研报告 §4 的建议）。
    */
   async list(options?: { cwd?: string; limit?: number }): Promise<SessionMeta[]> {
-    const infos = await this.#listSessions({
-      ...(options?.cwd === undefined ? {} : { dir: options.cwd }),
-      ...(options?.limit === undefined ? {} : { limit: options.limit }),
-      includeWorktrees: true,
-    });
+    const externalList =
+      this.#external === undefined || options?.cwd !== undefined
+        ? Promise.resolve<SessionMeta[]>([])
+        : this.#external.list().catch((err: unknown) => {
+            this.#log?.(`列出其他引擎的会话失败：${err instanceof Error ? err.message : String(err)}`);
+            return [];
+          });
+    const [infos, external] = await Promise.all([
+      this.#listSessions({
+        ...(options?.cwd === undefined ? {} : { dir: options.cwd }),
+        ...(options?.limit === undefined ? {} : { limit: options.limit }),
+        includeWorktrees: true,
+      }),
+      externalList,
+    ]);
     await this.#probeHeadless(infos);
 
     const out: SessionMeta[] = [];
@@ -523,14 +543,28 @@ export class SessionManager {
       );
     }
 
+    for (const meta of external) {
+      if (seen.has(meta.sessionId) || this.#meta.has(meta.sessionId)) continue;
+      if (this.#flags?.isDeleted(meta.sessionId) === true) continue;
+      out.push(this.#decorateExternal(meta));
+    }
+
     out.sort((a, b) => b.lastActivityAt - a.lastActivityAt);
     return out;
+  }
+
+  /** 其他引擎的 meta：headless 来自它自己（decorate 的唯一来源是 #headless，先登记） */
+  #decorateExternal(meta: SessionMeta): SessionMeta {
+    if (meta.headless === true) this.#headless.add(meta.sessionId);
+    return this.decorate(meta);
   }
 
   /** 会话元数据快照（session.updated 广播用；已合并标记） */
   metaOf(sessionId: string): SessionMeta | undefined {
     const meta = this.#meta.get(sessionId);
-    return meta === undefined ? undefined : this.decorate(meta);
+    if (meta !== undefined) return this.decorate(meta);
+    const external = this.#external?.metaOf(sessionId);
+    return external === undefined ? undefined : this.#decorateExternal(external);
   }
 
   /**
@@ -628,6 +662,8 @@ export class SessionManager {
       }
       return this.metaOf(sessionId);
     }
+    const external = this.#external?.metaOf(sessionId);
+    if (external !== undefined) return this.#decorateExternal(external);
     const info = await this.#getSessionInfo(sessionId);
     if (info !== undefined) await this.#probeHeadless([info]);
     return info === undefined

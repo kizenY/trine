@@ -414,8 +414,23 @@ export const EngineCapabilitiesSchema = z.object({
   cost: z.boolean().optional(),
   subagentHistory: z.boolean().optional(),
   attachments: z.boolean().optional(),
+  /** 能重命名、永久删除会话（归档、置顶是 trine 自己的标记，所有引擎都能用） */
+  mutations: z.boolean().optional(),
 });
 export type EngineCapabilities = z.infer<typeof EngineCapabilitiesSchema>;
+
+/** 引擎的一个限额窗口。窗口数量和时长因账号而异，不能假设固定是 5 小时 + 7 天 */
+export const EngineRateWindowSchema = z.object({
+  id: z.string().min(1).max(64),
+  /** 账号有多个限额桶时的桶名；只有一个桶时省略 */
+  bucket: z.string().max(64).optional(),
+  /** 窗口时长（分钟）；未知时省略 */
+  durationMins: z.number().int().positive().optional(),
+  /** 已用百分比 */
+  percent: z.number().nonnegative(),
+  resetsAt: TimestampSchema.optional(),
+});
+export type EngineRateWindow = z.infer<typeof EngineRateWindowSchema>;
 
 /** 机器上的一个引擎 */
 export const EngineSummarySchema = z.object({
@@ -427,6 +442,10 @@ export const EngineSummarySchema = z.object({
   /** available 为 false 的原因（给人看） */
   unavailableReason: z.string().max(300).optional(),
   capabilities: EngineCapabilitiesSchema,
+  /** 账号限额。Claude 的仍在 MachineInfo.rateLimits，这里不重复 */
+  rateLimits: z
+    .object({ windows: z.array(EngineRateWindowSchema).max(16), updatedAt: TimestampSchema })
+    .optional(),
 });
 export type EngineSummary = z.infer<typeof EngineSummarySchema>;
 

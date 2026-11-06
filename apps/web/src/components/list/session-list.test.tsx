@@ -625,3 +625,39 @@ describe('引擎能力：费用', () => {
     expect(show(list(meta({ sessionId: 'a', costUsd: 1.5, engine: 'other' }), { engines }))).not.toContain('1.5');
   });
 });
+
+describe('多引擎：行标签与菜单', () => {
+  const engines = [
+    { id: 'claude', displayName: 'Claude Code', available: true, capabilities: { mutations: true } },
+    { id: 'codex', displayName: 'Codex', available: true, capabilities: {} },
+  ];
+
+  test('多引擎机器的行标出引擎；单引擎机器不标', () => {
+    const show = (info: unknown, sessionMeta: SessionMeta): string | null | undefined => {
+      const withInfo = { m: { ...machines.m, info } } as unknown as Record<string, MachineState>;
+      host = document.createElement('div');
+      document.body.appendChild(host);
+      root = createRoot(host);
+      router = createMemoryRouter(
+        [
+          {
+            path: '*',
+            element: <SessionList sessions={{ m: { a: sessionMeta } }} machines={withInfo} query={{ ...DEFAULT_LIST_QUERY, groupBy: 'none' }} now={2} />,
+          },
+        ],
+        { initialEntries: ['/'] },
+      );
+      act(() => root!.render(<RouterProvider router={router!} />));
+      const tag = host.querySelector('[data-testid=session-engine]')?.textContent;
+      act(() => root!.unmount());
+      host.remove();
+      root = null;
+      host = null;
+      router = null;
+      return tag;
+    };
+    expect(show({ engines }, meta({ sessionId: 'a', engine: 'codex' }))).toContain('Codex');
+    expect(show({ engines }, meta({ sessionId: 'a' }))).toContain('Claude');
+    expect(show({ engines: [engines[0]] }, meta({ sessionId: 'a' }))).toBeUndefined();
+  });
+});

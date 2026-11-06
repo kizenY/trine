@@ -17,6 +17,7 @@ import { Chip } from '@/components/shell/StatusDot.tsx';
 import { Input } from '@/components/ui/input.tsx';
 import { Button } from '@/components/ui/button.tsx';
 import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover.tsx';
+import type { EngineOption } from '@/lib/engine-model.ts';
 import { cn } from '@/lib/utils.ts';
 import { STATUS_FILTER_LABEL, STATUS_FILTERS, type ListGroupBy, type StatusFilter } from './filtering.ts';
 
@@ -62,6 +63,31 @@ export function SearchBox({
           <XIcon className="size-3.5" />
         </button>
       )}
+    </div>
+  );
+}
+
+function EngineChips({
+  value,
+  onChange,
+  options,
+  className,
+}: {
+  value: string | null;
+  onChange: (value: string | null) => void;
+  options: readonly EngineOption[];
+  className?: string;
+}): React.JSX.Element {
+  return (
+    <div role="group" aria-label="按引擎筛选" data-testid="engine-chips" className={cn('flex items-center gap-1', className)}>
+      <Chip aria-pressed={value === null} selected={value === null} onClick={() => onChange(null)} data-testid="engine-chip-all">
+        全部引擎
+      </Chip>
+      {options.map((o) => (
+        <Chip key={o.id} aria-pressed={value === o.id} selected={value === o.id} onClick={() => onChange(o.id)} data-testid={`engine-chip-${o.id}`}>
+          {o.label}
+        </Chip>
+      ))}
     </div>
   );
 }
@@ -172,6 +198,10 @@ export interface ListControlsProps {
   onGroupBy: (value: ListGroupBy) => void;
   showTemp: boolean;
   onShowTemp: (value: boolean) => void;
+  /** 引擎筛选；选项少于两个时不显示 */
+  engine?: string | null | undefined;
+  onEngine?: ((value: string | null) => void) | undefined;
+  engineOptions?: readonly EngineOption[] | undefined;
   /** 不传 = 不显示「已归档」入口（归档视图自己） */
   archivedCount?: number;
   className?: string;
@@ -187,6 +217,9 @@ export function ListControls({
   onGroupBy,
   showTemp,
   onShowTemp,
+  engine,
+  onEngine,
+  engineOptions,
   archivedCount,
   className,
 }: ListControlsProps): React.JSX.Element {
@@ -203,6 +236,9 @@ export function ListControls({
         <GroupToggle value={groupBy} onChange={onGroupBy} />
         <TempToggle value={showTemp} onChange={onShowTemp} />
       </div>
+      {onEngine !== undefined && engineOptions !== undefined && engineOptions.length > 1 && (
+        <EngineChips value={engine ?? null} onChange={onEngine} options={engineOptions} className="flex-wrap" />
+      )}
     </div>
   );
 }
@@ -217,11 +253,14 @@ export function SidebarListControls({
   onGroupBy,
   showTemp,
   onShowTemp,
+  engine,
+  onEngine,
+  engineOptions,
   archivedCount,
   className,
 }: ListControlsProps): React.JSX.Element {
-  // 非默认筛选：状态不是「全部」，或打开了临时会话
-  const filtered = status !== 'all' || showTemp;
+  // 非默认筛选：状态不是「全部」，打开了临时会话，或选了引擎
+  const filtered = status !== 'all' || showTemp || (engine ?? null) !== null;
   const [open, setOpen] = useState(false);
   return (
     <div data-testid="sidebar-list-controls" className={cn('flex items-center gap-1.5', className)}>
@@ -245,6 +284,12 @@ export function SidebarListControls({
             <h3 className="text-text-3 text-xs">状态</h3>
             <StatusChips value={status} onChange={onStatus} className="flex-wrap" />
           </section>
+          {onEngine !== undefined && engineOptions !== undefined && engineOptions.length > 1 && (
+            <section className="flex flex-col gap-1.5">
+              <h3 className="text-text-3 text-xs">引擎</h3>
+              <EngineChips value={engine ?? null} onChange={onEngine} options={engineOptions} className="flex-wrap" />
+            </section>
+          )}
           <section className="flex flex-col gap-1.5">
             <h3 className="text-text-3 text-xs">显示</h3>
             <div className="flex flex-wrap gap-1.5">

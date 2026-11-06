@@ -10,7 +10,8 @@
 import { useState } from 'react';
 import { toast } from 'sonner';
 import { RefreshCwIcon } from 'lucide-react';
-import type { ContextUsage, RateLimits, RateLimitWindow } from '@trine/core';
+import type { ContextUsage, EngineSummary, MachineInfo, RateLimits, RateLimitWindow } from '@trine/core';
+import { enginesWithLimits, engineTag, windowLabel } from '@/lib/engine-model.ts';
 import { Button } from '@/components/ui/button.tsx';
 import { useClient, useTrine } from '@/app/runtime.ts';
 import type { MachineState } from '@/store/types.ts';
@@ -112,6 +113,42 @@ export function PlanUsageLine({
   );
 }
 
+/** 其他引擎的限额（Claude 的在 PlanUsageLine）：「Codex 1w 5%」；没有就渲染 null */
+export function EngineUsageLines({
+  info,
+  now,
+  className,
+  interactive = true,
+}: {
+  info: Pick<MachineInfo, 'engines'> | null | undefined;
+  now: number;
+  className?: string;
+  interactive?: boolean;
+}): React.JSX.Element | null {
+  const engines = enginesWithLimits(info);
+  if (engines.length === 0) return null;
+  return (
+    <span data-testid="engine-usage" className={cn('inline-flex flex-wrap items-baseline gap-x-3 gap-y-0.5 text-xs', className)}>
+      {engines.map((engine) => (
+        <span key={engine.id} className="inline-flex flex-wrap items-baseline gap-x-2" data-engine={engine.id}>
+          <span className="text-text-3">{engineTag(engine)}</span>
+          {engine.rateLimits?.windows.map((w) => (
+            <WindowValue
+              key={w.id}
+              label={windowLabel(w)}
+              window={w}
+              updatedAt={engine.rateLimits?.updatedAt}
+              now={now}
+              showReset
+              toggleable={interactive}
+            />
+          ))}
+        </span>
+      ))}
+    </span>
+  );
+}
+
 /** 手动刷新按钮（单台机器）；成败 toast */
 export function PlanUsageRefreshButton({ machine }: { machine: MachineState }): React.JSX.Element | null {
   const client = useClient();
@@ -178,9 +215,10 @@ export function PlanUsageStrip({
           <div className="flex min-w-0 flex-1 flex-wrap items-center gap-x-2">
             {m.info?.rateLimits !== undefined ? (
               <PlanUsageLine rateLimits={m.info.rateLimits} now={now} className="min-w-0 flex-auto" />
-            ) : supportsUsageRefresh(m.info) ? (
+            ) : supportsUsageRefresh(m.info) && enginesWithLimits(m.info).length === 0 ? (
               <span className="text-text-3 min-w-0 flex-1 truncate">用量：暂无数据，会话活动后更新</span>
             ) : null}
+            <EngineUsageLines info={m.info} now={now} className="min-w-0 flex-auto" />
             <MachineStatsBrief machine={m} now={now} intervalMs={statsInterval} className="ml-auto" />
           </div>
           <PlanUsageRefreshButton machine={m} />
@@ -198,11 +236,14 @@ export function PlanUsageStrip({
 export function SessionUsage({
   context,
   rateLimits,
+  windows,
   now,
   onRefreshContext,
 }: {
   context: ContextUsage | undefined;
   rateLimits: RateLimits | undefined;
+  /** 非 Claude 引擎的限额窗口（时长和数量因账号而异） */
+  windows?: EngineSummary['rateLimits'];
   now: number;
   /** 手动刷新 context；resolve 后结束转圈（成败提示由调用方负责） */
   onRefreshContext?: (() => Promise<void>) | undefined;
@@ -212,7 +253,8 @@ export function SessionUsage({
   const five = rateLimits?.fiveHour;
   const seven = rateLimits?.sevenDay;
   const canRefresh = onRefreshContext !== undefined;
-  if (ctx === undefined && !canRefresh && five === undefined && seven === undefined) return null;
+  const hasWindows = (windows?.windows.length ?? 0) > 0;
+  if (ctx === undefined && !canRefresh && five === undefined && seven === undefined && !hasWindows) return null;
   const ctxBody = (
     <>
       <span className="text-text-3">ctx </span>
@@ -257,6 +299,9 @@ export function SessionUsage({
       {seven !== undefined && (
         <WindowValue label="1w" window={seven} updatedAt={rateLimits?.updatedAt} now={now} showReset={false} toggleable />
       )}
+      {windows?.windows.map((w) => (
+        <WindowValue key={w.id} label={windowLabel(w)} window={w} updatedAt={windows.updatedAt} now={now} showReset={false} toggleable />
+      ))}
     </span>
   );
 }

@@ -9,6 +9,7 @@
  * 逻辑（能力探测、toast、错误文案）在 `session-actions.ts`，这里只做订阅与 memo。
  */
 import { useMemo } from 'react';
+import type { MachineInfo } from '@trine/core';
 import { toast } from 'sonner';
 import { useClient, useTrine } from '@/app/runtime.ts';
 import { openLinkPicker, openWorkspacePanel } from '@/components/ext/use-ext.ts';
@@ -28,6 +29,17 @@ export function useSessionActions(machineId?: string): SessionRowActions {
       .sort()
       .join(','),
   );
+  // 只取引擎的 id 与能力：限额变化不该让回调换引用
+  const enginesKey = useTrine((s) =>
+    JSON.stringify(
+      Object.fromEntries(
+        Object.entries(s.machines).map(([id, m]) => [
+          id,
+          m.info?.engines?.map((e) => ({ id: e.id, displayName: e.displayName, available: e.available, capabilities: e.capabilities })),
+        ]),
+      ),
+    ),
+  );
   return useMemo(
     () => ({
       ...buildSessionActions({
@@ -35,6 +47,10 @@ export function useSessionActions(machineId?: string): SessionRowActions {
         supportedMachineIds: new Set(supportedKey === '' ? [] : supportedKey.split(',')),
         pinMachineIds: new Set(pinKey === '' ? [] : pinKey.split(',')),
         onlyMachine: machineId,
+        machineInfo: (target) => {
+          const engines = (JSON.parse(enginesKey) as Record<string, MachineInfo['engines']>)[target];
+          return engines === undefined ? undefined : { engines };
+        },
         notify: toast,
       }),
       // 复制不经 agent：与能力探测无关，总是给
@@ -43,6 +59,6 @@ export function useSessionActions(machineId?: string): SessionRowActions {
       onOpenWorkspace: (target: string, cwd: string) => openWorkspacePanel({ machineId: target, cwd }),
       supportsLinks: (target: string) => linkKey.split(',').includes(target),
     }),
-    [client, supportedKey, pinKey, linkKey, machineId],
+    [client, supportedKey, pinKey, linkKey, enginesKey, machineId],
   );
 }

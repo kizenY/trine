@@ -62,6 +62,8 @@ export interface SessionRowActions {
    * false，那台的行不出任何菜单项。不给 = 所有机器同等对待。
    */
   supports?: (machineId: string) => boolean;
+  /** 这个会话的引擎能不能重命名、永久删除；不给 = 能（归档、置顶是 trine 自己的标记，不受影响） */
+  supportsMutations?: (machineId: string, meta: SessionMeta) => boolean;
   onRename?: (machineId: string, sessionId: string, title: string) => MaybePromise;
   onArchive?: (machineId: string, sessionId: string, archived: boolean) => MaybePromise;
   /** 多选批量归档 / 取消归档；不给则列表不开放多选 */
@@ -106,15 +108,16 @@ export function rowMenuItems(
   if (machineId !== undefined && actions?.supports !== undefined && !actions.supports(machineId)) {
     return { copyCwd, pin, link, rename: false, archive: false, unarchive: false, delete: false };
   }
+  const mutable = machineId === undefined || actions?.supportsMutations === undefined || actions.supportsMutations(machineId, meta);
   return {
     copyCwd,
     pin,
     link,
-    rename: actions?.onRename !== undefined,
+    rename: mutable && actions?.onRename !== undefined,
     archive: !archived && actions?.onArchive !== undefined,
     unarchive: archived && actions?.onArchive !== undefined,
     // 永久删除只在归档视图里给（agent 侧同样要求 archived===true，方案 §3.4）
-    delete: archived && actions?.onDelete !== undefined,
+    delete: mutable && archived && actions?.onDelete !== undefined,
   };
 }
 

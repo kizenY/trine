@@ -33,6 +33,10 @@ is not a substitute for those controls, backups or TLS.
   They are not separately encrypted at rest by trine.
 - The agent stores private identity keys on disk and Claude stores its own history
   and credentials locally. Protect the OS account and backups.
+- If a signed-in `codex` CLI is present, the agent also reads Codex's local sessions, account plan and
+  limits through `codex app-server` and shows them to paired devices, the same exposure as Claude
+  history. It does not read Codex's credentials itself and does not change Codex's state. Set
+  `TRINE_ENGINES=claude` to turn this off.
 - The agent keeps plaintext copies of received attachments under `<home>/uploads`
   (deleted with the session) and lets Claude read that session's folder without an
   approval prompt. Any paired controller can place files there.

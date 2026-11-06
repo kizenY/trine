@@ -18,7 +18,7 @@ import {
   parkedWarnLine,
 } from './machine-text.ts';
 import { claudeUpdateHint } from './claude-update.ts';
-import { PlanUsageLine } from '@/components/usage/PlanUsage.tsx';
+import { EngineUsageLines, PlanUsageLine } from '@/components/usage/PlanUsage.tsx';
 import { MachineStatsLine } from './MachineStats.tsx';
 
 export function MachineCard({
@@ -80,6 +80,7 @@ export function MachineCard({
       </div>
 
       <PlanUsageLine rateLimits={machine.info?.rateLimits} now={now ?? Date.now()} interactive={false} className="text-text-2 mt-1.5" />
+      <EngineUsageLines info={machine.info} now={now ?? Date.now()} interactive={false} className="text-text-2 mt-1.5" />
       <MachineStatsLine machine={machine} now={now ?? Date.now()} intervalMs={statsIntervalMs} className="text-text-2 mt-1.5 flex" />
 
       {warn !== '' && (

@@ -19,7 +19,7 @@ import { SessionList } from '@/components/list/SessionList.tsx';
 import { ListControls } from '@/components/list/ListControls.tsx';
 import { countArchived } from '@/components/list/filtering.ts';
 import { countLiveSessions, liveSessionsLine, selectMachineFilterItems } from '@/components/list/sorting.ts';
-import { useListGroupBy, useListQuery, useListShowTemp } from '@/components/list/use-list-query.ts';
+import { useEngineFilter, useListGroupBy, useListQuery, useListShowTemp } from '@/components/list/use-list-query.ts';
 import { useSessionActions } from '@/components/list/use-session-actions.ts';
 import { useNow, useSessionRefresh } from '@/components/list/use-session-refresh.ts';
 import { NewSessionSheet } from '@/components/sheets/NewSessionSheet.tsx';
@@ -37,6 +37,7 @@ export function SessionListView(): React.JSX.Element {
   const { search, setSearch, status, setStatus } = useListFilters();
   const [groupBy, setGroupBy] = useListGroupBy();
   const [showTemp, setShowTemp] = useListShowTemp();
+  const { engine, setEngine, options: engineOptions } = useEngineFilter();
   const query = useListQuery({ archived: false });
   const actions = useSessionActions();
   const [sheetOpen, setSheetOpen] = useNewSessionSheet();
@@ -127,6 +128,9 @@ export function SessionListView(): React.JSX.Element {
         onGroupBy={setGroupBy}
         showTemp={showTemp}
         onShowTemp={setShowTemp}
+        engine={engine}
+        onEngine={setEngine}
+        engineOptions={engineOptions}
         archivedCount={countArchived(sessions, filter)}
         className="px-3.5 pt-1.5 pb-1"
       />

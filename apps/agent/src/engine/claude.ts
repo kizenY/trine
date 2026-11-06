@@ -15,6 +15,7 @@ export function claudeEngineSummary(version: string): EngineSummary {
       cost: true,
       subagentHistory: true,
       attachments: true,
+      mutations: true,
     },
   };
 }

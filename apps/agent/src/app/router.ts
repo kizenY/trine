@@ -100,6 +100,7 @@ import type {
   AgentToClientEvent,
   ClientToAgentEvent,
   FsErrorCode,
+  HistoryItem,
   MachineInfo,
   PermissionMode,
   McpServerStatus,
@@ -239,7 +240,15 @@ export class CapabilitiesCache {
   }
 }
 
+/** router 对只读引擎（Codex）要用的部分 */
+export interface ReadOnlyEngine {
+  owns(sessionId: string): Promise<boolean>;
+  history(sessionId: string): Promise<HistoryItem[]>;
+}
+
 export interface RouterDeps {
+  /** 只读引擎；不给 = 只有 Claude */
+  readOnlyEngine?: ReadOnlyEngine | undefined;
   manager: SessionManager;
   emitter: EventEmitter;
   state: AgentState;
@@ -724,6 +733,14 @@ export class Router {
   async #handleMetaCommand(sessionId: string, event: SessionMetaEvent): Promise<void> {
     let outcome: MutationOutcome;
     try {
+      if ((event.type === 'session.rename' || event.type === 'session.delete') && (await this.#isReadOnlySession(sessionId))) {
+        this.#emitMutateResponse(event.reqId, sessionId, {
+          ok: false,
+          code: 'io',
+          message: '这个引擎的会话暂时不能重命名或删除',
+        });
+        return;
+      }
       switch (event.type) {
         case 'session.rename':
           outcome = await this.#mutations.rename(sessionId, event.title);
@@ -822,12 +839,7 @@ export class Router {
     event: Extract<ClientToAgentEvent, { type: 'session.history.request' }>,
     sender: Recipient,
   ): Promise<void> {
-    const live = this.#deps.manager.get(sessionId);
-    const pending =
-      (live !== undefined && isRewindable(live) ? live.pendingRewind : undefined) ?? this.#deps.state.pendingRewind(sessionId);
-    const messages = cutAtRewind(await this.#readTranscript(sessionId), pending?.dropFrom);
-    const attachments = (await this.#deps.attachments?.historyIndex(sessionId)) ?? new Map();
-    const page = paginateHistory(toHistoryItems(messages, attachments), { before: event.before, limit: event.limit });
+    const page = paginateHistory(await this.#historyItems(sessionId), { before: event.before, limit: event.limit });
     this.#deps.emitter.emit(
       {
         type: 'session.history.response',
@@ -839,6 +851,32 @@ export class Router {
       sessionId,
       { to: sender.deviceId },
     );
+  }
+
+  async #historyItems(sessionId: string): Promise<HistoryItem[]> {
+    const engine = this.#deps.readOnlyEngine;
+    if (engine !== undefined && (await this.#isReadOnlySession(sessionId))) return engine.history(sessionId);
+    const live = this.#deps.manager.get(sessionId);
+    const pending =
+      (live !== undefined && isRewindable(live) ? live.pendingRewind : undefined) ?? this.#deps.state.pendingRewind(sessionId);
+    const messages = cutAtRewind(await this.#readTranscript(sessionId), pending?.dropFrom);
+    const attachments = (await this.#deps.attachments?.historyIndex(sessionId)) ?? new Map();
+    return toHistoryItems(messages, attachments);
+  }
+
+  /**
+   * 这个会话属于只读引擎吗。Claude 已知的会话不去问；问不到（app-server 不可用）按不是处理，
+   * 请求接着走 Claude 那条路，结果是「会话不存在」，不会误操作。
+   */
+  async #isReadOnlySession(sessionId: string): Promise<boolean> {
+    const engine = this.#deps.readOnlyEngine;
+    if (engine === undefined) return false;
+    if (this.#deps.manager.has(sessionId) || this.#deps.state.sessionParams(sessionId) !== undefined) return false;
+    if (this.#deps.manager.metaOf(sessionId)?.engine !== undefined) return true;
+    return engine.owns(sessionId).catch((err: unknown) => {
+      this.#log(`[router] 查询引擎会话失败 session=${sessionId}: ${err instanceof Error ? err.message : String(err)}`);
+      return false;
+    });
   }
 
   /** 附件按需重新上传（见文件头），结果只发给请求方 */
@@ -997,6 +1035,13 @@ export class Router {
    * 探测失败 → 空数组（见文件头），source 统一 'project'（与 translate.ts 一致）。
    */
   async #commands(sessionId: string, reqId: string, sender: Recipient): Promise<void> {
+    // 只读引擎没有斜杠命令；探测会起 claude，也不该拿 Claude 的命令充数
+    if (await this.#isReadOnlySession(sessionId)) {
+      this.#deps.emitter.emit({ type: 'session.commands.response', reqId, slashCommands: [] }, sessionId, {
+        to: sender.deviceId,
+      });
+      return;
+    }
     const known = this.#deps.state.sessionParams(sessionId)?.cwd ?? this.#deps.manager.metaOf(sessionId)?.cwd;
     const cwd = known === undefined || known === '' ? this.#deps.cwdStore.snapshot().defaultCwd : known;
     let slashCommands: SlashCommand[] = [];
@@ -1153,6 +1198,11 @@ export class Router {
   }
 
   async #resume(sessionId: string): Promise<EngineSession | undefined> {
+    // 能力在 agent 端强制：只读引擎的会话不能被当成 Claude 会话 resume
+    if (await this.#isReadOnlySession(sessionId)) {
+      this.#emitMachine({ type: 'error.fatal', kind: 'config', message: '这个会话目前只能查看，不能在 trine 里操作' });
+      return undefined;
+    }
     let params: SessionParams | undefined;
     try {
       params = await this.#lookupParams(sessionId);
@@ -1166,6 +1216,11 @@ export class Router {
           err instanceof Error ? err.message : String(err)
         }`.slice(0, 300),
       });
+      return undefined;
+    }
+    // 归属查询可能失败（见 #isReadOnlySession）而列表随后成功：列表里带引擎的会话同样不能走到这里
+    if (this.#deps.manager.metaOf(sessionId)?.engine !== undefined) {
+      this.#emitMachine({ type: 'error.fatal', kind: 'config', message: '这个会话目前只能查看，不能在 trine 里操作' });
       return undefined;
     }
     if (params === undefined) {

@@ -26,7 +26,7 @@ import { SessionList } from '@/components/list/SessionList.tsx';
 import { SidebarListControls } from '@/components/list/ListControls.tsx';
 import { countArchived } from '@/components/list/filtering.ts';
 import { selectMachineFilterItems } from '@/components/list/sorting.ts';
-import { useListGroupBy, useListQuery, useListShowTemp } from '@/components/list/use-list-query.ts';
+import { useEngineFilter, useListGroupBy, useListQuery, useListShowTemp } from '@/components/list/use-list-query.ts';
 import { useSessionActions } from '@/components/list/use-session-actions.ts';
 import { useListFilters } from '@/app/Layout.tsx';
 import { useNow, useSessionRefresh } from '@/components/list/use-session-refresh.ts';
@@ -107,6 +107,7 @@ function ListControlsSlot({ filter }: { filter: string | null }): React.JSX.Elem
   const { search, setSearch, status, setStatus } = useListFilters();
   const [groupBy, setGroupBy] = useListGroupBy();
   const [showTemp, setShowTemp] = useListShowTemp();
+  const { engine, setEngine, options: engineOptions } = useEngineFilter();
   return (
     <SidebarListControls
       search={search}
@@ -117,6 +118,9 @@ function ListControlsSlot({ filter }: { filter: string | null }): React.JSX.Elem
       onGroupBy={setGroupBy}
       showTemp={showTemp}
       onShowTemp={setShowTemp}
+      engine={engine}
+      onEngine={setEngine}
+      engineOptions={engineOptions}
       archivedCount={countArchived(sessions, filter)}
       className="px-3 pb-2"
     />

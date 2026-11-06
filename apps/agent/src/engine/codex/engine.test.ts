@@ -1,0 +1,505 @@
+import { describe, expect, test } from 'bun:test';
+import { HistoryItemSchema, MachineInfoSchema, SessionMetaSchema } from '@trine/core';
+import { buildMachineInfo } from '../../app/machine-info.ts';
+import { AppServerClient, AppServerError } from './app-server.ts';
+import { CodexEngine, rateWindows, threadToMeta } from './engine.ts';
+import { FakeAppServer, fakeThread, rpcError } from './fake-app-server.ts';
+import { codexItemToHistory, unwrapShellCommand } from './history.ts';
+
+function engine(routes: ConstructorParameters<typeof FakeAppServer>[0], now: () => number = () => 1_000_000) {
+  const server = new FakeAppServer(routes);
+  const client = new AppServerClient({ spawn: server.spawn, clientVersion: '0', idleMs: 60_000, now });
+  let changes = 0;
+  const codex = new CodexEngine({ client, now, onChange: () => (changes += 1) });
+  return { server, client, codex, changes: () => changes };
+}
+
+describe('AppServerClient', () => {
+  test('惰性启动：第一次 call 才握手，只握手一次', async () => {
+    const server = new FakeAppServer({ ping: () => 'pong' });
+    const client = new AppServerClient({ spawn: server.spawn, clientVersion: '1.2.3', idleMs: 60_000 });
+    expect(server.spawnCount).toBe(0);
+    expect(await client.call('ping', {})).toBe('pong');
+    expect(await client.call('ping', {})).toBe('pong');
+    expect(server.spawnCount).toBe(1);
+    expect(server.calls.filter((c) => c.method === 'initialize')).toHaveLength(1);
+    expect(server.sent).toContainEqual({ method: 'initialized' });
+    expect(client.userAgent).toContain('9.9.9');
+    client.dispose();
+  });
+
+  test('不开 experimentalApi：只用稳定接口', async () => {
+    const server = new FakeAppServer({});
+    const client = new AppServerClient({ spawn: server.spawn, clientVersion: '0', idleMs: 60_000 });
+    await client.call('x', {}).catch(() => {});
+    const init = server.calls.find((c) => c.method === 'initialize')!.params as Record<string, unknown>;
+    expect(init['capabilities']).toBeUndefined();
+    client.dispose();
+  });
+
+  test('JSON-RPC 错误带错误码', async () => {
+    const server = new FakeAppServer({
+      bad: () => {
+        throw rpcError(-32600, 'nope');
+      },
+    });
+    const client = new AppServerClient({ spawn: server.spawn, clientVersion: '0', idleMs: 60_000 });
+    const err = await client.call('bad', {}).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(AppServerError);
+    expect((err as AppServerError).code).toBe(-32600);
+    client.dispose();
+  });
+
+  test('进程退出：挂起的请求被拒绝，下次 call 重新拉起', async () => {
+    const server = new FakeAppServer({ ping: () => 'pong' });
+    const client = new AppServerClient({ spawn: server.spawn, clientVersion: '0', idleMs: 60_000 });
+    await client.call('ping', {});
+    server.routes['hang'] = () => {
+      throw rpcError(0, 'unused');
+    };
+    server.handlers!.onExit();
+    expect(client.running).toBe(false);
+    expect(await client.call('ping', {})).toBe('pong');
+    expect(server.spawnCount).toBe(2);
+    client.dispose();
+  });
+
+  test('启动失败后一段时间内不重试', async () => {
+    let clock = 0;
+    let spawns = 0;
+    const client = new AppServerClient({
+      spawn: () => {
+        spawns += 1;
+        throw new Error('boom');
+      },
+      clientVersion: '0',
+      now: () => clock,
+      startRetryMs: 1000,
+    });
+    await expect(client.call('x', {})).rejects.toThrow('boom');
+    await expect(client.call('x', {})).rejects.toThrow('boom');
+    expect(spawns).toBe(1);
+    clock = 1000;
+    await expect(client.call('x', {})).rejects.toThrow('boom');
+    expect(spawns).toBe(2);
+    client.dispose();
+  });
+
+  test('服务端发来的请求：明确拒绝，不让对端干等', async () => {
+    const server = new FakeAppServer({ ping: () => 'pong' });
+    const client = new AppServerClient({ spawn: server.spawn, clientVersion: '0', idleMs: 60_000 });
+    await client.call('ping', {});
+    server.handlers!.onLine(JSON.stringify({ id: 99, method: 'item/commandExecution/requestApproval', params: {} }));
+    expect(server.sent).toContainEqual({ id: 99, error: { code: -32601, message: 'not supported by this client' } });
+    client.dispose();
+  });
+
+  test('畸形行被忽略，不影响后续请求', async () => {
+    const server = new FakeAppServer({ ping: () => 'pong' });
+    const client = new AppServerClient({ spawn: server.spawn, clientVersion: '0', idleMs: 60_000 });
+    await client.call('ping', {});
+    server.handlers!.onLine('not json');
+    expect(await client.call('ping', {})).toBe('pong');
+    client.dispose();
+  });
+
+  test('空闲退出后下次 call 重新拉起', async () => {
+    const server = new FakeAppServer({ ping: () => 'pong' });
+    const client = new AppServerClient({ spawn: server.spawn, clientVersion: '0', idleMs: 5 });
+    await client.call('ping', {});
+    await Bun.sleep(20);
+    expect(client.running).toBe(false);
+    expect(server.killed).toBe(1);
+    await client.call('ping', {});
+    expect(server.spawnCount).toBe(2);
+    client.dispose();
+  });
+});
+
+describe('threadToMeta', () => {
+  test('映射字段并过 schema；秒转毫秒', () => {
+    const meta = threadToMeta(fakeThread('t1', { name: '名字', recencyAt: 3000 }))!;
+    expect(SessionMetaSchema.parse(meta)).toBeDefined();
+    expect(meta).toMatchObject({
+      sessionId: 't1',
+      title: '名字',
+      engine: 'codex',
+      cwd: '/synthetic/project',
+      model: 'synthetic-model',
+      gitBranch: 'main',
+      createdAt: 1_000_000,
+      lastActivityAt: 3_000_000,
+      firstPrompt: 'prompt t1',
+    });
+  });
+
+  test('没有名字用 preview；exec 来源是 headless，其余不是', () => {
+    expect(threadToMeta(fakeThread('t'))!.title).toBe('prompt t');
+    expect(threadToMeta(fakeThread('t', { source: 'exec' }))!.headless).toBe(true);
+    expect(threadToMeta(fakeThread('t'))!.headless).toBeUndefined();
+  });
+
+  test('形状不对返回 undefined，不抛', () => {
+    expect(threadToMeta(null)).toBeUndefined();
+    expect(threadToMeta({ preview: 'x' })).toBeUndefined();
+  });
+});
+
+describe('rateWindows', () => {
+  test('只有周窗口的账号：不假设固定两个窗口', () => {
+    const out = rateWindows({
+      rateLimits: {},
+      rateLimitsByLimitId: {
+        codex: {
+          limitId: 'codex',
+          primary: { usedPercent: 5, windowDurationMins: 10080, resetsAt: 2000 },
+          secondary: null,
+        },
+      },
+    });
+    expect(out).toEqual([{ id: 'codex:primary', percent: 5, durationMins: 10080, resetsAt: 2_000_000 }]);
+  });
+
+  test('多桶才标桶名', () => {
+    const out = rateWindows({
+      rateLimitsByLimitId: {
+        a: { limitName: 'A', primary: { usedPercent: 1, windowDurationMins: 300, resetsAt: null } },
+        b: { limitName: null, secondary: { usedPercent: 2, windowDurationMins: null, resetsAt: null } },
+      },
+    });
+    expect(out).toEqual([
+      { id: 'a:primary', percent: 1, bucket: 'A', durationMins: 300 },
+      { id: 'b:secondary', percent: 2, bucket: 'b' },
+    ]);
+  });
+
+  test('没有按桶视图时用单桶字段；形状不对返回空', () => {
+    expect(rateWindows({ rateLimits: { primary: { usedPercent: 9 } } })).toEqual([{ id: 'default:primary', percent: 9 }]);
+    expect(rateWindows(null)).toEqual([]);
+    expect(rateWindows({ rateLimits: { primary: { usedPercent: 'x' } } })).toEqual([]);
+  });
+});
+
+describe('codexItemToHistory', () => {
+  const ok = (item: unknown) => HistoryItemSchema.parse(codexItemToHistory(item, 5));
+
+  test('用户消息：文本与图片占位', () => {
+    expect(
+      ok({
+        type: 'userMessage',
+        id: 'u',
+        startedAtMs: 7,
+        content: [{ type: 'text', text: 'hi' }, { type: 'localImage', path: '/x.png' }],
+      }),
+    ).toEqual({ kind: 'user', id: 'u', text: 'hi\n[图片]', ts: 7 });
+  });
+
+  test('assistant；时间戳缺失用兜底', () => {
+    expect(ok({ type: 'agentMessage', id: 'a', text: 'yo' })).toEqual({ kind: 'assistant', id: 'a', text: 'yo', ts: 5 });
+  });
+
+  test('命令：退出码非 0 是 error', () => {
+    const item = ok({ type: 'commandExecution', id: 'c', command: 'false', status: 'completed', exitCode: 1, durationMs: 1500, commandActions: [] });
+    expect(item).toMatchObject({ kind: 'tool', toolName: 'Shell', status: 'error', durationMs: 1500 });
+  });
+
+  test('单条读文件的命令显示成 Read，带路径', () => {
+    const item = ok({
+      type: 'commandExecution',
+      id: 'c',
+      command: 'cat /a/b.txt',
+      status: 'completed',
+      exitCode: 0,
+      commandActions: [{ type: 'read', command: 'cat', name: 'b.txt', path: '/a/b.txt' }],
+      aggregatedOutput: 'text',
+    });
+    expect(item).toMatchObject({ toolName: 'Read', filePath: '/a/b.txt', status: 'ok', outputPreview: 'text' });
+  });
+
+  test('改文件：单文件带路径，统计增删', () => {
+    const item = ok({
+      type: 'fileChange',
+      id: 'f',
+      status: 'completed',
+      changes: [{ path: '/a.txt', kind: { type: 'update' }, diff: '--- a\n+++ b\n+x\n+y\n-z\n' }],
+    });
+    expect(item).toMatchObject({ toolName: 'Edit', filePath: '/a.txt', resultSummary: '+2 −1', status: 'ok' });
+  });
+
+  test('改多个文件：不带路径；被拒绝是 error', () => {
+    const item = ok({
+      type: 'fileChange',
+      id: 'f',
+      status: 'declined',
+      changes: [
+        { path: '/a', diff: '' },
+        { path: '/b', diff: '' },
+      ],
+    });
+    expect(item).toMatchObject({ argSummary: '2 个文件', status: 'error' });
+    expect((item as { filePath?: string }).filePath).toBeUndefined();
+  });
+
+  test('MCP 用 mcp__ 前缀；进行中没有状态', () => {
+    const item = ok({ type: 'mcpToolCall', id: 'm', server: 's', tool: 't', status: 'inProgress', arguments: { a: 1 } });
+    expect(item).toMatchObject({ toolName: 'mcp__s__t', argSummary: '{"a":1}' });
+    expect((item as { status?: string }).status).toBeUndefined();
+  });
+
+  test('搜索', () => {
+    expect(ok({ type: 'webSearch', id: 'w', query: 'q' })).toMatchObject({ toolName: 'WebSearch', argSummary: 'q' });
+  });
+
+  test('长消息截断，否则会突破历史分页的体积上限', () => {
+    const long = 'x'.repeat(20 * 1024);
+    const assistant = ok({ type: 'agentMessage', id: 'a', text: long }) as { text: string };
+    const user = ok({ type: 'userMessage', id: 'u', content: [{ type: 'text', text: long }] }) as { text: string };
+    expect(assistant.text.length).toBeLessThan(9 * 1024);
+    expect(user.text.length).toBeLessThan(9 * 1024);
+  });
+
+  test('不认识的条目与形状不对的条目跳过', () => {
+    expect(codexItemToHistory({ type: 'reasoning', id: 'r' }, 0)).toBeUndefined();
+    expect(codexItemToHistory({ type: 'somethingNew', id: 'x' }, 0)).toBeUndefined();
+    expect(codexItemToHistory({ type: 'agentMessage' }, 0)).toBeUndefined();
+    expect(codexItemToHistory('nope', 0)).toBeUndefined();
+  });
+});
+
+describe('unwrapShellCommand', () => {
+  test('去掉 shell 外壳', () => {
+    expect(unwrapShellCommand('/usr/bin/zsh -lc "ls -la"')).toBe('ls -la');
+    expect(unwrapShellCommand("bash -lc 'echo hi'")).toBe('echo hi');
+    expect(unwrapShellCommand('/bin/sh -c "git status"')).toBe('git status');
+  });
+
+  test('还原转义的引号', () => {
+    expect(unwrapShellCommand('zsh -lc "rg \\"foo\\" src"')).toBe('rg "foo" src');
+    expect(unwrapShellCommand("bash -lc 'echo '\\''x'\\'''")).toBe("echo 'x'");
+  });
+
+  test('不是外壳形式的原样返回', () => {
+    expect(unwrapShellCommand('ls -la')).toBe('ls -la');
+    expect(unwrapShellCommand('zsh script.sh')).toBe('zsh script.sh');
+    expect(unwrapShellCommand('bash -lc "a" && rm x')).toBe('bash -lc "a" && rm x');
+    expect(unwrapShellCommand('bash -lc "a" && echo "b"')).toBe('bash -lc "a" && echo "b"');
+  });
+});
+
+describe('CodexEngine', () => {
+  test('列表翻页，且只读 state DB、不写', async () => {
+    const pages: Record<string, unknown> = {
+      first: { data: [fakeThread('a')], nextCursor: 'c2' },
+      c2: { data: [fakeThread('b')], nextCursor: null },
+    };
+    const { codex, server } = engine({
+      'thread/list': (p) => pages[(p as { cursor?: string }).cursor ?? 'first'],
+      'account/read': () => ({ account: { type: 'chatgpt' }, requiresOpenaiAuth: true }),
+      'account/rateLimits/read': () => ({}),
+    });
+    const list = await codex.listSessions();
+    expect(list.map((m) => m.sessionId)).toEqual(['a', 'b']);
+    const params = server.calls.find((c) => c.method === 'thread/list')!.params as Record<string, unknown>;
+    expect(params['useStateDbOnly']).toBe(true);
+    expect(params['sourceKinds']).toEqual(['cli', 'vscode', 'exec', 'appServer']);
+    const forbidden = ['thread/start', 'thread/resume', 'turn/start', 'thread/archive', 'thread/delete', 'thread/name/set'];
+    expect(server.calls.filter((c) => forbidden.includes(c.method))).toEqual([]);
+    codex.dispose();
+  });
+
+  test('owns：列表里有的不问；thread/read 能查到的记住；查无此 thread 短期缓存', async () => {
+    let clock = 0;
+    let reads = 0;
+    const { codex } = engine(
+      {
+        'thread/list': () => ({ data: [fakeThread('listed')], nextCursor: null }),
+        'thread/read': (p) => {
+          reads += 1;
+          const id = (p as { threadId: string }).threadId;
+          if (id === 'found') return { thread: fakeThread('found') };
+          throw rpcError(-32600, `thread not loaded: ${id}`);
+        },
+        'account/read': () => ({ account: { type: 'chatgpt' } }),
+        'account/rateLimits/read': () => ({}),
+      },
+      () => clock,
+    );
+    await codex.listSessions();
+    expect(await codex.owns('listed')).toBe(true);
+    expect(reads).toBe(0);
+    expect(await codex.owns('found')).toBe(true);
+    expect(codex.metaOf('found')?.cwd).toBe('/synthetic/project');
+    expect(await codex.owns('claude-id')).toBe(false);
+    const after = reads;
+    expect(await codex.owns('claude-id')).toBe(false);
+    expect(reads).toBe(after);
+    clock = 60_000;
+    expect(await codex.owns('claude-id')).toBe(false);
+    expect(reads).toBe(after + 1);
+    codex.dispose();
+  });
+
+  test('owns：内部错误不算「不存在」，否则 GC 会误清标记', async () => {
+    const { codex } = engine({
+      'thread/read': () => {
+        throw rpcError(-32603, 'internal error');
+      },
+    });
+    await expect(codex.owns('x')).rejects.toThrow('internal error');
+    codex.dispose();
+  });
+
+  test('列表有等待上限：卡住时退回缓存，跑完后缓存更新', async () => {
+    let release: (value: unknown) => void = () => {};
+    let hang = false;
+    const client = {
+      userAgent: undefined,
+      dispose: () => {},
+      call: (method: string) => {
+        if (method !== 'thread/list') return Promise.resolve({ account: { type: 'chatgpt' } });
+        if (hang) return new Promise((resolve) => (release = resolve));
+        return Promise.resolve({ data: [fakeThread('a')], nextCursor: null });
+      },
+    };
+    const codex = new CodexEngine({ client });
+    expect((await codex.listSessionsBounded(50)).map((m) => m.sessionId)).toEqual(['a']);
+    hang = true;
+    const started = Date.now();
+    expect((await codex.listSessionsBounded(10)).map((m) => m.sessionId)).toEqual(['a']);
+    expect(Date.now() - started).toBeLessThan(1000);
+    release({ data: [fakeThread('b')], nextCursor: null });
+    await Bun.sleep(5);
+    expect(codex.cachedSessions().map((m) => m.sessionId)).toEqual(['b']);
+  });
+
+  test('列表失败：退回缓存，不抛', async () => {
+    const client = {
+      userAgent: undefined,
+      dispose: () => {},
+      call: async () => {
+        throw new AppServerError('down');
+      },
+    };
+    const codex = new CodexEngine({ client });
+    expect(await codex.listSessionsBounded(50)).toEqual([]);
+  });
+
+  test('owns：app-server 起不来时抛错，而不是说「不是」', async () => {
+    const client = new AppServerClient({
+      spawn: () => {
+        throw new Error('no binary');
+      },
+      clientVersion: '0',
+    });
+    const codex = new CodexEngine({ client });
+    await expect(codex.owns('x')).rejects.toThrow('no binary');
+    codex.dispose();
+  });
+
+  test('历史：元素是 {item, startedAtMs}，翻页，认不出的跳过', async () => {
+    const { codex } = engine({
+      'thread/items/list': (p) =>
+        (p as { cursor?: string }).cursor === undefined
+          ? {
+              data: [
+                { turnId: 't', startedAtMs: 100, item: { type: 'userMessage', id: 'u', content: [{ type: 'text', text: 'q' }] } },
+                { turnId: 't', startedAtMs: 110, item: { type: 'reasoning', id: 'r' } },
+              ],
+              nextCursor: 'n',
+            }
+          : { data: [{ turnId: 't', startedAtMs: 120, item: { type: 'agentMessage', id: 'a', text: 'ans' } }], nextCursor: null },
+    });
+    expect(await codex.history('t1')).toEqual([
+      { kind: 'user', id: 'u', text: 'q', ts: 100 },
+      { kind: 'assistant', id: 'a', text: 'ans', ts: 120 },
+    ]);
+    codex.dispose();
+  });
+
+  test('历史：没有分页接口的 thread 退回 thread/read，时间单调不回退', async () => {
+    const { codex } = engine({
+      'thread/items/list': () => {
+        throw rpcError(-32601, 'not supported yet');
+      },
+      'thread/read': () => ({
+        thread: {
+          turns: [
+            {
+              items: [
+                { type: 'userMessage', id: 'u', startedAtMs: 50, content: [{ type: 'text', text: 'q' }] },
+                { type: 'agentMessage', id: 'a', text: 'ans' },
+              ],
+            },
+          ],
+        },
+      }),
+    });
+    expect(await codex.history('t1')).toEqual([
+      { kind: 'user', id: 'u', text: 'q', ts: 50 },
+      { kind: 'assistant', id: 'a', text: 'ans', ts: 50 },
+    ]);
+    codex.dispose();
+  });
+
+  test('summary：只读能力；版本从 userAgent 取；限额进 summary 且过 schema；有变化才回调', async () => {
+    const h = engine({
+      'account/read': () => ({ account: { type: 'chatgpt' }, requiresOpenaiAuth: true }),
+      'account/rateLimits/read': () => ({
+        rateLimitsByLimitId: { codex: { primary: { usedPercent: 5, windowDurationMins: 10080, resetsAt: 2000 } } },
+      }),
+    });
+    expect(h.codex.summary().capabilities.interactive).toBe(false);
+    await h.codex.refresh();
+    const summary = h.codex.summary();
+    expect(summary).toMatchObject({ id: 'codex', version: '9.9.9', available: true });
+    expect(summary.rateLimits?.windows[0]?.percent).toBe(5);
+    expect(h.changes()).toBe(1);
+    await h.codex.refresh();
+    const info = buildMachineInfo({ name: 'm', claudeVersion: '', activeSessionCount: 0, maxSessions: 1, engines: [summary] });
+    expect(MachineInfoSchema.parse(info).engines?.[0]?.id).toBe('codex');
+    h.codex.dispose();
+  });
+
+  test('未登录：不可用，给出办法，不读限额', async () => {
+    const h = engine({ 'account/read': () => ({ account: null, requiresOpenaiAuth: true }) });
+    await h.codex.refresh();
+    expect(h.codex.summary().available).toBe(false);
+    expect(h.codex.summary().unavailableReason).toContain('codex login');
+    expect(h.server.calls.some((c) => c.method === 'account/rateLimits/read')).toBe(false);
+    h.codex.dispose();
+  });
+
+  test('API key 账号读限额报错：仍可用，没有限额', async () => {
+    const h = engine({
+      'account/read': () => ({ account: { type: 'apiKey' }, requiresOpenaiAuth: true }),
+      'account/rateLimits/read': () => {
+        throw rpcError(-32600, 'no limits');
+      },
+    });
+    await h.codex.refresh();
+    expect(h.codex.summary().available).toBe(true);
+    expect(h.codex.summary().rateLimits).toBeUndefined();
+    h.codex.dispose();
+  });
+
+  test('app-server 不可用：summary 写原因，refresh 不抛；列表退回缓存', async () => {
+    let fail = false;
+    const client = {
+      userAgent: undefined,
+      dispose: () => {},
+      call: async (method: string) => {
+        if (fail) throw new AppServerError('down');
+        if (method === 'thread/list') return { data: [fakeThread('a')], nextCursor: null };
+        return { account: { type: 'chatgpt' } };
+      },
+    };
+    const codex = new CodexEngine({ client });
+    await codex.listSessions();
+    await codex.refresh();
+    fail = true;
+    await codex.refresh();
+    expect(codex.summary().available).toBe(false);
+    await expect(codex.listSessions()).rejects.toThrow('down');
+    expect(codex.cachedSessions().map((m) => m.sessionId)).toEqual(['a']);
+  });
+});

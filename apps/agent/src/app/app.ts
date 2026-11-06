@@ -62,6 +62,8 @@ import {
 } from './claude-cli.ts';
 import { ClaudeLatestChecker } from './claude-latest.ts';
 import { claudeEngineSummary } from '../engine/claude.ts';
+import { AppServerClient, spawnCodexAppServer, type SpawnAppServer } from '../engine/codex/app-server.ts';
+import { CodexEngine } from '../engine/codex/engine.ts';
 import { AGENT_VERSION, buildMachineInfo } from './machine-info.ts';
 import {
   findUp,
@@ -92,6 +94,8 @@ function headlessProbeOption(deps: AgentAppDeps): { headlessProbe?: HeadlessProb
 }
 
 export interface AgentAppDeps {
+  /** 注入 Codex 的 app-server（测试）；给了就启用 Codex 引擎，不看配置 */
+  spawnCodexAppServer?: SpawnAppServer;
   /** 注入假会话工厂（测试） */
   createSession?: (args: CreateSessionArgs) => EngineSession;
   listSessionsFn?: typeof listSessions;
@@ -168,6 +172,7 @@ export class AgentApp {
   /** 文件查看的单文件上限；undefined = 关闭（machine.info 不带 files） */
   #filesMaxBytes: number | undefined;
   #planUsage!: PlanUsageTracker;
+  #codex: CodexEngine | undefined;
   #machineStats!: MachineStatsWatcher;
   #extRegistry!: ExtensionRegistry;
   #extLinks!: SessionLinksStore;
@@ -245,9 +250,31 @@ export class AgentApp {
         })
       : undefined;
 
+    const codexSpawn =
+      deps.spawnCodexAppServer ??
+      (config.codexEnabled === true && Bun.which(config.codexBin ?? 'codex') !== null
+        ? spawnCodexAppServer(Bun.which(config.codexBin ?? 'codex')!)
+        : undefined);
+    const codex =
+      codexSpawn === undefined
+        ? undefined
+        : new CodexEngine({
+            client: new AppServerClient({ spawn: codexSpawn, clientVersion: AGENT_VERSION, now, log }),
+            now,
+            log,
+            onChange: () => app.#emitMachine({ type: 'machine.info', info: app.machineInfo() }),
+          });
     const manager = new SessionManager({
       emitter,
       now,
+      ...(codex === undefined
+        ? {}
+        : {
+            externalSessions: {
+              list: () => codex.listSessionsBounded(),
+              metaOf: (sessionId: string) => codex.metaOf(sessionId),
+            },
+          }),
       uploadsDir: (sessionId) => attachments.sessionDir(sessionId),
       // 会话里跑的 `trine-agent restart` 据此找到本 agent、认出发起的会话
       // home 转成绝对路径：子进程的 cwd 是会话目录，相对路径会指到别处
@@ -362,7 +389,11 @@ export class AgentApp {
       renameMachine: (name) => app.#rename(name, paths.identity),
       updateClaude: () => app.#updateClaude(),
       checkClaude: () => app.#claudeLatest.check(),
-      refreshUsage: () => app.#planUsage.refresh(),
+      refreshUsage: () => {
+        void app.#codex?.refresh();
+        return app.#planUsage.refresh();
+      },
+      readOnlyEngine: codex,
       restartAgent: async (action) => (action === 'cancel' ? app.cancelRestart() : app.restartAgent({ mode: action === 'now' ? 'now' : 'when_idle' })),
       machineStats,
       now,
@@ -402,6 +433,8 @@ export class AgentApp {
       claudeVersion,
     );
     app.#commandsProbe = commandsProbe;
+    app.#codex = codex;
+    void codex?.refresh();
     app.#filesMaxBytes = files?.maxBytes;
     app.#machineStats = machineStats;
     app.#extRegistry = extRegistry;
@@ -508,7 +541,11 @@ export class AgentApp {
     const now = this.now();
     try {
       const tombstones = await this.flags.sweepTombstones(now);
-      const exists = async (sid: string): Promise<boolean> => (await this.manager.sessionInfo(sid)) !== undefined;
+      const exists = async (sid: string): Promise<boolean> => {
+        if ((await this.manager.sessionInfo(sid)) !== undefined) return true;
+        // Codex 的会话不在 Claude 的存储里。app-server 不可用时当作存在：标记晚点清不要紧，误清就丢了
+        return this.#codex === undefined ? false : this.#codex.owns(sid).catch(() => true);
+      };
       const archived = await this.flags.gcArchived(now, exists);
       const pinned = await this.flags.gcPinned(now, exists);
       if (tombstones + archived + pinned > 0) {
@@ -546,6 +583,7 @@ export class AgentApp {
     this.#claudeLatest.dispose();
     this.#commandsProbe.dispose();
     this.#planUsage.dispose();
+    this.#codex?.dispose();
     this.#machineStats.dispose();
     this.#extensions.dispose();
     this.#restart.dispose();
@@ -616,7 +654,10 @@ export class AgentApp {
       restart: this.#restart === undefined ? undefined : this.#restartInfo(),
       claudeLatest: this.#claudeLatest?.current,
       files: this.#filesMaxBytes === undefined ? undefined : { maxBytes: this.#filesMaxBytes },
-      engines: [claudeEngineSummary(this.claudeVersion)],
+      engines: [
+        claudeEngineSummary(this.claudeVersion),
+        ...(this.#codex === undefined ? [] : [this.#codex.summary()]),
+      ],
     });
   }
 

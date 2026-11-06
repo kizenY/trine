@@ -33,7 +33,8 @@ import { SessionList } from '@/components/list/SessionList.tsx';
 import { countActiveSessions, countLiveSessions, liveSessionsLine } from '@/components/list/sorting.ts';
 import { countArchived, DEFAULT_LIST_QUERY, type ListQuery } from '@/components/list/filtering.ts';
 import { useNow } from '@/components/list/use-session-refresh.ts';
-import { PlanUsageLine, PlanUsageRefreshButton } from '@/components/usage/PlanUsage.tsx';
+import { EngineUsageLines, PlanUsageLine, PlanUsageRefreshButton } from '@/components/usage/PlanUsage.tsx';
+import { enginesOf, hasMultipleEngines } from '@/lib/engine-model.ts';
 import { supportsUsageRefresh } from '@/components/usage/usage-model.ts';
 import { useSessionActions } from '@/components/list/use-session-actions.ts';
 import { useListShowTemp } from '@/components/list/use-list-query.ts';
@@ -118,6 +119,27 @@ export function MachineDetailView(): React.JSX.Element {
               </span>
             )}
           </dd>
+          {hasMultipleEngines(machine.info) && (
+            <>
+              <dt className="text-text-3">引擎</dt>
+              <dd className="flex flex-col gap-0.5 text-xs" data-testid="detail-engines">
+                {enginesOf(machine.info).map((engine) => (
+                  <span key={engine.id} data-engine={engine.id}>
+                    <span className="font-mono">
+                      {engine.displayName}
+                      {engine.version === undefined ? '' : ` ${engine.version}`}
+                    </span>
+                    {engine.unavailableReason !== undefined && (
+                      <span className="text-amber"> · {engine.unavailableReason}</span>
+                    )}
+                    {engine.available && engine.capabilities.interactive !== true && (
+                      <span className="text-text-3"> · 目前只能查看</span>
+                    )}
+                  </span>
+                ))}
+              </dd>
+            </>
+          )}
           <dt className="text-text-3">会话</dt>
           <dd>
             {totalCount} 个
@@ -141,6 +163,7 @@ export function MachineDetailView(): React.JSX.Element {
                 ) : (
                   <PlanUsageLine rateLimits={machine.info.rateLimits} now={now} />
                 )}
+                <EngineUsageLines info={machine.info} now={now} />
                 <PlanUsageRefreshButton machine={machine} />
               </dd>
             </>

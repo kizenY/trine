@@ -1,6 +1,15 @@
 import { describe, expect, test } from 'bun:test';
 import type { EngineSummary } from '@trine/core';
-import { capabilitiesOf, engineOf, enginesOf } from './engine-model.ts';
+import {
+  capabilitiesOf,
+  engineFilterOptions,
+  engineOf,
+  enginesOf,
+  enginesWithLimits,
+  engineTag,
+  sessionEngineTag,
+  windowLabel,
+} from './engine-model.ts';
 
 const claude: EngineSummary = {
   id: 'claude',
@@ -41,5 +50,47 @@ describe('engine-model', () => {
   test('不认识的引擎什么都不支持', () => {
     expect(engineOf({ engines: [claude] }, { engine: 'future' })).toBeUndefined();
     expect(capabilitiesOf({ engines: [claude] }, { engine: 'future' })).toEqual({});
+  });
+});
+
+describe('多引擎展示', () => {
+  test('短名取第一个词', () => {
+    expect(engineTag({ displayName: 'Claude Code' })).toBe('Claude');
+    expect(engineTag({ displayName: 'Codex' })).toBe('Codex');
+  });
+
+  test('列表标签：只有一个引擎时不显示', () => {
+    expect(sessionEngineTag({ engines: [claude] }, {})).toBeUndefined();
+    expect(sessionEngineTag({}, {})).toBeUndefined();
+  });
+
+  test('列表标签：多引擎时都标；不认识的显示原始 id', () => {
+    const info = { engines: [claude, other] };
+    expect(sessionEngineTag(info, {})).toBe('Claude');
+    expect(sessionEngineTag(info, { engine: 'other' })).toBe('Other');
+    expect(sessionEngineTag(info, { engine: 'future' })).toBe('future');
+  });
+
+  test('筛选选项：所有机器的并集，少于两个时为空', () => {
+    expect(engineFilterOptions([{ engines: [claude] }, {}])).toEqual([]);
+    expect(engineFilterOptions([{ engines: [claude] }, { engines: [claude, other] }])).toEqual([
+      { id: 'claude', label: 'Claude' },
+      { id: 'other', label: 'Other' },
+    ]);
+  });
+
+  test('窗口标签按时长换算，多桶带桶名', () => {
+    expect(windowLabel({ durationMins: 300 })).toBe('5h');
+    expect(windowLabel({ durationMins: 10080 })).toBe('1w');
+    expect(windowLabel({ durationMins: 1440 })).toBe('1d');
+    expect(windowLabel({ durationMins: 45 })).toBe('45m');
+    expect(windowLabel({ durationMins: 300, bucket: 'A' })).toBe('A 5h');
+    expect(windowLabel({})).toBe('限额');
+  });
+
+  test('只列有窗口的引擎', () => {
+    const withLimits = { ...other, rateLimits: { windows: [{ id: 'w', percent: 1 }], updatedAt: 1 } };
+    const empty = { ...claude, rateLimits: { windows: [], updatedAt: 1 } };
+    expect(enginesWithLimits({ engines: [empty, withLimits] }).map((e) => e.id)).toEqual(['other']);
   });
 });

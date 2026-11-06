@@ -4,6 +4,7 @@
  * 用假的 ClaudeSession 工厂注入，避免起真子进程——这些逻辑本身与 SDK 无关。
  */
 import { describe, expect, test } from 'bun:test';
+import type { SessionMeta } from '@trine/core';
 import type { listSessions } from '@anthropic-ai/claude-agent-sdk';
 import { EventEmitter } from './emitter.ts';
 import {
@@ -871,5 +872,63 @@ describe('SessionManager · waitingFor 与权限模式变化（exit-plan-mode）
     emitMeta(fakes[0]!, { permissionMode: 'default' });
     expect(changes).toEqual([['s1', 'default']]);
     expect(updatedOf(events).at(-1)!.permissionMode).toBe('default');
+  });
+});
+
+describe('SessionManager · 其他引擎的会话', () => {
+  const meta = (sessionId: string, over: Partial<SessionMeta> = {}): SessionMeta => ({
+    sessionId,
+    title: sessionId,
+    state: 'idle',
+    lastActivityAt: 5,
+    cwd: '/synthetic',
+    model: 'm',
+    permissionMode: 'default',
+    costUsd: 0,
+    engine: 'codex',
+    ...over,
+  });
+
+  function make(external: SessionMeta[] | Error, flags = fakeFlags().flags) {
+    const emitter = new EventEmitter({ now: () => 1, sink: () => {} });
+    return new SessionManager({
+      emitter,
+      flags,
+      listSessionsFn: (async () => []) as never,
+      getSessionInfoFn: (async () => undefined) as never,
+      externalSessions: {
+        list: async () => {
+          if (external instanceof Error) throw external;
+          return external;
+        },
+        metaOf: (id) => (external instanceof Error ? undefined : external.find((m) => m.sessionId === id)),
+      },
+    });
+  }
+
+  test('并进列表，带引擎字段，合并归档与置顶标记', async () => {
+    const f = fakeFlags();
+    f.archived.set('a', 9);
+    const manager = make([meta('a'), meta('b')], f.flags);
+    const list = await manager.list();
+    expect(list.map((m) => m.sessionId).sort()).toEqual(['a', 'b']);
+    expect(list.find((m) => m.sessionId === 'a')).toMatchObject({ engine: 'codex', archived: true, archivedAt: 9 });
+    expect(await manager.snapshot('a')).toMatchObject({ engine: 'codex', archived: true });
+    expect(manager.metaOf('b')?.engine).toBe('codex');
+  });
+
+  test('headless 不被 decorate 抹掉', async () => {
+    const manager = make([meta('a', { headless: true })]);
+    expect((await manager.list())[0]?.headless).toBe(true);
+  });
+
+  test('永久删除过的不出现', async () => {
+    const f = fakeFlags();
+    f.deleted.add('a');
+    expect(await make([meta('a')], f.flags).list()).toEqual([]);
+  });
+
+  test('目录抛错：只记日志，不影响 Claude 列表', async () => {
+    expect(await make(new Error('down')).list()).toEqual([]);
   });
 });

@@ -300,6 +300,8 @@ agent 侧所有产出 SessionMeta 的出口（list、session.created、session.u
 - `session.create` 可带 `engine`、`engineMode`；不支持的引擎回 `error.fatal`（`kind: config`），不建会话。`session.setPermissionMode` 可带 `engineMode`。
 - 引擎 id 和 `engineMode` 是开放字符串，不做枚举；原因见 DECISIONS D20。
 - 引擎不支持的请求由 agent 拒绝：回退回 `unavailable`，刷新 context 回 `failed`。
+- Codex 目前只读（`capabilities.interactive` 为 false）：列表与 `session.history.request` 可用，归档、置顶是 trine 自己的标记，也可用。发消息等要拉起会话的请求回机器级 `error.fatal`（`kind: config`），重命名、删除回 `session.mutate.response`（`ok: false`），`session.commands.request` 回空列表。
+- `EngineSummary.rateLimits.windows`：引擎的限额窗口，数量和时长因账号而异（实测有只给周窗口的账号），不能假设是 5 小时 + 7 天。Claude 的限额仍在 `MachineInfo.rateLimits`。
 
 ## 协议约定汇总
 

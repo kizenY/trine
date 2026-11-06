@@ -20,6 +20,7 @@ import type { EngineSession } from '../engine/types.ts';
 import type { EventBody } from '../bridge/types.ts';
 import { AgentApp, type AgentAppDeps } from '../app/app.ts';
 import type { SpawnFn } from '../app/claude-cli.ts';
+import type { SpawnAppServer } from '../engine/codex/app-server.ts';
 import type { AgentConfig } from '../app/config.ts';
 import { FakeTranscripts } from './fake-transcripts.ts';
 
@@ -188,6 +189,8 @@ export class EchoSession implements EngineSession {
 // ---------------------------------------------------------------------------
 
 export interface StartEchoAgentOptions {
+  /** 注入假的 Codex app-server；不给 = 没有 Codex 引擎 */
+  spawnCodexAppServer?: SpawnAppServer;
   getInvitation?: () => Promise<string>;
   /** 服务端根地址，如 `http://127.0.0.1:8787` */
   serverUrl: string;
@@ -289,6 +292,7 @@ export async function startEchoAgent(
     whichFn: options.whichFn ?? (() => null),
     ...(options.spawnFn === undefined ? {} : { spawnFn: options.spawnFn }),
     log: options.log ?? (() => {}),
+    ...(options.spawnCodexAppServer === undefined ? {} : { spawnCodexAppServer: options.spawnCodexAppServer }),
     listSessionsFn:
       recording === undefined ? ((async () => []) as typeof listSessions) : transcripts.listSessions,
     getSessionInfoFn: transcripts.getSessionInfo,

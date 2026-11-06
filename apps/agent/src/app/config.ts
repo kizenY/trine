@@ -35,6 +35,13 @@ export interface AgentConfig {
   filesEnabled: boolean;
   /** 会话 cwd 之外允许查看的目录（env `TRINE_FILES_ALLOW`，`:` 分隔，已展开 `~`、转成绝对路径） */
   filesAllow: string[];
+  /**
+   * 启用 Codex 引擎：env `TRINE_ENGINES`（逗号分隔）不含 codex 时关闭，默认开。
+   * 实际还要机器上找得到 codex。省略 = 关（手写配置的测试不会碰本机的 codex）
+   */
+  codexEnabled?: boolean;
+  /** codex 可执行文件（env `TRINE_CODEX_BIN`）；默认 PATH 上的 codex */
+  codexBin?: string | undefined;
 }
 
 /**
@@ -114,7 +121,8 @@ export const USAGE = `用法：trine-agent [--enroll] [--pair] [--server URL] [-
   selfcheck       加载全部代码后退出（重启预检用）
 
 env：TRINE_DEFAULT_MODEL  TRINE_MAX_SESSIONS  TRINE_IDLE_TIMEOUT_MS
-     TRINE_FILES=off（关闭文件查看）  TRINE_FILES_ALLOW=DIR[:DIR...]（会话目录之外允许查看的目录）`;
+     TRINE_FILES=off（关闭文件查看）  TRINE_FILES_ALLOW=DIR[:DIR...]（会话目录之外允许查看的目录）
+     TRINE_ENGINES=claude（不启用 Codex；默认 claude,codex）  TRINE_CODEX_BIN=PATH`;
 
 export interface SubcommandInvocation {
   command: Subcommand;
@@ -241,6 +249,14 @@ export class ConfigError extends Error {
  * 未知开关直接报错而不是忽略：`--sever` 这种拼错被静默吞掉，用户会盯着
  * 一个连不上的 agent 找半天。
  */
+function parseEngines(raw: string | undefined): string[] {
+  const list = (raw ?? '')
+    .split(',')
+    .map((s) => s.trim().toLowerCase())
+    .filter((s) => s !== '');
+  return list.length === 0 ? ['claude', 'codex'] : list;
+}
+
 export function loadAgentConfig(
   argv: readonly string[],
   env: Readonly<Record<string, string | undefined>>,
@@ -273,6 +289,8 @@ export function loadAgentConfig(
     claudeBin,
     filesEnabled: !['off', '0', 'false', 'no'].includes((env['TRINE_FILES'] ?? '').trim().toLowerCase()),
     filesAllow: parseFilesAllow(env['TRINE_FILES_ALLOW']),
+    codexEnabled: parseEngines(env['TRINE_ENGINES']).includes('codex'),
+    codexBin: nonEmpty(env['TRINE_CODEX_BIN']),
   };
 }
 

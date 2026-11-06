@@ -98,12 +98,16 @@ export interface ListFilters {
   setSearch: (search: string) => void;
   status: StatusFilter;
   setStatus: (status: StatusFilter) => void;
+  engine: string | null;
+  setEngine: (engine: string | null) => void;
 }
 const ListFiltersContext = createContext<ListFilters>({
   search: '',
   setSearch: () => {},
   status: 'all',
   setStatus: () => {},
+  engine: null,
+  setEngine: () => {},
 });
 
 export function useListFilters(): ListFilters {
@@ -140,9 +144,10 @@ export function Layout(): React.JSX.Element {
   );
   const [search, setSearch] = useState('');
   const [status, setStatus] = useState<StatusFilter>('all');
+  const [engine, setEngine] = useState<string | null>(null);
   const listFilters = useMemo<ListFilters>(
-    () => ({ search, setSearch, status, setStatus }),
-    [search, status],
+    () => ({ search, setSearch, status, setStatus, engine, setEngine }),
+    [search, status, engine],
   );
 
   if (runtime.phase === 'booting' || runtime.phase === 'error') {

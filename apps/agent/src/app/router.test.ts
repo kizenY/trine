@@ -41,6 +41,7 @@ import {
   Router,
   toSlashCommands,
   type RouterDeps,
+  type ReadOnlyEngine,
 } from './router.ts';
 import { SessionFlagsStore, TOMBSTONE_TTL_MS } from './session-flags.ts';
 import {
@@ -245,6 +246,7 @@ async function makeHarness(options: {
   links?: SessionLinksStore;
   /** 时间线记录卡（扩展）；省略 = 不支持 */
   records?: SessionRecordsStore;
+  readOnlyEngine?: ReadOnlyEngine;
 } = {}) {
   const probeCalls: string[] = [];
   const historyCalls: { sessionId: string; dir: string | undefined }[] = [];
@@ -290,6 +292,7 @@ async function makeHarness(options: {
   const timers: { fn: () => void; ms: number; cleared: boolean }[] = [];
   const renames: string[] = [];
   router = new Router({
+    ...(options.readOnlyEngine === undefined ? {} : { readOnlyEngine: options.readOnlyEngine }),
     manager,
     emitter,
     state,
@@ -2683,5 +2686,107 @@ describe('Router · 扩展', () => {
     await h.router.handle({ type: 'ext.catalog.request', ...c2a(), reqId: 'k2' }, phone);
     await h.router.idle();
     expect(h.byType('ext.catalog.response').at(-1)).toMatchObject({ reqId: 'k2', items: [] });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 只读引擎（Codex）：只读、不被当成 Claude 会话 resume
+// ---------------------------------------------------------------------------
+describe('Router · 只读引擎', () => {
+  const readOnlyEngine = {
+    owns: async (id: string) => id === 'codex-1',
+    history: async () => [{ kind: 'assistant' as const, id: 'a', text: 'from codex', ts: 1 }],
+  };
+
+  test('历史走引擎，不读 Claude 转录', async () => {
+    const h = await makeHarness({ readOnlyEngine });
+    await h.router.handle({ type: 'session.history.request', ...c2a('codex-1'), reqId: 'h1' }, phone);
+    await h.router.idle();
+    expect(h.byType('session.history.response')[0]).toMatchObject({ items: [{ text: 'from codex' }] });
+  });
+
+  test('发消息：不建会话，报错', async () => {
+    const h = await makeHarness({ readOnlyEngine });
+    await h.router.handle({ type: 'input.send', ...c2a('codex-1'), clientMsgId: 'c', text: 'hi' }, phone);
+    expect(h.created).toHaveLength(0);
+    expect(h.byType('error.fatal')[0]).toMatchObject({ kind: 'config' });
+  });
+
+  test('改模型等其他会话操作也不建会话', async () => {
+    const h = await makeHarness({ readOnlyEngine });
+    await h.router.handle({ type: 'session.setModel', ...c2a('codex-1'), model: 'm' }, phone);
+    await h.router.handle({ type: 'session.setPermissionMode', ...c2a('codex-1'), mode: 'default' }, phone);
+    expect(h.created).toHaveLength(0);
+  });
+
+  test('重命名、删除被拒绝', async () => {
+    const h = await makeHarness({ readOnlyEngine });
+    await h.router.handle({ type: 'session.rename', ...c2a('codex-1'), sessionId: 'codex-1', reqId: 'r', title: 't' }, phone);
+    await h.router.handle({ type: 'session.delete', ...c2a('codex-1'), sessionId: 'codex-1', reqId: 'd' }, phone);
+    await h.router.idle();
+    const out = h.byType('session.mutate.response');
+    expect(out).toHaveLength(2);
+    for (const r of out) expect(r).toMatchObject({ ok: false });
+    expect(h.flags.isDeleted('codex-1')).toBe(false);
+  });
+
+  test('斜杠命令：空，不探测 Claude', async () => {
+    const h = await makeHarness({ readOnlyEngine });
+    await h.router.handle({ type: 'session.commands.request', ...c2a('codex-1'), reqId: 'c' }, phone);
+    await h.router.idle();
+    expect(h.byType('session.commands.response')[0]).toMatchObject({ slashCommands: [] });
+    expect(h.probeCalls).toEqual([]);
+  });
+
+  test('归属查询失败、列表却带着它：仍不能当 Claude 会话 resume', async () => {
+    const h = await makeHarness({
+      listed: [{ sessionId: 'x', summary: 's', lastModified: 1 }] as never,
+      readOnlyEngine: {
+        owns: async () => {
+          throw new Error('timeout');
+        },
+        history: async () => [],
+      },
+    });
+    const realMetaOf = h.manager.metaOf.bind(h.manager);
+    h.manager.metaOf = ((id: string) => {
+      const meta = realMetaOf(id);
+      return id === 'x' ? { ...(meta ?? {}), engine: 'codex' } : meta;
+    }) as never;
+    await h.router.handle({ type: 'input.send', ...c2a('x'), clientMsgId: 'c', text: 'hi' }, phone);
+    expect(h.created).toHaveLength(0);
+    expect(h.state.sessionParams('x')).toBeUndefined();
+    expect(h.byType('error.fatal')[0]).toMatchObject({ kind: 'config' });
+  });
+
+  test('Claude 已知的会话不问引擎', async () => {
+    let asked = 0;
+    const h = await makeHarness({
+      readOnlyEngine: {
+        owns: async () => {
+          asked += 1;
+          return false;
+        },
+        history: async () => [],
+      },
+    });
+    h.state.rememberSession('s1', params);
+    await h.router.handle({ type: 'input.send', ...c2a('s1'), clientMsgId: 'c1', text: 'hi' }, phone);
+    expect(asked).toBe(0);
+    expect(h.created).toHaveLength(1);
+  });
+
+  test('引擎查询失败：按不是处理，不崩', async () => {
+    const h = await makeHarness({
+      readOnlyEngine: {
+        owns: async () => {
+          throw new Error('down');
+        },
+        history: async () => [],
+      },
+    });
+    await h.router.handle({ type: 'input.send', ...c2a('unknown'), clientMsgId: 'c', text: 'hi' }, phone);
+    expect(h.created).toHaveLength(0);
+    expect(h.byType('error.fatal')[0]).toMatchObject({ kind: 'config' });
   });
 });

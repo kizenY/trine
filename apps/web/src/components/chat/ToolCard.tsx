@@ -28,6 +28,7 @@ import { cn } from '@/lib/utils.ts';
 /** 工具名 → 行首图标，与原型一致（未知工具回落扳手） */
 const TOOL_ICON: Record<string, string> = {
   Bash: '🔧',
+  Shell: '🔧',
   BashOutput: '🔧',
   Edit: '✏️',
   Write: '📝',

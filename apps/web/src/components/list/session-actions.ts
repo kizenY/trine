@@ -11,7 +11,8 @@
  * ——宁可暂时藏起入口，也不给一个点了等 10 秒才报错的按钮。万一探测误判（agent
  * 自报版本号却不认帧），`request()` 的超时文案兜底提示「agent 版本过旧或离线」。
  */
-import type { MachineInfo } from '@trine/core';
+import type { MachineInfo, SessionMeta } from '@trine/core';
+import { capabilitiesOf } from '@/lib/engine-model.ts';
 import type { SessionRowActions } from './SessionRowMenu.tsx';
 
 /** 首个支持 session.rename / archive / delete 的 agent 版本 */
@@ -128,6 +129,8 @@ export function buildSessionActions(args: {
   /** 支持置顶（agent ≥ 0.14.0）的机器；不给 = 都不支持 */
   pinMachineIds?: ReadonlySet<string>;
   onlyMachine?: string | undefined;
+  /** 机器信息（判断引擎能力）；不给 = 不按引擎区分 */
+  machineInfo?: (machineId: string) => Pick<MachineInfo, 'engines'> | null | undefined;
   notify: Notifier;
 }): SessionRowActions {
   const { client, supportedMachineIds, onlyMachine, notify } = args;
@@ -206,6 +209,12 @@ export function buildSessionActions(args: {
   return {
     ...pinActions,
     supports: (machineId) => supportedMachineIds.has(machineId),
+    ...(args.machineInfo === undefined
+      ? {}
+      : {
+          supportsMutations: (machineId: string, meta: SessionMeta) =>
+            capabilitiesOf(args.machineInfo?.(machineId), meta).mutations === true,
+        }),
     onRename: (machineId, sessionId, title) =>
       run('重命名失败', () => client.renameSession(machineId, sessionId, title), () => notify.success('已重命名')),
     onArchive,

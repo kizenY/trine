@@ -18,7 +18,7 @@ import { ListControls } from '@/components/list/ListControls.tsx';
 import { SessionList } from '@/components/list/SessionList.tsx';
 import { countArchived } from '@/components/list/filtering.ts';
 import { selectMachineFilterItems } from '@/components/list/sorting.ts';
-import { useListGroupBy, useListQuery, useListShowTemp } from '@/components/list/use-list-query.ts';
+import { useEngineFilter, useListGroupBy, useListQuery, useListShowTemp } from '@/components/list/use-list-query.ts';
 import { useNow } from '@/components/list/use-session-refresh.ts';
 import { useSessionActions } from '@/components/list/use-session-actions.ts';
 import { useListFilters, useMachineFilter } from '@/app/Layout.tsx';
@@ -31,6 +31,7 @@ export function ArchivedView(): React.JSX.Element {
   const { search, setSearch, status, setStatus } = useListFilters();
   const [groupBy, setGroupBy] = useListGroupBy();
   const [showTemp, setShowTemp] = useListShowTemp();
+  const { engine, setEngine, options: engineOptions } = useEngineFilter();
   const query = useListQuery({ archived: true });
   const actions = useSessionActions();
   const now = useNow();
@@ -60,6 +61,9 @@ export function ArchivedView(): React.JSX.Element {
             onGroupBy={setGroupBy}
             showTemp={showTemp}
             onShowTemp={setShowTemp}
+            engine={engine}
+            onEngine={setEngine}
+            engineOptions={engineOptions}
             className="px-3.5 pt-1.5 pb-1"
           />
         </>

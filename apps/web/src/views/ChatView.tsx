@@ -91,7 +91,8 @@ import {
   type UserEntry,
 } from '@/lib/reducer.ts';
 import { timelineKey } from '@/lib/storage.ts';
-import { capabilitiesOf } from '@/lib/engine-model.ts';
+import { CLAUDE_ENGINE_ID } from '@trine/core';
+import { capabilitiesOf, engineOf, sessionEngineTag } from '@/lib/engine-model.ts';
 import { formatCost } from '@/lib/format.ts';
 import { waitingForOfTool } from '@/lib/waiting.ts';
 import { ExtHeadEntry, ExtPanelSheet } from '@/components/ext/ExtPanel.tsx';
@@ -308,6 +309,8 @@ export function ChatView(): React.JSX.Element {
 
   const attach = useAttachmentDrafts(key);
   const engineCaps = capabilitiesOf(machine?.info, meta);
+  /** 非 Claude 会话在头部标出引擎，且不显示 Claude 的权限模式 */
+  const engineTagText = meta?.engine === undefined ? undefined : (sessionEngineTag(machine?.info, meta) ?? meta.engine);
   const attachDisabledReason = !agentSupportsAttachments(machine?.info?.agentVersion)
     ? machine?.info === undefined
       ? '还不知道这台 agent 的版本，暂时不能添加附件'
@@ -492,7 +495,8 @@ export function ChatView(): React.JSX.Element {
   );
 
   // 头部 ctx 手动刷新（agent ≥ 0.13.0）：新值随 session.updated 到；这里只提示失败
-  const canRefreshContext = client !== null && meta !== undefined && supportsContextRefresh(machine?.info);
+  const canRefreshContext =
+    client !== null && meta !== undefined && supportsContextRefresh(machine?.info) && engineCaps.interactive === true;
   const refreshContext = useCallback(async (): Promise<void> => {
     if (!client) return;
     try {
@@ -661,17 +665,22 @@ export function ChatView(): React.JSX.Element {
             <button
               type="button"
               data-testid="session-meta"
-              className="hover:text-text-2 min-w-0 truncate text-left transition-colors"
+              disabled={engineCaps.interactive !== true}
+              className="hover:text-text-2 disabled:hover:text-inherit min-w-0 truncate text-left transition-colors"
               onClick={() => openSettings(null)}
               title="会话设置：模型 / 权限模式 / 工作目录"
             >
               {meta === undefined
                 ? '会话设置 ▾'
-                : `${cwdTail(meta.cwd)} · ${shortModel(meta.model)} · ${meta.permissionMode} ▾`}
+                : engineTagText !== undefined
+                  ? `${cwdTail(meta.cwd)} · ${engineTagText} · ${meta.model === '' ? '默认模型' : shortModel(meta.model)}`
+                  : `${cwdTail(meta.cwd)} · ${shortModel(meta.model)} · ${meta.permissionMode} ▾`}
             </button>
             <SessionUsage
               context={meta?.context}
-              rateLimits={machine?.info?.rateLimits}
+              // Claude 的限额只给确定是 Claude 的会话：多引擎机器上 meta 没到时还不知道是谁的
+              rateLimits={engineOf(machine?.info, meta)?.id === CLAUDE_ENGINE_ID ? machine?.info?.rateLimits : undefined}
+              windows={engineOf(machine?.info, meta)?.rateLimits}
               now={usageNow}
               onRefreshContext={canRefreshContext ? refreshContext : undefined}
             />

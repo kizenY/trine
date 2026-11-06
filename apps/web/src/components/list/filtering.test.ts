@@ -306,3 +306,28 @@ describe('临时会话', () => {
     expect(emptyText('all-temp', { compact: true, archivedCount: 0, tempHidden: 2, search: '' })).toContain('2 个');
   });
 });
+
+describe('引擎筛选', () => {
+  const base = {
+    title: 't',
+    state: 'idle' as const,
+    lastActivityAt: 1,
+    cwd: '/a',
+    model: '',
+    permissionMode: 'default' as const,
+    costUsd: 0,
+  };
+  const sessions = { m: { c: { ...base, sessionId: 'c' }, x: { ...base, sessionId: 'x', engine: 'codex' } } };
+  const ids = (engine: string | null, search = '') =>
+    filterSessions(sessions, { ...DEFAULT_LIST_QUERY, groupBy: 'none', engine, search }).rows.map((r) => r.meta.sessionId).sort();
+
+  test('省略 engine 的会话算 Claude', () => {
+    expect(ids('claude')).toEqual(['c']);
+    expect(ids('codex')).toEqual(['x']);
+    expect(ids(null)).toEqual(['c', 'x']);
+  });
+
+  test('搜索能匹配引擎名', () => {
+    expect(ids(null, 'codex')).toEqual(['x']);
+  });
+});
