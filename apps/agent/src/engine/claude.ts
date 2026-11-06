@@ -16,6 +16,7 @@ export function claudeEngineSummary(version: string): EngineSummary {
       subagentHistory: true,
       attachments: true,
       mutations: true,
+      contextRefresh: true,
     },
   };
 }

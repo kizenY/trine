@@ -19,8 +19,9 @@
 - 扩展：agent 机器上的程序可以给会话页和输入框加面板、徽章和操作按钮（例如项目的任务列表，「在新会话里接续这个任务」），会话可以关联到它的条目；列表行上显示关联，工作区分组的菜单不进会话也能打开同一个面板。新建会话时可以从扩展的条目开始（预填首条消息并自动关联），关联变化和扩展的操作会在会话时间线留一条记录。浏览器不执行扩展的任何代码，只渲染 agent 返回的数据，操作在点击后由 agent 执行。用 `trine-agent ext add <目录>` 安装，见[扩展](docs/EXTENSIONS.md)。需要 agent 0.16.0 及以上（从条目开始、时间线记录需要 0.17.0）。
 - 显示各机器上会话所用的 Claude Code 版本，并可远程更新（`claude update`）。agent 启动后不久及每 6 小时向 Claude Code 自更新所用的发布渠道（`autoUpdatesChannel`，默认 `latest`）检查一次最新版本，有新版本时机器卡上会提示；机器详情页的「检查更新」立即检查。设置了 `DISABLE_AUTOUPDATER` 或 `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC` 时不自动检查。检查需要 agent ≥ 0.19.0。
 - 更新 agent 的工作区后可以安全重启：在机器详情页操作，或运行 `trine-agent restart`（在 trine 会话里也可以）。先预检新代码，等没有会话在忙再退出，由服务管理器拉起。用其他方式重启 agent 会结束所有运行中的会话，包括执行命令的那个。需要 agent ≥ 0.18.0，且由 systemd 等服务管理器托管，见[安全重启 agent](docs/AGENT-ENROLLMENT.zh-CN.md#安全重启-agent升级后换上新代码)。
-- 机器上有已登录的 `codex` CLI 时，Codex 会话与 Claude 会话一起列出，可查看历史、版本与订阅限额，列表可按引擎筛选。
-  目前只读，还不能在 trine 里发消息。`TRINE_ENGINES=claude` 可关闭，`TRINE_CODEX_BIN` 可指定可执行文件。需要 agent 0.21.0 或更高版本。
+- 机器上有已登录的 `codex` CLI 时可同时使用 Codex：新建和续接会话（包括 CLI、VS Code 里开的）、流式回复、审批、停止、排队、切换模型和权限模式、图片和文件附件、重命名和删除。
+  新建会话时选引擎，列表可按引擎筛选。Codex 新会话默认完全访问，可在设置里改。回退、计划模式、后台任务和费用目前只有 Claude 支持。
+  `TRINE_ENGINES=claude` 可关闭 Codex，`TRINE_CODEX_BIN` 可指定可执行文件。需要 agent 0.21.0 或更高版本。
 - 默认隐藏临时会话（工作目录在系统临时目录下，或 `claude -p` 等非交互运行），列表筛选里可以重新显示。
 - 配对码/二维码与人工校验码确认，浏览器到 agent 的应用消息端到端加密。
 - 可选 Bark 通知，仅包含通用事件类型和机器标识/别名。

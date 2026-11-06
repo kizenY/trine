@@ -21,7 +21,8 @@
 import { useEffect, useMemo, useState } from 'react';
 import { useNavigate } from 'react-router';
 import { toast } from 'sonner';
-import type { PermissionMode } from '@trine/core';
+import { CLAUDE_ENGINE_ID, type PermissionMode } from '@trine/core';
+import { creatableEngines, ENGINE_DEFAULT_MODEL } from '@/lib/engine-model.ts';
 import { Button } from '@/components/ui/button.tsx';
 import { Input } from '@/components/ui/input.tsx';
 import { Textarea } from '@/components/ui/textarea.tsx';
@@ -32,11 +33,15 @@ import { cn } from '@/lib/utils.ts';
 import { ExtNewSessionPicker, useNewSessionExtensions, type NewSessionStart } from '@/components/ext/ExtNewSessionPicker.tsx';
 import { CwdPicker } from './CwdPicker.tsx';
 import {
+  clickEngineMode,
   clickMode,
+  engineModeWarning,
+  initialEngineMode,
   initialModeState,
   OFFLINE_HINT,
   PERMISSION_MODE_OPTIONS,
   pendingWarning,
+  type EngineModePickerState,
   type ModePickerState,
 } from './permission-mode.ts';
 
@@ -79,8 +84,21 @@ export function NewSessionSheet({
   const [cwdRequested, setCwdRequested] = useState<string | null>(null);
   const [start, setStart] = useState<NewSessionStart | null>(null);
   const [prompt, setPrompt] = useState('');
+  const [engineId, setEngineId] = useState<string | null>(null);
+  const [engineMode, setEngineMode] = useState<EngineModePickerState>({ value: undefined, pending: null });
+  const defaultEngine = useTrine((s) => s.prefs.defaultEngine);
+  const engineDefaults = useTrine((s) => s.prefs.engineDefaults);
 
   const machine = machines[machineId];
+  const engines = creatableEngines(machine?.info);
+  // 选的引擎这台机器上没有（换了机器）：退回默认引擎，再退回第一个能用的
+  const engine =
+    engines.find((e) => e.id === engineId) ??
+    engines.find((e) => e.id === defaultEngine) ??
+    engines.find((e) => e.id === CLAUDE_ENGINE_ID) ??
+    engines[0];
+  const engineModes = engine?.modes;
+  const engineDefault = engine === undefined ? undefined : engineDefaults[engine.id];
   const offline = machine !== undefined && machine.online !== true;
   const startExts = useNewSessionExtensions(machineId);
   // 选中后扩展被停用 / 移除（别的设备改了设置）：这一节会消失，选择与预填的文字一并作废，
@@ -135,17 +153,43 @@ export function NewSessionSheet({
   // 每次打开按设置页的默认值预选（上次没建成的选择不留到下次）
   useEffect(() => {
     if (!open) return;
+    setEngineId(null);
     setModel(defaultModel);
     setModeState(initialModeState(defaultMode));
     setStart(null);
     setPrompt('');
   }, [open, defaultModel, defaultMode]);
 
+  // 引擎一变，模型和权限模式都要换成这个引擎的默认：另一个引擎的模型名在这里没有意义
+  const engineKey = engine?.id;
+  useEffect(() => {
+    if (!open || engineKey === undefined) return;
+    if (engineModes === undefined) {
+      setModel(defaultModel);
+      setModeState(initialModeState(defaultMode));
+      setEngineMode({ value: undefined, pending: null });
+    } else {
+      setModel(engineDefault?.model ?? ENGINE_DEFAULT_MODEL);
+      setEngineMode({ value: initialEngineMode(engineModes, engineDefault?.mode), pending: null });
+    }
+    setCustomModel('');
+    // 目录内容变化（限额刷新带来的新 machine.info）不算换引擎，不能冲掉用户的选择
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open, engineKey]);
+
+  const engineModels = engine?.models;
+  const usesCatalog = engineModes !== undefined;
   const modelChips = useMemo(() => {
-    const set = new Set(knownModels);
-    if (model !== '') set.add(model);
-    return [...set];
-  }, [knownModels, model]);
+    const labels = new Map<string, string>();
+    if (usesCatalog) {
+      labels.set(ENGINE_DEFAULT_MODEL, '跟随配置');
+      for (const m of engineModels ?? []) labels.set(m.id, m.label);
+    } else {
+      for (const m of knownModels) labels.set(m, m);
+    }
+    if (model !== '' && !labels.has(model)) labels.set(model, model);
+    return [...labels].map(([id, label]) => ({ id, label }));
+  }, [usesCatalog, engineModels, knownModels, model]);
 
   const create = async (): Promise<void> => {
     // 离线机器直接不做：`client.request()` 对 online === false 立即 reject
@@ -157,6 +201,8 @@ export function NewSessionSheet({
         cwd: cwd.trim(),
         model: model.trim(),
         permissionMode: modeState.value,
+        ...(engine === undefined || engine.id === CLAUDE_ENGINE_ID ? {} : { engine: engine.id }),
+        ...(engineMode.value === undefined || !usesCatalog ? {} : { engineMode: engineMode.value }),
       });
       const from = startAvailable ? start : null;
       if (from?.link !== undefined) await linkNewSession(meta.sessionId, from);
@@ -190,7 +236,7 @@ export function NewSessionSheet({
     }
   };
 
-  const warning = pendingWarning(modeState);
+  const warning = usesCatalog ? engineModeWarning(engineMode, engineModes ?? []) : pendingWarning(modeState);
 
   return (
     <Sheet open={open} onOpenChange={onOpenChange}>
@@ -269,18 +315,37 @@ export function NewSessionSheet({
                 </section>
               )}
 
+              {engines.length > 1 && (
+                <section data-testid="ns-engine">
+                  <Label>引擎</Label>
+                  <div className="flex flex-wrap gap-1.5">
+                    {engines.map((e) => (
+                      <Chip
+                        key={e.id}
+                        data-testid="ns-engine-chip"
+                        data-engine={e.id}
+                        selected={engine?.id === e.id}
+                        onClick={() => setEngineId(e.id)}
+                      >
+                        {e.displayName}
+                      </Chip>
+                    ))}
+                  </div>
+                </section>
+              )}
+
               <section>
                 <Label>模型</Label>
                 <div className="flex flex-wrap gap-1.5">
                   {modelChips.map((m) => (
                     <Chip
-                      key={m}
+                      key={m.id}
                       data-testid="ns-model"
-                      selected={model === m}
-                      onClick={() => setModel(m)}
+                      selected={model === m.id}
+                      onClick={() => setModel(m.id)}
                       className="font-mono"
                     >
-                      {m}
+                      {m.label}
                     </Chip>
                   ))}
                 </div>
@@ -316,7 +381,24 @@ export function NewSessionSheet({
               <section>
                 <Label>权限模式</Label>
                 <div className="flex flex-wrap gap-1.5">
-                  {PERMISSION_MODE_OPTIONS.map((opt) => {
+                  {engineModes?.map((mode) => {
+                    const pending = engineMode.pending === mode.id;
+                    return (
+                      <Chip
+                        key={mode.id}
+                        data-testid="ns-mode"
+                        data-mode={mode.id}
+                        data-pending={pending}
+                        title={mode.description}
+                        selected={engineMode.value === mode.id}
+                        onClick={() => setEngineMode((s) => clickEngineMode(s, mode.id, engineModes))}
+                        className={cn(pending && 'border-red bg-red-soft text-red font-medium')}
+                      >
+                        {mode.label}
+                      </Chip>
+                    );
+                  })}
+                  {engineModes === undefined && PERMISSION_MODE_OPTIONS.map((opt) => {
                     const selected = modeState.value === opt.value;
                     const pending = modeState.pending === opt.value;
                     return (

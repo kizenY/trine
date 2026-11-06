@@ -2,7 +2,9 @@ import { describe, expect, test } from 'bun:test';
 import type { EngineSummary } from '@trine/core';
 import {
   capabilitiesOf,
+  creatableEngines,
   engineFilterOptions,
+  engineModeLabel,
   engineOf,
   enginesOf,
   enginesWithLimits,
@@ -92,5 +94,20 @@ describe('多引擎展示', () => {
     const withLimits = { ...other, rateLimits: { windows: [{ id: 'w', percent: 1 }], updatedAt: 1 } };
     const empty = { ...claude, rateLimits: { windows: [], updatedAt: 1 } };
     expect(enginesWithLimits({ engines: [empty, withLimits] }).map((e) => e.id)).toEqual(['other']);
+  });
+});
+
+describe('新建与模式', () => {
+  test('能新建的引擎：可用且能交互', () => {
+    const down = { ...other, id: 'down', available: false, capabilities: { interactive: true } };
+    const live = { ...other, id: 'live', capabilities: { interactive: true } };
+    expect(creatableEngines({ engines: [claude, other, down, live] }).map((e) => e.id)).toEqual(['claude', 'live']);
+  });
+
+  test('模式显示名；目录里没有时显示 id，未知时 undefined', () => {
+    const engine = { ...other, modes: [{ id: 'full', label: '完全访问' }] };
+    expect(engineModeLabel(engine, 'full')).toBe('完全访问');
+    expect(engineModeLabel(engine, 'x')).toBe('x');
+    expect(engineModeLabel(engine, undefined)).toBeUndefined();
   });
 });

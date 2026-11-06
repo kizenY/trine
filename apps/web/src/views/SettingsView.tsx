@@ -15,6 +15,8 @@
  * 预选；会话建好后各自的模型 / 权限由 agent 记住，改默认值不影响已有会话。
  */
 import { useEffect, useState } from 'react';
+import { CLAUDE_ENGINE_ID, type EngineSummary } from '@trine/core';
+import { creatableEngines, ENGINE_DEFAULT_MODEL } from '@/lib/engine-model.ts';
 import { NavLink, useNavigate } from 'react-router';
 import { ArrowUpIcon, CopyIcon, PencilIcon, PlusIcon, XIcon } from 'lucide-react';
 import { toast } from 'sonner';
@@ -25,7 +27,10 @@ import { Textarea } from '@/components/ui/textarea.tsx';
 import { AppHead } from '@/components/shell/AppHead.tsx';
 import { Chip, StatusDot } from '@/components/shell/StatusDot.tsx';
 import {
+  clickEngineMode,
   clickMode,
+  engineModeWarning,
+  initialEngineMode,
   PERMISSION_MODE_OPTIONS,
   pendingWarning,
   type ModePickerState,
@@ -507,6 +512,90 @@ function NumberSetting({
 }
 
 /** 新会话默认值：新建会话 sheet 预选的模型与权限模式 */
+/**
+ * 引擎相关的新会话默认：默认引擎，以及带自己目录的引擎（Codex）的默认模型、权限模式。
+ * Claude 的默认值在 SessionDefaults。只有一个引擎时不显示，界面不变。
+ */
+function EngineDefaults(): React.JSX.Element | null {
+  const client = useClient();
+  const machines = useTrine((s) => s.machines);
+  const defaultEngine = useTrine((s) => s.prefs.defaultEngine);
+  const engineDefaults = useTrine((s) => s.prefs.engineDefaults);
+  const [pending, setPending] = useState<string | null>(null);
+  const engines = new Map<string, EngineSummary>();
+  for (const m of Object.values(machines)) {
+    for (const e of creatableEngines(m.info)) if (!engines.has(e.id)) engines.set(e.id, e);
+  }
+  if (engines.size < 2) return null;
+  const save = (id: string, next: { model?: string; mode?: string }): void => {
+    client?.updatePrefs({ engineDefaults: { ...engineDefaults, [id]: { ...engineDefaults[id], ...next } } });
+  };
+  return (
+    <section className="flex flex-col gap-3" data-testid="engine-defaults">
+      <div className="flex flex-col gap-1.5">
+        <h3 className="text-text-3 text-xs">默认引擎</h3>
+        <div className="flex flex-wrap gap-1.5">
+          {[...engines.values()].map((e) => (
+            <Chip
+              key={e.id}
+              data-testid="default-engine-chip"
+              data-engine={e.id}
+              selected={(defaultEngine ?? CLAUDE_ENGINE_ID) === e.id}
+              onClick={() => client?.updatePrefs({ defaultEngine: e.id })}
+            >
+              {e.displayName}
+            </Chip>
+          ))}
+        </div>
+      </div>
+      {[...engines.values()]
+        .filter((e) => e.modes !== undefined)
+        .map((e) => {
+          const modes = e.modes ?? [];
+          const model = engineDefaults[e.id]?.model ?? ENGINE_DEFAULT_MODEL;
+          const state = { value: initialEngineMode(modes, engineDefaults[e.id]?.mode), pending };
+          const warning = engineModeWarning(state, modes);
+          return (
+            <div key={e.id} className="flex flex-col gap-1.5" data-engine={e.id}>
+              <h3 className="text-text-3 text-xs">{e.displayName} 默认模型</h3>
+              <div className="flex flex-wrap gap-1.5">
+                <Chip selected={model === ENGINE_DEFAULT_MODEL} onClick={() => save(e.id, { model: ENGINE_DEFAULT_MODEL })}>
+                  跟随配置
+                </Chip>
+                {e.models?.map((m) => (
+                  <Chip key={m.id} selected={model === m.id} className="font-mono" onClick={() => save(e.id, { model: m.id })}>
+                    {m.label}
+                  </Chip>
+                ))}
+              </div>
+              <h3 className="text-text-3 mt-1 text-xs">{e.displayName} 默认权限模式</h3>
+              <div className="flex flex-wrap gap-1.5">
+                {modes.map((mode) => (
+                  <Chip
+                    key={mode.id}
+                    data-testid="engine-default-mode"
+                    data-mode={mode.id}
+                    title={mode.description}
+                    selected={state.value === mode.id}
+                    className={cn(pending === mode.id && 'border-red bg-red-soft text-red font-medium')}
+                    onClick={() => {
+                      const next = clickEngineMode(state, mode.id, modes);
+                      setPending(next.pending);
+                      if (next.pending === null && next.value !== undefined) save(e.id, { mode: next.value });
+                    }}
+                  >
+                    {mode.label}
+                  </Chip>
+                ))}
+              </div>
+              {warning !== '' && <p className="text-red text-[11.5px]">{warning}</p>}
+            </div>
+          );
+        })}
+    </section>
+  );
+}
+
 function SessionDefaults(): React.JSX.Element {
   const client = useClient();
   const models = useTrine((s) => s.prefs.knownModels);
@@ -627,6 +716,7 @@ export function SettingsView(): React.JSX.Element {
 
         <Separator />
         <SessionDefaults />
+        <EngineDefaults />
 
         <Separator />
         <AttachmentSettings />

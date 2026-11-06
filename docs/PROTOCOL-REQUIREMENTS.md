@@ -300,7 +300,11 @@ agent 侧所有产出 SessionMeta 的出口（list、session.created、session.u
 - `session.create` 可带 `engine`、`engineMode`；不支持的引擎回 `error.fatal`（`kind: config`），不建会话。`session.setPermissionMode` 可带 `engineMode`。
 - 引擎 id 和 `engineMode` 是开放字符串，不做枚举；原因见 DECISIONS D20。
 - 引擎不支持的请求由 agent 拒绝：回退回 `unavailable`，刷新 context 回 `failed`。
-- Codex 目前只读（`capabilities.interactive` 为 false）：列表与 `session.history.request` 可用，归档、置顶是 trine 自己的标记，也可用。发消息等要拉起会话的请求回机器级 `error.fatal`（`kind: config`），重命名、删除回 `session.mutate.response`（`ok: false`），`session.commands.request` 回空列表。
+- `session.create` 带 `engine: codex` 时 thread 由 Codex 生成，id 随应答返回。`model: default` 表示不指定，跟随用户的 Codex 配置。
+- `permission.request.options`：引擎给的决定选项（`allow_once`、`allow_session`、`reject`）。client 按它显示按钮，选中的 id 放进 `permission.respond.optionId`。`optionId` 只能细化 `verdict`，不能改变它；不认识的 id 按单次批准。带 options 的请求不支持 `updatedInput` 和 `remember`。
+- `EngineSummary.models`、`modes`：引擎的模型和权限模式目录。省略时 client 用自己的已知模型列表和四档 `PermissionMode`（Claude）。
+- `run.done.costUnknown`：引擎不回报费用，`costUsd` 只是占位的 0，不显示。
+- Codex 不支持的请求（回退、后台任务、刷新 context）由 agent 拒绝。斜杠命令清单回空列表。
 - `EngineSummary.rateLimits.windows`：引擎的限额窗口，数量和时长因账号而异（实测有只给周窗口的账号），不能假设是 5 小时 + 7 天。Claude 的限额仍在 `MachineInfo.rateLimits`。
 
 ## 协议约定汇总

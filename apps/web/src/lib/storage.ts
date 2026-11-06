@@ -148,6 +148,15 @@ export const PrefsSchema = z.object({
   defaultModel: z.string().min(1).catch(DEFAULT_SESSION_MODEL),
   /** 新建会话预选的权限模式（设置页可改，选 bypass 同样要两击确认） */
   defaultPermissionMode: PermissionModeSchema.catch(DEFAULT_SESSION_PERMISSION_MODE),
+  /** 新建会话预选的引擎；省略 = Claude Code，或机器上第一个能用的 */
+  defaultEngine: z.string().min(1).optional().catch(undefined),
+  /**
+   * 非 Claude 引擎的新会话默认（Claude 的是上面两项）。model 省略 = 跟随引擎自己的配置，
+   * mode 省略 = 目录标的默认
+   */
+  engineDefaults: z
+    .record(z.string(), z.object({ model: z.string().min(1).optional(), mode: z.string().min(1).optional() }))
+    .catch({}),
   /**
    * PC 上的发送键（见 components/composer/composer-keys.ts）：`enter` = Enter 发送、
    * Shift+Enter 换行；`mod-enter` = Cmd/Ctrl+Enter 发送、Enter 换行。触屏设备不看它，
@@ -203,6 +212,7 @@ export function defaultPrefs(): Prefs {
     listShowTemp: false,
     defaultModel: DEFAULT_SESSION_MODEL,
     defaultPermissionMode: DEFAULT_SESSION_PERMISSION_MODE,
+    engineDefaults: {},
     sendKey: 'enter',
     attachMaxTotalMb: ATTACHMENTS_DEFAULT_MAX_TOTAL_BYTES / (1024 * 1024),
     machineStatsIntervalMs: 60_000,

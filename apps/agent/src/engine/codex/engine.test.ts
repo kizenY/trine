@@ -8,10 +8,14 @@ import { codexItemToHistory, unwrapShellCommand } from './history.ts';
 
 function engine(routes: ConstructorParameters<typeof FakeAppServer>[0], now: () => number = () => 1_000_000) {
   const server = new FakeAppServer(routes);
-  const client = new AppServerClient({ spawn: server.spawn, clientVersion: '0', idleMs: 60_000, now });
   let changes = 0;
-  const codex = new CodexEngine({ client, now, onChange: () => (changes += 1) });
-  return { server, client, codex, changes: () => changes };
+  const codex = new CodexEngine({
+    spawn: server.spawn,
+    clientOptions: { idleMs: 60_000 },
+    now,
+    onChange: () => (changes += 1),
+  });
+  return { server, codex, changes: () => changes };
 }
 
 describe('AppServerClient', () => {
@@ -85,7 +89,7 @@ describe('AppServerClient', () => {
     client.dispose();
   });
 
-  test('服务端发来的请求：明确拒绝，不让对端干等', async () => {
+  test('服务端发来的请求没人处理：明确拒绝，不让对端干等', async () => {
     const server = new FakeAppServer({ ping: () => 'pong' });
     const client = new AppServerClient({ spawn: server.spawn, clientVersion: '0', idleMs: 60_000 });
     await client.call('ping', {});
@@ -302,6 +306,7 @@ describe('CodexEngine', () => {
     const params = server.calls.find((c) => c.method === 'thread/list')!.params as Record<string, unknown>;
     expect(params['useStateDbOnly']).toBe(true);
     expect(params['sourceKinds']).toEqual(['cli', 'vscode', 'exec', 'appServer']);
+    // 列会话不加载 thread，也不写 Codex 的状态
     const forbidden = ['thread/start', 'thread/resume', 'turn/start', 'thread/archive', 'thread/delete', 'thread/name/set'];
     expect(server.calls.filter((c) => forbidden.includes(c.method))).toEqual([]);
     codex.dispose();
@@ -441,18 +446,26 @@ describe('CodexEngine', () => {
     codex.dispose();
   });
 
-  test('summary：只读能力；版本从 userAgent 取；限额进 summary 且过 schema；有变化才回调', async () => {
+  test('summary：版本从 userAgent 取；模型目录去掉隐藏的；限额进 summary 且过 schema；有变化才回调', async () => {
     const h = engine({
       'account/read': () => ({ account: { type: 'chatgpt' }, requiresOpenaiAuth: true }),
       'account/rateLimits/read': () => ({
         rateLimitsByLimitId: { codex: { primary: { usedPercent: 5, windowDurationMins: 10080, resetsAt: 2000 } } },
       }),
+      'model/list': () => ({
+        data: [
+          { id: 'm1', displayName: 'Model 1', hidden: false },
+          { id: 'hidden', displayName: 'H', hidden: true },
+        ],
+      }),
     });
-    expect(h.codex.summary().capabilities.interactive).toBe(false);
+    expect(h.codex.summary().capabilities.interactive).toBe(true);
+    expect(h.codex.summary().modes?.find((m) => m.default)?.id).toBe('full');
     await h.codex.refresh();
     const summary = h.codex.summary();
     expect(summary).toMatchObject({ id: 'codex', version: '9.9.9', available: true });
     expect(summary.rateLimits?.windows[0]?.percent).toBe(5);
+    expect(summary.models).toEqual([{ id: 'm1', label: 'Model 1' }]);
     expect(h.changes()).toBe(1);
     await h.codex.refresh();
     const info = buildMachineInfo({ name: 'm', claudeVersion: '', activeSessionCount: 0, maxSessions: 1, engines: [summary] });
@@ -501,5 +514,92 @@ describe('CodexEngine', () => {
     expect(codex.summary().available).toBe(false);
     await expect(codex.listSessions()).rejects.toThrow('down');
     expect(codex.cachedSessions().map((m) => m.sessionId)).toEqual(['a']);
+  });
+});
+
+describe('CodexEngine · 写操作', () => {
+  test('startThread：模式带上，审批路由给用户，default 模型不传', async () => {
+    const h = engine({ 'thread/start': () => ({ thread: { id: 'new' }, model: 'resolved' }) });
+    const out = await h.codex.startThread({ cwd: '/a', model: 'default', engineMode: 'workspace' });
+    expect(out).toEqual({ threadId: 'new', model: 'resolved', engineMode: 'workspace', permissionMode: 'default' });
+    const params = h.server.calls.find((c) => c.method === 'thread/start')!.params;
+    expect(params).toEqual({ cwd: '/a', approvalsReviewer: 'user', approvalPolicy: 'on-request', sandbox: 'workspace-write' });
+    h.codex.dispose();
+  });
+
+  test('startThread：不认识的模式退回默认（完全访问是用户选的默认）', async () => {
+    const h = engine({ 'thread/start': () => ({ thread: { id: 'new' } }) });
+    const out = await h.codex.startThread({ cwd: '/a', model: 'm', engineMode: 'nope' });
+    expect(out.engineMode).toBe('full');
+    h.codex.dispose();
+  });
+
+  test('rename：更新缓存；thread 没落盘时转成 not found', async () => {
+    const h = engine({
+      'thread/list': () => ({ data: [fakeThread('a')], nextCursor: null }),
+      'thread/name/set': (p) => {
+        if ((p as { threadId: string }).threadId === 'b') throw rpcError(-32600, 'thread not loaded: b');
+        return {};
+      },
+      'account/read': () => ({ account: { type: 'chatgpt' } }),
+      'account/rateLimits/read': () => ({}),
+    });
+    await h.codex.listSessions();
+    await h.codex.rename('a', '新名字');
+    expect(h.codex.metaOf('a')?.title).toBe('新名字');
+    await expect(h.codex.rename('b', 'x')).rejects.toThrow('not found');
+    h.codex.dispose();
+  });
+
+  test('delete：调 thread/delete，缓存删掉', async () => {
+    const h = engine({
+      'thread/list': () => ({ data: [fakeThread('a')], nextCursor: null }),
+      'thread/delete': () => ({}),
+      'account/read': () => ({ account: { type: 'chatgpt' } }),
+      'account/rateLimits/read': () => ({}),
+    });
+    await h.codex.listSessions();
+    await h.codex.delete('a');
+    expect(h.server.calls.some((c) => c.method === 'thread/delete')).toBe(true);
+    expect(h.codex.metaOf('a')).toBeUndefined();
+    h.codex.dispose();
+  });
+
+  test('限额更新是稀疏的：只替换带来的窗口，没带的保留', async () => {
+    const h = engine({
+      'account/read': () => ({ account: { type: 'chatgpt' } }),
+      'account/rateLimits/read': () => ({
+        rateLimitsByLimitId: {
+          codex: {
+            primary: { usedPercent: 5, windowDurationMins: 300 },
+            secondary: { usedPercent: 9, windowDurationMins: 10080 },
+          },
+        },
+      }),
+    });
+    await h.codex.refresh();
+    h.server.handlers!.onLine(
+      JSON.stringify({
+        method: 'account/rateLimits/updated',
+        params: { rateLimits: { limitId: 'codex', primary: { usedPercent: 6, windowDurationMins: 300 }, secondary: null } },
+      }),
+    );
+    const windows = h.codex.summary().rateLimits!.windows;
+    expect(windows.find((w) => w.id === 'codex:primary')?.percent).toBe(6);
+    expect(windows.find((w) => w.id === 'codex:secondary')?.percent).toBe(9);
+    h.codex.dispose();
+  });
+
+  test('持有活跃会话时 app-server 不空闲退出；释放后才退', async () => {
+    const server = new FakeAppServer({ ping: () => 'pong' });
+    const client = new AppServerClient({ spawn: server.spawn, clientVersion: '0', idleMs: 5 });
+    client.hold();
+    await client.call('ping', {});
+    await Bun.sleep(20);
+    expect(client.running).toBe(true);
+    client.release();
+    await Bun.sleep(20);
+    expect(client.running).toBe(false);
+    client.dispose();
   });
 });

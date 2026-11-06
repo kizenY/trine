@@ -77,3 +77,36 @@ describe('PermissionCard · 改参数后批准的参数显示（验收 5）', ()
     expect(html).not.toContain('secret');
   });
 });
+
+describe('PermissionCard · 引擎给的决定选项', () => {
+  const options = [
+    { id: 'accept', label: '批准', kind: 'allow_once' as const },
+    { id: 'acceptForSession', label: '本会话都批准', kind: 'allow_session' as const },
+    { id: 'decline', label: '拒绝', kind: 'reject' as const },
+  ];
+
+  test('按选项显示按钮；没有改参数入口和「记住」', () => {
+    const html = render(entry({ toolName: 'Shell', input: { command: 'touch x' }, options }));
+    expect(html).toContain('touch x');
+    expect(html).toContain('本会话都批准');
+    expect(html).toContain('perm-allow-session');
+    expect(html).not.toContain('perm-edit');
+    expect(html).not.toContain('perm-remember');
+  });
+
+  test('Shell 命令按命令显示，不是 JSON', () => {
+    const html = render(entry({ toolName: 'Shell', input: { command: 'touch x', cwd: '/a' }, options }));
+    expect(html).not.toContain('完整参数');
+  });
+
+  test('没有 options：照旧（Claude）', () => {
+    const html = render(entry());
+    expect(html).toContain('perm-edit');
+    expect(html).not.toContain('perm-allow-session');
+  });
+
+  test('已响应后不再显示选项按钮', () => {
+    const html = render(entry({ options, state: 'resolved', verdict: 'allow' }));
+    expect(html).not.toContain('perm-allow-session');
+  });
+});

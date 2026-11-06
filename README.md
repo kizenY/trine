@@ -59,10 +59,12 @@ the agent runs on your own computer.
   the agent any other way ends every running session, including the one that ran the command.
   Requires agent 0.18.0 or later run by systemd or another service manager; see
   [restarting the agent](apps/server/deploy/README.md#run-the-agent-as-a-service-and-restart-it-safely).
-- Lists and reads Codex sessions next to Claude ones when the machine has a signed-in `codex` CLI
-  (history, version and plan limits; a list filter narrows by engine). Read-only for now: sending
-  messages from trine comes later. Set `TRINE_ENGINES=claude` to turn it off, `TRINE_CODEX_BIN` to
-  choose the executable. Requires agent 0.21.0 or later.
+- Runs Codex next to Claude Code when the machine has a signed-in `codex` CLI: start and continue
+  sessions (including ones from the CLI or VS Code), streaming, approvals, stop, queued messages,
+  model and permission mode, images and files, rename and delete. New sessions pick an engine and
+  the list can filter by it. New Codex sessions default to full access; change it in Settings. Rewind,
+  plan mode, background tasks and cost are Claude-only for now. Set `TRINE_ENGINES=claude` to turn
+  Codex off, `TRINE_CODEX_BIN` to choose the executable. Requires agent 0.21.0 or later.
 - Hides temporary sessions by default (working directory under a system temp directory, or
   non-interactive runs such as `claude -p`); a list filter shows them again.
 - Relays tool approval requests and interactive questions to your browser.

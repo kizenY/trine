@@ -392,7 +392,7 @@ export function useRowActionDialogs(actions: SessionRowActions | undefined): {
             description={
               <>
                 <p>
-                  会删除 agent 那台机器上的会话记录（claude 的 jsonl 文件），<strong>不可恢复</strong>
+                  会删除 agent 那台机器上的会话记录，<strong>不可恢复</strong>
                   ，本机终端里也无法再 resume 它。
                 </p>
                 <p>所有设备上的这条会话与本地时间线都会一并清除。</p>

@@ -33,9 +33,9 @@ function str(value: unknown): string | undefined {
 
 export function permissionParamView(toolName: string, input: unknown): PermissionParamView {
   const rec = asRecord(input);
-  if (toolName === 'Bash') {
+  if (toolName === 'Bash' || toolName === 'Shell') {
     const command = str(rec.command);
-    if (command !== undefined) return { kind: 'command', label: 'Bash', command };
+    if (command !== undefined) return { kind: 'command', label: toolName, command };
   }
   if (toolName === 'Edit' || toolName === 'Write') {
     const filePath = str(rec.file_path);

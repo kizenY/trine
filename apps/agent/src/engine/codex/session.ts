@@ -1,0 +1,719 @@
+/**
+ * 一个活跃的 Codex 会话：trine 的会话语义 ↔ app-server 的 thread / turn / item。
+ *
+ * 帧序列对齐 ClaudeSession（client 不区分引擎）：user.message 在消息出队时发，
+ * running → 工具与文本 → run.done → idle。排队用 trine 自己的 InputQueue，不用 turn/steer：
+ * 与 Claude 语义一致，排队的消息可撤回。
+ *
+ * 权限模式缺省时不传覆盖：续接 CLI 里开的 thread 不能悄悄改掉它自己的沙箱设置。
+ * 审批一律显式路由给用户（approvalsReviewer: user），否则会继承配置里的自动审核，绕过浏览器。
+ */
+import { randomUUID } from 'node:crypto';
+import type {
+  BgTask,
+  ContextUsage,
+  PermissionMode,
+  PermissionOption,
+  SessionState,
+} from '@trine/core';
+import type { PreparedInput } from '../../bridge/attachments.ts';
+import { Heartbeat } from '../../bridge/heartbeat.ts';
+import type { PendingPermissionSnapshot, PermissionVerdict } from '../../bridge/permission.ts';
+import { InputQueue } from '../../bridge/queue.ts';
+import type { SessionRuntimeMeta, StopBgTaskResult } from '../../bridge/session.ts';
+import { toSingleLine } from '../../bridge/summarize.ts';
+import type { EventBody } from '../../bridge/types.ts';
+import type { EngineSession } from '../types.ts';
+import { codexItemToHistory, unwrapShellCommand } from './history.ts';
+import { CODEX_DEFAULT_MODEL } from './ids.ts';
+import {
+  isCodexMode,
+  legacyFromMode,
+  modeFromLegacy,
+  modeFromThreadResponse,
+  threadModeParams,
+  turnModeParams,
+  type CodexModeId,
+} from './modes.ts';
+
+type Rec = Record<string, unknown>;
+
+function isRecord(value: unknown): value is Rec {
+  return typeof value === 'object' && value !== null;
+}
+function str(value: unknown): string | undefined {
+  return typeof value === 'string' ? value : undefined;
+}
+
+export interface CodexSessionClient {
+  call(method: string, params: unknown): Promise<unknown>;
+  /** 注册这个 thread 的通知与服务端请求；持有期间 app-server 不会空闲退出 */
+  attach(threadId: string, session: CodexSessionEvents): void;
+  /** 只解绑自己：回收等待期间可能已经建了新实例。返回是否真的解绑了 */
+  detach(threadId: string, session: CodexSessionEvents): boolean;
+}
+
+export interface CodexSessionEvents {
+  onNotification(method: string, params: Rec): void;
+  /** 返回 false 表示不处理，由调用方回错误 */
+  onServerRequest(id: unknown, method: string, params: Rec, reply: (result: unknown) => void): boolean;
+  onExit(): void;
+}
+
+export interface CodexSessionOptions {
+  sessionId: string;
+  cwd: string;
+  model: string;
+  permissionMode: PermissionMode;
+  engineMode?: string | undefined;
+  /** true = 磁盘上已有的 thread，要先 thread/resume；false = 刚 thread/start 的，已加载 */
+  resume: boolean;
+  client: CodexSessionClient;
+  emit: (body: EventBody) => void;
+  onMeta?: ((meta: SessionRuntimeMeta) => void) | undefined;
+  onIdle?: (() => void) | undefined;
+  log?: ((line: string) => void) | undefined;
+  now?: () => number;
+}
+
+interface PendingApproval {
+  requestId: string;
+  rpcId: unknown;
+  toolName: string;
+  input: Record<string, unknown>;
+  requestedAt: number;
+  options: PermissionOption[];
+  decide: (verdict: 'allow' | 'deny', optionId: string | undefined) => unknown;
+  reply: (result: unknown) => void;
+}
+
+const ALLOW_ONCE: PermissionOption = { id: 'accept', label: '批准', kind: 'allow_once' };
+const ALLOW_SESSION: PermissionOption = { id: 'acceptForSession', label: '本会话都批准', kind: 'allow_session' };
+const DENY: PermissionOption = { id: 'decline', label: '拒绝', kind: 'reject' };
+
+/** Codex 给的可选决定 → trine 的选项；只认识的才显示，带修改策略的先不给 */
+function optionsFrom(available: unknown): PermissionOption[] {
+  if (!Array.isArray(available)) return [ALLOW_ONCE, ALLOW_SESSION, DENY];
+  const out = [ALLOW_ONCE, ALLOW_SESSION, DENY].filter((o) => available.includes(o.id));
+  // 协议变了也要能批准和拒绝
+  if (!out.some((o) => o.kind === 'reject')) out.push(DENY);
+  if (!out.some((o) => o.kind !== 'reject')) out.unshift(ALLOW_ONCE);
+  return out;
+}
+
+function errorKind(info: unknown): 'quota' | 'auth' | 'config' | 'other' {
+  if (info === 'usageLimitExceeded' || info === 'rateLimitExceeded' || info === 'sessionBudgetExceeded') return 'quota';
+  if (info === 'unauthorized') return 'auth';
+  if (info === 'modelNotFound' || info === 'badRequest') return 'config';
+  return 'other';
+}
+
+/** 带附件的内容（Claude 的内容块）→ Codex 的 UserInput */
+export function toUserInput(text: string, prepared: PreparedInput['content'] | undefined): unknown[] {
+  const textInput = (value: string): Rec => ({ type: 'text', text: value, text_elements: [] });
+  if (prepared === undefined || typeof prepared === 'string') return [textInput(prepared ?? text)];
+  const out: unknown[] = [];
+  for (const block of prepared as unknown[]) {
+    if (!isRecord(block)) continue;
+    if (block['type'] === 'text' && typeof block['text'] === 'string') {
+      out.push(textInput(block['text']));
+    } else if (block['type'] === 'image' && isRecord(block['source'])) {
+      const { media_type: media, data } = block['source'];
+      if (typeof media === 'string' && typeof data === 'string') out.push({ type: 'image', url: `data:${media};base64,${data}` });
+    }
+  }
+  return out.length === 0 ? [textInput(text)] : out;
+}
+
+export class CodexSession implements EngineSession, CodexSessionEvents {
+  readonly sessionId: string;
+  readonly #client: CodexSessionClient;
+  readonly #emit: (body: EventBody) => void;
+  readonly #onMeta: ((meta: SessionRuntimeMeta) => void) | undefined;
+  readonly #onIdle: (() => void) | undefined;
+  readonly #log: (line: string) => void;
+  readonly #now: () => number;
+  readonly #queue: InputQueue;
+  readonly #heartbeat: Heartbeat;
+
+  /** 这几个 Map 按轮清空 */
+  readonly #pending = new Map<string, PendingApproval>();
+  readonly #inFlightTools = new Map<string, number>();
+  /** 改文件审批的请求里没有 diff，要从 item/started 取 */
+  readonly #fileChanges = new Map<string, Rec>();
+
+  readonly permissions = {
+    snapshot: (): readonly PendingPermissionSnapshot[] =>
+      [...this.#pending.values()].map((p) => ({
+        requestId: p.requestId,
+        toolName: p.toolName,
+        input: p.input,
+        requestedAt: p.requestedAt,
+        options: p.options,
+      })),
+  };
+
+  #state: SessionState = 'idle';
+  #cwd: string;
+  #model: string;
+  /** 用户明确选的模式，才会传给 Codex 覆盖；没选过就不传 */
+  #mode: CodexModeId | undefined;
+  /** thread 自己的设置对应哪一档，只用来显示 */
+  #reportedMode: CodexModeId | undefined;
+  #legacyMode: PermissionMode;
+  #context: ContextUsage | undefined;
+  #loaded: boolean;
+  #lastActivityAt: number;
+  #turnId: string | undefined;
+  /** 这一轮还在进行（含 turn/start 的 await 期间）*/
+  #running = false;
+  #stopping = false;
+  #closed = false;
+  #turnStartedAt = 0;
+  #toolCount = 0;
+  #permissionCount = 0;
+  #firstPrompt: string | undefined;
+  /** 每轮结束加一：await 回来发现代际变了，说明那一轮已结束（退出、关闭），不能再动状态 */
+  #generation = 0;
+  #lastCompletedTurnId: string | undefined;
+
+  constructor(options: CodexSessionOptions) {
+    this.sessionId = options.sessionId;
+    this.#client = options.client;
+    this.#emit = options.emit;
+    this.#onMeta = options.onMeta;
+    this.#onIdle = options.onIdle;
+    this.#log = options.log ?? (() => {});
+    this.#now = options.now ?? Date.now;
+    this.#queue = new InputQueue({ now: this.#now });
+    this.#heartbeat = new Heartbeat({ emit: this.#emit, now: this.#now });
+    this.#cwd = options.cwd;
+    this.#model = options.model;
+    this.#mode = isCodexMode(options.engineMode) ? options.engineMode : undefined;
+    this.#legacyMode = this.#mode === undefined ? options.permissionMode : legacyFromMode(this.#mode);
+    this.#loaded = !options.resume;
+    this.#lastActivityAt = this.#now();
+    this.#client.attach(this.sessionId, this);
+  }
+
+  get state(): SessionState {
+    return this.#state;
+  }
+  get costUsd(): number {
+    return 0;
+  }
+  get lastActivityAt(): number {
+    return this.#lastActivityAt;
+  }
+  get queueLength(): number {
+    return this.#queue.length;
+  }
+  get hasProcess(): boolean {
+    return this.#loaded;
+  }
+  get bgRunningCount(): number {
+    return 0;
+  }
+  get permissionMode(): PermissionMode {
+    return this.#legacyMode;
+  }
+
+  meta(): SessionRuntimeMeta {
+    return {
+      sessionId: this.sessionId,
+      state: this.#state,
+      costUsd: 0,
+      lastActivityAt: this.#lastActivityAt,
+      cwd: this.#cwd,
+      model: this.#model,
+      permissionMode: this.#legacyMode,
+      ...((this.#mode ?? this.#reportedMode) === undefined ? {} : { engineMode: (this.#mode ?? this.#reportedMode)! }),
+      ...(this.#state === 'waiting_permission' && this.#pending.size > 0 ? { waitingFor: 'permission' as const } : {}),
+      ...(this.#context === undefined ? {} : { context: this.#context }),
+      ...(this.#firstPrompt === undefined ? {} : { firstPrompt: this.#firstPrompt }),
+    };
+  }
+
+  bgTasks(): BgTask[] {
+    return [];
+  }
+
+  async stopBgTask(): Promise<StopBgTaskResult> {
+    return { ok: false, code: 'not_found', message: '这个引擎没有后台任务' };
+  }
+
+  send(clientMsgId: string, text: string, prepared?: PreparedInput): { duplicate: boolean; uuid?: string } {
+    this.#touch();
+    // 停止还在进行时（turn id 没到、中断没回）不能撤销它，否则原来那一轮会接着跑
+    if (!this.#running) this.#stopping = false;
+    const result = this.#queue.enqueue(clientMsgId, text, prepared?.content);
+    if (result.duplicate) {
+      this.#emit({ type: 'input.queued', clientMsgId });
+      return { duplicate: true };
+    }
+    this.#attachments.set(clientMsgId, prepared?.attachments ?? []);
+    if (this.#running) this.#emit({ type: 'input.queued', clientMsgId });
+    else void this.#runNext();
+    return { duplicate: false };
+  }
+
+  readonly #attachments = new Map<string, NonNullable<PreparedInput['attachments']>>();
+
+  recall(clientMsgId: string): boolean {
+    this.#touch();
+    if (!this.#queue.recall(clientMsgId)) return false;
+    this.#attachments.delete(clientMsgId);
+    this.#emit({ type: 'input.cancelled', clientMsgId, reason: 'recalled' });
+    return true;
+  }
+
+  async #runNext(): Promise<void> {
+    if (this.#running || this.#closed) return;
+    const next = this.#queue.takeNext();
+    if (next === undefined) return;
+    this.#running = true;
+    this.#queue.setRunning(true);
+    this.#turnId = undefined;
+    this.#turnStartedAt = this.#now();
+    this.#toolCount = 0;
+    this.#permissionCount = 0;
+    this.#firstPrompt ??= toSingleLine(next.text);
+    const attachments = this.#attachments.get(next.clientMsgId) ?? [];
+    this.#attachments.delete(next.clientMsgId);
+    this.#emit({
+      type: 'user.message',
+      messageId: next.clientMsgId,
+      clientMsgId: next.clientMsgId,
+      text: next.text,
+      ...(attachments.length === 0 ? {} : { attachments }),
+    });
+    this.#setState('running');
+    this.#heartbeat.start();
+    const generation = this.#generation;
+    const stale = (): boolean => generation !== this.#generation || this.#closed;
+    try {
+      await this.#ensureLoaded();
+      if (stale()) return;
+      const result = await this.#client.call('turn/start', {
+        threadId: this.sessionId,
+        clientUserMessageId: next.clientMsgId,
+        cwd: this.#cwd,
+        input: toUserInput(next.text, next.content),
+        approvalsReviewer: 'user',
+        ...(this.#model === CODEX_DEFAULT_MODEL || this.#model === '' ? {} : { model: this.#model }),
+        ...(this.#mode === undefined ? {} : turnModeParams(this.#mode)),
+      });
+      if (stale()) return;
+      const turn = isRecord(result) ? result['turn'] : undefined;
+      const id = isRecord(turn) ? str(turn['id']) : undefined;
+      if (id !== undefined) this.#turnId ??= id;
+      // turn/start 的 await 期间用户点了停止：那时还没有 turnId，补一次中断
+      if (this.#stopping) await this.#interrupt();
+    } catch (err) {
+      // 这一轮已经结束了（比如进程退出时已报过），迟到的异常不能算到下一轮头上
+      if (stale()) return;
+      this.#failTurn('other', err instanceof Error ? err.message : String(err));
+    }
+  }
+
+  async #ensureLoaded(): Promise<void> {
+    if (this.#loaded) return;
+    const response = await this.#client.call('thread/resume', {
+      threadId: this.sessionId,
+      excludeTurns: true,
+      cwd: this.#cwd,
+      approvalsReviewer: 'user',
+      ...(this.#model === CODEX_DEFAULT_MODEL || this.#model === '' ? {} : { model: this.#model }),
+      ...(this.#mode === undefined ? {} : threadModeParams(this.#mode)),
+    });
+    this.#loaded = true;
+    // 没指定模式时如实回报这个 thread 自己的设置，但不拿它去覆盖：它可能比标准档更严
+    // （如禁写 /tmp），按档位重发会放宽。对不上任何一档就不带 engineMode
+    if (this.#mode === undefined) {
+      this.#reportedMode = modeFromThreadResponse(response);
+      if (this.#reportedMode !== undefined) this.#legacyMode = legacyFromMode(this.#reportedMode);
+    }
+    if (isRecord(response) && typeof response['model'] === 'string' && response['model'] !== '') {
+      this.#model = response['model'];
+    }
+    this.#onMeta?.(this.meta());
+  }
+
+  onNotification(method: string, params: Rec): void {
+    switch (method) {
+      case 'turn/started': {
+        const turn = params['turn'];
+        const id = isRecord(turn) ? str(turn['id']) : undefined;
+        if (id !== undefined) this.#turnId = id;
+        return;
+      }
+      case 'item/agentMessage/delta': {
+        const itemId = str(params['itemId']);
+        const delta = str(params['delta']);
+        if (itemId === undefined || delta === undefined) return;
+        this.#heartbeat.noteActivity();
+        this.#touch();
+        this.#emit({ type: 'assistant.delta', messageId: itemId, text: delta });
+        return;
+      }
+      case 'item/started':
+        this.#itemStarted(params['item']);
+        return;
+      case 'item/completed':
+        this.#itemCompleted(params['item']);
+        return;
+      case 'thread/tokenUsage/updated':
+        this.#tokenUsage(params['tokenUsage']);
+        return;
+      case 'error': {
+        // willRetry 是可恢复的；不可恢复的错误随后由 turn/completed 带来，不在这里重复报
+        if (params['willRetry'] !== true) return;
+        const error = params['error'];
+        const message = isRecord(error) ? str(error['message']) : undefined;
+        this.#emit({ type: 'error.transient', attempt: 1, reason: toSingleLine(message ?? 'Codex 正在重试', 200) });
+        return;
+      }
+      case 'serverRequest/resolved': {
+        const requestId = params['requestId'];
+        for (const pending of this.#pending.values()) {
+          if (pending.rpcId === requestId) this.#invalidate(pending, 'Codex 已不再等待这个决定');
+        }
+        return;
+      }
+      case 'turn/completed':
+        this.#turnCompleted(params['turn']);
+        return;
+      default:
+        return;
+    }
+  }
+
+  #itemStarted(item: unknown): void {
+    if (!isRecord(item)) return;
+    const id = str(item['id']);
+    if (id === undefined) return;
+    if (item['type'] === 'fileChange') this.#fileChanges.set(id, item);
+    const converted = codexItemToHistory(item, this.#now());
+    if (converted?.kind !== 'tool') return;
+    this.#touch();
+    this.#inFlightTools.set(id, this.#now());
+    this.#heartbeat.noteToolStart(id, converted.toolName);
+    this.#emit({
+      type: 'tool.start',
+      toolUseId: id,
+      toolName: converted.toolName,
+      argSummary: converted.argSummary,
+      ...(converted.filePath === undefined ? {} : { filePath: converted.filePath }),
+    });
+  }
+
+  #itemCompleted(item: unknown): void {
+    if (!isRecord(item)) return;
+    const id = str(item['id']);
+    if (id === undefined) return;
+    if (item['type'] === 'agentMessage') {
+      this.#heartbeat.noteActivity();
+      this.#emit({ type: 'assistant.done', messageId: id, text: str(item['text']) ?? '' });
+      return;
+    }
+    const converted = codexItemToHistory(item, this.#now());
+    if (converted?.kind !== 'tool') return;
+    const startedAt = this.#inFlightTools.get(id);
+    this.#inFlightTools.delete(id);
+    this.#fileChanges.delete(id);
+    this.#toolCount += 1;
+    this.#heartbeat.noteToolEnd(id);
+    this.#touch();
+    this.#emit({
+      type: 'tool.end',
+      toolUseId: id,
+      status: converted.status ?? 'ok',
+      durationMs: converted.durationMs ?? (startedAt === undefined ? 0 : Math.max(0, Math.round(this.#now() - startedAt))),
+      resultSummary: converted.resultSummary ?? '',
+      ...(converted.outputPreview === undefined ? {} : { outputPreview: converted.outputPreview }),
+    });
+  }
+
+  #tokenUsage(usage: unknown): void {
+    if (!isRecord(usage) || !isRecord(usage['last'])) return;
+    const used = usage['last']['totalTokens'];
+    const max = usage['modelContextWindow'];
+    if (typeof used !== 'number' || used < 0 || typeof max !== 'number' || max <= 0) return;
+    this.#context = {
+      usedTokens: Math.round(used),
+      maxTokens: Math.round(max),
+      percent: (used / max) * 100,
+      at: this.#now(),
+    };
+  }
+
+  #turnCompleted(turn: unknown): void {
+    if (!isRecord(turn)) return;
+    const id = str(turn['id']);
+    // 其他轮的迟到通知（比如上一轮被中断后才到）不算这一轮结束。新一轮的 turn id 还没到时，
+    // 靠「刚结束的那一轮」认出重复通知
+    if (!this.#running || (this.#turnId !== undefined && id !== undefined && id !== this.#turnId)) return;
+    if (id !== undefined && id === this.#lastCompletedTurnId) return;
+    if (id !== undefined) this.#lastCompletedTurnId = id;
+    const status = turn['status'];
+    if (status === 'failed') {
+      const error = turn['error'];
+      this.#failTurn(
+        errorKind(isRecord(error) ? error['codexErrorInfo'] : undefined),
+        (isRecord(error) ? str(error['message']) : undefined) ?? 'Codex 这一轮失败了',
+      );
+      return;
+    }
+    this.#endTurn();
+    if (this.#stopping || status === 'interrupted') {
+      this.#stopping = false;
+      this.#setState('stopped');
+      this.#continueOrIdle();
+      return;
+    }
+    this.#emit({
+      type: 'run.done',
+      durationMs: Math.max(0, Math.round(this.#now() - this.#turnStartedAt)),
+      costUsd: 0,
+      costUnknown: true,
+      toolCount: this.#toolCount,
+      permissionCount: this.#permissionCount,
+    });
+    this.#setState('idle');
+    this.#continueOrIdle();
+  }
+
+  #failTurn(kind: 'quota' | 'auth' | 'config' | 'other', message: string): void {
+    this.#log(`[codex] 会话 ${this.sessionId} 这一轮失败：${message}`);
+    this.#endTurn();
+    this.#emit({ type: 'error.fatal', kind, message: toSingleLine(message, 500) });
+    this.#setState('error');
+    this.#continueOrIdle();
+  }
+
+  /** 这一轮结束的共同收尾：没跑完的工具卡收口，挂起的审批作废 */
+  #endTurn(): void {
+    this.#heartbeat.stop();
+    for (const id of this.#inFlightTools.keys()) {
+      this.#emit({ type: 'tool.end', toolUseId: id, status: 'warn', durationMs: 0, resultSummary: '已中断' });
+    }
+    this.#inFlightTools.clear();
+    this.#fileChanges.clear();
+    for (const pending of [...this.#pending.values()]) this.#invalidate(pending, '这一轮已结束');
+    this.#running = false;
+    this.#generation += 1;
+    this.#queue.setRunning(false);
+    this.#turnId = undefined;
+    this.#touch();
+  }
+
+  #continueOrIdle(): void {
+    if (this.#closed) return;
+    if (this.#queue.length > 0) void this.#runNext();
+    else this.#onIdle?.();
+  }
+
+  onServerRequest(id: unknown, method: string, params: Rec, reply: (result: unknown) => void): boolean {
+    switch (method) {
+      case 'item/commandExecution/requestApproval': {
+        const command = unwrapShellCommand(str(params['command']) ?? '');
+        this.#request(id, 'Shell', {
+          command,
+          ...(str(params['cwd']) === undefined ? {} : { cwd: str(params['cwd']) }),
+          ...(str(params['reason']) === undefined ? {} : { reason: str(params['reason']) }),
+        }, optionsFrom(params['availableDecisions']), reply, (verdict, optionId) => ({
+          decision: verdict === 'deny' ? 'decline' : optionId === ALLOW_SESSION.id ? 'acceptForSession' : 'accept',
+        }));
+        return true;
+      }
+      case 'item/fileChange/requestApproval': {
+        const item = this.#fileChanges.get(str(params['itemId']) ?? '');
+        const changes = Array.isArray(item?.['changes']) ? (item['changes'] as unknown[]).filter(isRecord) : [];
+        const paths = changes.map((c) => str(c['path'])).filter((p) => p !== undefined);
+        this.#request(id, 'Edit', {
+          file_path: paths.length <= 1 ? (paths[0] ?? '') : `${paths[0]} 等 ${paths.length} 个文件`,
+          new_string: changes.map((c) => str(c['diff']) ?? '').join('\n'),
+          ...(str(params['reason']) === undefined ? {} : { reason: str(params['reason']) }),
+          ...(str(params['grantRoot']) === undefined ? {} : { grantRoot: str(params['grantRoot']) }),
+        }, [ALLOW_ONCE, ALLOW_SESSION, DENY], reply, (verdict, optionId) => ({
+          decision: verdict === 'deny' ? 'decline' : optionId === ALLOW_SESSION.id ? 'acceptForSession' : 'accept',
+        }));
+        return true;
+      }
+      case 'item/permissions/requestApproval': {
+        const requested = isRecord(params['permissions']) ? params['permissions'] : {};
+        const granted: Rec = {};
+        for (const [key, value] of Object.entries(requested)) if (value !== null) granted[key] = value;
+        this.#request(id, 'Permissions', {
+          ...(str(params['reason']) === undefined ? {} : { reason: str(params['reason']) }),
+          permissions: requested,
+        }, [ALLOW_ONCE, ALLOW_SESSION, DENY], reply, (verdict, optionId) =>
+          verdict === 'deny'
+            ? { permissions: {}, scope: 'turn' }
+            : { permissions: granted, scope: optionId === ALLOW_SESSION.id ? 'session' : 'turn' },
+        );
+        return true;
+      }
+      case 'mcpServer/elicitation/request': {
+        // 还没有对应的界面：拒绝并留一条说明，否则这一轮会一直等下去
+        this.#emit({
+          type: 'error.transient',
+          attempt: 1,
+          reason: toSingleLine(`MCP 服务 ${str(params['serverName']) ?? ''} 请求输入，trine 暂不支持，已拒绝`, 200),
+        });
+        reply({ action: 'decline', content: null, _meta: null });
+        return true;
+      }
+      default:
+        return false;
+    }
+  }
+
+  #request(
+    rpcId: unknown,
+    toolName: string,
+    input: Record<string, unknown>,
+    options: PermissionOption[],
+    reply: (result: unknown) => void,
+    decide: PendingApproval['decide'],
+  ): void {
+    // 不用计数器：会话重建后会重复，迟到的旧应答可能批准到新请求上
+    const requestId = `codex-${randomUUID()}`;
+    const requestedAt = this.#now();
+    this.#pending.set(requestId, { requestId, rpcId, toolName, input, requestedAt, options, decide, reply });
+    this.#permissionCount += 1;
+    this.#heartbeat.setPhase('wait');
+    this.#emit({ type: 'permission.request', requestId, toolName, input, requestedAt, options });
+    this.#setState('waiting_permission');
+    // 同状态下新增挂起项也要广播 meta（waitingFor）
+    this.#onMeta?.(this.meta());
+  }
+
+  respondPermission(verdict: PermissionVerdict): boolean {
+    this.#touch();
+    const pending = this.#pending.get(verdict.requestId);
+    if (pending === undefined) return false;
+    this.#pending.delete(verdict.requestId);
+    // Codex 不能改参数后执行。旧版网页可能发来「改了参数的批准」：放行就等于执行用户已经改掉的
+    // 原命令，所以按拒绝处理，并说清楚
+    const edited = verdict.verdict === 'allow' && verdict.updatedInput !== undefined;
+    const effective = edited ? 'deny' : verdict.verdict;
+    if (edited) {
+      this.#emit({ type: 'error.transient', attempt: 1, reason: 'Codex 不支持改参数后批准，已拒绝这次请求' });
+    }
+    // optionId 只能细化「批准」：不认识的选项按单次批准，绝不放宽
+    const optionId = pending.options.some((o) => o.id === verdict.optionId) ? verdict.optionId : undefined;
+    pending.reply(pending.decide(effective, optionId));
+    this.#emit({
+      type: 'permission.resolved',
+      requestId: verdict.requestId,
+      verdict: effective,
+      ...(verdict.resolvedBy === undefined ? {} : { resolvedBy: verdict.resolvedBy }),
+    });
+    this.#afterPendingChanged();
+    return true;
+  }
+
+  #invalidate(pending: PendingApproval, reason: string): void {
+    if (!this.#pending.delete(pending.requestId)) return;
+    this.#emit({ type: 'permission.invalidated', requestId: pending.requestId, reason });
+    this.#afterPendingChanged();
+  }
+
+  #afterPendingChanged(): void {
+    if (this.#pending.size > 0 || this.#state !== 'waiting_permission') return;
+    this.#heartbeat.setPhase('run');
+    this.#setState('running');
+  }
+
+  async stop(): Promise<void> {
+    this.#touch();
+    for (const dropped of this.#queue.clear()) {
+      this.#attachments.delete(dropped.clientMsgId);
+      this.#emit({ type: 'input.cancelled', clientMsgId: dropped.clientMsgId, reason: 'stopped' });
+    }
+    if (!this.#running) {
+      this.#setState('stopped');
+      return;
+    }
+    this.#stopping = true;
+    for (const pending of [...this.#pending.values()]) {
+      pending.reply(pending.decide('deny', undefined));
+      this.#invalidate(pending, '用户停止了当前任务');
+    }
+    await this.#interrupt();
+  }
+
+  async #interrupt(): Promise<void> {
+    if (this.#turnId === undefined) return;
+    await this.#client.call('turn/interrupt', { threadId: this.sessionId, turnId: this.#turnId }).catch((err: unknown) => {
+      this.#emit({
+        type: 'error.transient',
+        attempt: 1,
+        reason: toSingleLine(`中断请求失败：${err instanceof Error ? err.message : String(err)}`),
+      });
+    });
+  }
+
+  async setPermissionMode(mode: PermissionMode, engineMode?: string): Promise<void> {
+    this.#touch();
+    // 下一轮 turn/start 带上。不认识的值按旧枚举映射，不会变成更宽的权限
+    this.#mode = isCodexMode(engineMode) ? engineMode : modeFromLegacy(mode);
+    this.#legacyMode = legacyFromMode(this.#mode);
+    this.#onMeta?.(this.meta());
+  }
+
+  setCwd(cwd: string): void {
+    this.#touch();
+    this.#cwd = cwd;
+    this.#onMeta?.(this.meta());
+  }
+
+  async setModel(model: string): Promise<void> {
+    this.#touch();
+    this.#model = model;
+    this.#onMeta?.(this.meta());
+  }
+
+  /** app-server 退出（崩溃或 agent 关停）：thread 要重新加载，下一条消息会 resume */
+  onExit(): void {
+    this.#loaded = false;
+    if (this.#running) this.#failTurn('other', 'Codex 进程意外退出，发消息可继续');
+    else this.#onMeta?.(this.meta());
+  }
+
+  async close(_reason?: string, _drainTimeoutMs?: number): Promise<void> {
+    if (this.#closed) return;
+    this.#closed = true;
+    this.#heartbeat.stop();
+    for (const dropped of this.#queue.clear()) {
+      this.#emit({ type: 'input.cancelled', clientMsgId: dropped.clientMsgId, reason: 'closed' });
+    }
+    for (const pending of [...this.#pending.values()]) {
+      pending.reply(pending.decide('deny', undefined));
+      this.#invalidate(pending, '会话已关闭');
+    }
+    if (this.#running) await this.#interrupt();
+    const wasLoaded = this.#loaded;
+    this.#loaded = false;
+    this.#generation += 1;
+    this.#running = false;
+    // 已被新实例接管就不能卸载：thread 正归新实例用
+    const detached = this.#client.detach(this.sessionId, this);
+    if (wasLoaded && detached) {
+      // 卸载失败不要紧：进程退出时一起没了
+      await this.#client.call('thread/unsubscribe', { threadId: this.sessionId }).catch(() => {});
+    }
+  }
+
+  #touch(): void {
+    this.#lastActivityAt = this.#now();
+  }
+
+  #setState(state: SessionState): void {
+    if (this.#state === state) return;
+    this.#state = state;
+    this.#emit({ type: 'run.state', state });
+    this.#onMeta?.(this.meta());
+  }
+}

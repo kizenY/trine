@@ -183,3 +183,22 @@ describe('AgentState · 待生效的对话截断点', () => {
     expect(logs).toEqual([]);
   });
 });
+
+describe('AgentState · 引擎字段', () => {
+  test('只有 engineMode 变了也要写：先写 permissionMode、后写 engineMode 时不能被当成没变化', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'trine-state-engine-'));
+    try {
+      const path = join(dir, 'state.json');
+      const state = await AgentState.load({ path, machineId: 'm' });
+      state.rememberSession('t', { cwd: '/p', model: 'x', permissionMode: 'default', engine: 'codex', engineMode: 'workspace' });
+      state.updateSession('t', { permissionMode: 'plan' });
+      state.updateSession('t', { permissionMode: 'plan', engineMode: 'read-only' });
+      expect(state.sessionParams('t')?.engineMode).toBe('read-only');
+      await state.flush();
+      const reloaded = await AgentState.load({ path, machineId: 'm' });
+      expect(reloaded.sessionParams('t')).toMatchObject({ engine: 'codex', engineMode: 'read-only', permissionMode: 'plan' });
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+});

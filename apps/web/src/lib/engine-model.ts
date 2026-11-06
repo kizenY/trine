@@ -27,6 +27,7 @@ const CLAUDE_FALLBACK: EngineSummary = {
     subagentHistory: true,
     attachments: true,
     mutations: true,
+    contextRefresh: true,
   },
 };
 
@@ -102,4 +103,18 @@ export function windowLabel(window: Pick<EngineRateWindow, 'durationMins' | 'buc
 /** 带限额的引擎（Claude 的限额仍在 MachineInfo.rateLimits） */
 export function enginesWithLimits(info: Info): readonly EngineSummary[] {
   return enginesOf(info).filter((e) => (e.rateLimits?.windows.length ?? 0) > 0);
+}
+
+/** 新会话不指定模型：跟随引擎自己的配置（agent 收到后不传 model） */
+export const ENGINE_DEFAULT_MODEL = 'default';
+
+/** 这台机器上能新建会话的引擎 */
+export function creatableEngines(info: Info): readonly EngineSummary[] {
+  return enginesOf(info).filter((e) => e.available && e.capabilities.interactive === true);
+}
+
+/** 权限模式的显示名；模式未知（续接外部 thread，组合对不上任何一档）时为 undefined */
+export function engineModeLabel(engine: EngineSummary | undefined, modeId: string | undefined): string | undefined {
+  if (modeId === undefined) return undefined;
+  return engine?.modes?.find((m) => m.id === modeId)?.label ?? modeId;
 }

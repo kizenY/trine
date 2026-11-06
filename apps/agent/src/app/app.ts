@@ -62,8 +62,8 @@ import {
 } from './claude-cli.ts';
 import { ClaudeLatestChecker } from './claude-latest.ts';
 import { claudeEngineSummary } from '../engine/claude.ts';
-import { AppServerClient, spawnCodexAppServer, type SpawnAppServer } from '../engine/codex/app-server.ts';
-import { CodexEngine } from '../engine/codex/engine.ts';
+import { spawnCodexAppServer, type SpawnAppServer } from '../engine/codex/app-server.ts';
+import { CODEX_ENGINE_ID, CodexEngine } from '../engine/codex/engine.ts';
 import { AGENT_VERSION, buildMachineInfo } from './machine-info.ts';
 import {
   findUp,
@@ -259,7 +259,8 @@ export class AgentApp {
       codexSpawn === undefined
         ? undefined
         : new CodexEngine({
-            client: new AppServerClient({ spawn: codexSpawn, clientVersion: AGENT_VERSION, now, log }),
+            spawn: codexSpawn,
+            clientVersion: AGENT_VERSION,
             now,
             log,
             onChange: () => app.#emitMachine({ type: 'machine.info', info: app.machineInfo() }),
@@ -273,6 +274,9 @@ export class AgentApp {
             externalSessions: {
               list: () => codex.listSessionsBounded(),
               metaOf: (sessionId: string) => codex.metaOf(sessionId),
+              rename: (sessionId: string, title: string) => codex.rename(sessionId, title),
+              delete: (sessionId: string) => codex.delete(sessionId),
+              createSession: (args: CreateSessionArgs) => (args.engine === CODEX_ENGINE_ID ? codex.createSession(args) : undefined),
             },
           }),
       uploadsDir: (sessionId) => attachments.sessionDir(sessionId),
@@ -393,7 +397,7 @@ export class AgentApp {
         void app.#codex?.refresh();
         return app.#planUsage.refresh();
       },
-      readOnlyEngine: codex,
+      codexEngine: codex,
       restartAgent: async (action) => (action === 'cancel' ? app.cancelRestart() : app.restartAgent({ mode: action === 'now' ? 'now' : 'when_idle' })),
       machineStats,
       now,
@@ -781,6 +785,7 @@ export class AgentApp {
             requestedAt: pending.requestedAt,
             ...(pending.suggestions === undefined ? {} : { suggestions: pending.suggestions }),
             ...(pending.parentToolUseId === undefined ? {} : { parentToolUseId: pending.parentToolUseId }),
+            ...(pending.options === undefined ? {} : { options: pending.options }),
           },
           sessionId,
         );

@@ -33,6 +33,7 @@
  * 也可能让同一条 input.send 两次进 agent，于是 `input.queued` 可能在
  * `confirmed` 之后才到（评审 C4）。
  */
+import { PermissionOptionSchema } from '@trine/core';
 import { z } from 'zod';
 import type {
   AgentToClientEvent,
@@ -206,6 +207,8 @@ export const PermissionEntrySchema = z.object({
   toolName: z.string(),
   input: z.unknown(),
   suggestions: z.array(z.unknown()).optional(),
+  /** 引擎给的决定选项；刷新后还要能按它显示按钮，所以进持久化 */
+  options: z.array(PermissionOptionSchema).optional(),
   requestedAt: z.number(),
   state: z.enum(['pending', 'resolved', 'invalidated']),
   verdict: z.enum(['allow', 'deny']).optional(),
@@ -245,6 +248,7 @@ export const RunDoneEntrySchema = z.object({
   id: z.string().min(1),
   durationMs: z.number(),
   costUsd: z.number(),
+  costUnknown: z.boolean().optional(),
   toolCount: z.number(),
   permissionCount: z.number(),
   turns: z.number().optional(),
@@ -591,6 +595,7 @@ export function applyEvent(tl: Timeline, event: AgentToClientEvent): Timeline {
             requestedAt: event.requestedAt,
             state: 'pending',
             ...(event.parentToolUseId === undefined ? {} : { parentToolUseId: event.parentToolUseId }),
+            ...(event.options === undefined ? {} : { options: event.options }),
             seq,
             ts: event.ts,
           },
@@ -657,6 +662,7 @@ export function applyEvent(tl: Timeline, event: AgentToClientEvent): Timeline {
         id: `run.done:${seq}`,
         durationMs: event.durationMs,
         costUsd: event.costUsd,
+        ...(event.costUnknown === true ? { costUnknown: true } : {}),
         toolCount: event.toolCount,
         permissionCount: event.permissionCount,
         ...(event.turns === undefined ? {} : { turns: event.turns }),

@@ -107,6 +107,7 @@ import type {
   SlashCommand,
 } from '@trine/core';
 import { CLAUDE_ENGINE_ID } from '@trine/core';
+import { CODEX_DEFAULT_MODEL, CODEX_ENGINE_ID } from '../engine/codex/ids.ts';
 import { AttachmentError, type AttachmentStore, type PreparedInput } from '../bridge/attachments.ts';
 import { FileAccessError } from '../files/access.ts';
 import type { FileService } from '../files/service.ts';
@@ -240,15 +241,21 @@ export class CapabilitiesCache {
   }
 }
 
-/** router 对只读引擎（Codex）要用的部分 */
-export interface ReadOnlyEngine {
+/** router 对 Codex 引擎要用的部分 */
+export interface RouterCodexEngine {
   owns(sessionId: string): Promise<boolean>;
   history(sessionId: string): Promise<HistoryItem[]>;
+  startThread(args: { cwd: string; model: string; engineMode?: string | undefined }): Promise<{
+    threadId: string;
+    model: string;
+    engineMode: string;
+    permissionMode: PermissionMode;
+  }>;
 }
 
 export interface RouterDeps {
-  /** 只读引擎；不给 = 只有 Claude */
-  readOnlyEngine?: ReadOnlyEngine | undefined;
+  /** Codex 引擎；不给 = 只有 Claude */
+  codexEngine?: RouterCodexEngine | undefined;
   manager: SessionManager;
   emitter: EventEmitter;
   state: AgentState;
@@ -665,8 +672,15 @@ export class Router {
         this.#deps.state.updateSession(sessionId, { model: event.model });
         return;
       case 'session.setPermissionMode':
-        await session.setPermissionMode(event.mode);
-        this.#deps.state.updateSession(sessionId, { permissionMode: event.mode });
+        await session.setPermissionMode(event.mode, event.engineMode);
+        {
+          // Codex 的 event.mode 可能只是近似值，以会话实际采用的为准
+          const applied = session.meta();
+          this.#deps.state.updateSession(sessionId, {
+            permissionMode: applied.permissionMode,
+            ...(applied.engineMode === undefined ? {} : { engineMode: applied.engineMode }),
+          });
+        }
         return;
       case 'session.setCwd':
         await this.#setCwd(sessionId, session, event.cwd);
@@ -733,14 +747,6 @@ export class Router {
   async #handleMetaCommand(sessionId: string, event: SessionMetaEvent): Promise<void> {
     let outcome: MutationOutcome;
     try {
-      if ((event.type === 'session.rename' || event.type === 'session.delete') && (await this.#isReadOnlySession(sessionId))) {
-        this.#emitMutateResponse(event.reqId, sessionId, {
-          ok: false,
-          code: 'io',
-          message: '这个引擎的会话暂时不能重命名或删除',
-        });
-        return;
-      }
       switch (event.type) {
         case 'session.rename':
           outcome = await this.#mutations.rename(sessionId, event.title);
@@ -854,8 +860,12 @@ export class Router {
   }
 
   async #historyItems(sessionId: string): Promise<HistoryItem[]> {
-    const engine = this.#deps.readOnlyEngine;
-    if (engine !== undefined && (await this.#isReadOnlySession(sessionId))) return engine.history(sessionId);
+    const engine = this.#deps.codexEngine;
+    if (engine !== undefined && (await this.#isCodexSession(sessionId))) {
+      // 还没发过消息的 thread 没落盘，没有历史可读
+      if (this.#deps.state.sessionParams(sessionId)?.started === false) return [];
+      return engine.history(sessionId);
+    }
     const live = this.#deps.manager.get(sessionId);
     const pending =
       (live !== undefined && isRewindable(live) ? live.pendingRewind : undefined) ?? this.#deps.state.pendingRewind(sessionId);
@@ -865,14 +875,17 @@ export class Router {
   }
 
   /**
-   * 这个会话属于只读引擎吗。Claude 已知的会话不去问；问不到（app-server 不可用）按不是处理，
+   * 这个会话属于 Codex 吗。本机记过的直接看记录；问不到（app-server 不可用）按不是处理，
    * 请求接着走 Claude 那条路，结果是「会话不存在」，不会误操作。
    */
-  async #isReadOnlySession(sessionId: string): Promise<boolean> {
-    const engine = this.#deps.readOnlyEngine;
+  async #isCodexSession(sessionId: string): Promise<boolean> {
+    const engine = this.#deps.codexEngine;
     if (engine === undefined) return false;
-    if (this.#deps.manager.has(sessionId) || this.#deps.state.sessionParams(sessionId) !== undefined) return false;
-    if (this.#deps.manager.metaOf(sessionId)?.engine !== undefined) return true;
+    const params = this.#deps.state.sessionParams(sessionId);
+    if (params !== undefined) return params.engine === CODEX_ENGINE_ID;
+    const known = this.#deps.manager.metaOf(sessionId)?.engine;
+    if (known !== undefined) return known === CODEX_ENGINE_ID;
+    if (this.#deps.manager.has(sessionId)) return false;
     return engine.owns(sessionId).catch((err: unknown) => {
       this.#log(`[router] 查询引擎会话失败 session=${sessionId}: ${err instanceof Error ? err.message : String(err)}`);
       return false;
@@ -1035,8 +1048,8 @@ export class Router {
    * 探测失败 → 空数组（见文件头），source 统一 'project'（与 translate.ts 一致）。
    */
   async #commands(sessionId: string, reqId: string, sender: Recipient): Promise<void> {
-    // 只读引擎没有斜杠命令；探测会起 claude，也不该拿 Claude 的命令充数
-    if (await this.#isReadOnlySession(sessionId)) {
+    // Codex 没有列举斜杠命令的接口；探测会起 claude，也不该拿 Claude 的命令充数
+    if (await this.#isCodexSession(sessionId)) {
       this.#deps.emitter.emit({ type: 'session.commands.response', reqId, slashCommands: [] }, sessionId, {
         to: sender.deviceId,
       });
@@ -1086,6 +1099,7 @@ export class Router {
           ...(event.remember === undefined ? {} : { remember: event.remember }),
           ...(event.message === undefined ? {} : { message: event.message }),
           ...(event.setMode === undefined ? {} : { setMode: event.setMode }),
+          ...(event.optionId === undefined ? {} : { optionId: event.optionId }),
           resolvedBy: sender.deviceId,
         });
         if (!hit) {
@@ -1129,6 +1143,13 @@ export class Router {
     }
     const meta = session.meta();
     const { manager, state } = this.#deps;
+    if (session.setCwd !== undefined) {
+      session.setCwd(cwd);
+      state.updateSession(sessionId, { cwd });
+      const changed = manager.metaOf(sessionId);
+      if (changed !== undefined) this.#emitMachine({ type: 'session.updated', session: changed });
+      return;
+    }
     // 有转录才 resume；一条消息都没发过的新会话就以新建方式重开（会多广播一次
     // session.created，client 按 sessionId 幂等）。「发过消息」持久化在 state.sessions
     // 里（省略 = 历史会话，有转录），起过子进程也算
@@ -1198,11 +1219,8 @@ export class Router {
   }
 
   async #resume(sessionId: string): Promise<EngineSession | undefined> {
-    // 能力在 agent 端强制：只读引擎的会话不能被当成 Claude 会话 resume
-    if (await this.#isReadOnlySession(sessionId)) {
-      this.#emitMachine({ type: 'error.fatal', kind: 'config', message: '这个会话目前只能查看，不能在 trine 里操作' });
-      return undefined;
-    }
+    // 让目录记住它：下面的 #lookupParams 经 metaOf 拿到引擎。thread 没加载，不占名额
+    await this.#isCodexSession(sessionId);
     let params: SessionParams | undefined;
     try {
       params = await this.#lookupParams(sessionId);
@@ -1218,10 +1236,21 @@ export class Router {
       });
       return undefined;
     }
-    // 归属查询可能失败（见 #isReadOnlySession）而列表随后成功：列表里带引擎的会话同样不能走到这里
-    if (this.#deps.manager.metaOf(sessionId)?.engine !== undefined) {
-      this.#emitMachine({ type: 'error.fatal', kind: 'config', message: '这个会话目前只能查看，不能在 trine 里操作' });
+    // 不认识的引擎绝不能当 Claude 会话 resume。引擎可能只在 meta 上（归属查询失败、列表却命中），
+    // 也要带进 params，否则走到 Claude 的工厂
+    const known = this.#deps.manager.metaOf(sessionId);
+    const engineId = params?.engine ?? known?.engine;
+    if (engineId !== undefined && (engineId !== CODEX_ENGINE_ID || this.#deps.codexEngine === undefined)) {
+      this.#emitMachine({ type: 'error.fatal', kind: 'config', message: `这台机器不支持引擎 ${engineId}` });
       return undefined;
+    }
+    if (engineId !== undefined && params !== undefined && params.engine === undefined) {
+      params = {
+        ...params,
+        engine: engineId,
+        model: known?.model || CODEX_DEFAULT_MODEL,
+        ...(known?.engineMode === undefined ? {} : { engineMode: known.engineMode }),
+      };
     }
     if (params === undefined) {
       this.#emitMachine({
@@ -1234,7 +1263,9 @@ export class Router {
     try {
       // started 省略 = 历史会话有转录 → resume；本进程 create 出来还没发过消息的
       // （started:false，进程重启后仍记着）→ 无转录，以新建方式起
-      const resume = params.started !== false;
+      // Codex 走到这里说明会话没有活跃实例：thread 要重新加载。没落盘的（首条消息前 agent 重启）
+      // 会在 thread/resume 失败，用户看得到原因
+      const resume = params.engine !== undefined || params.started !== false;
       // resume 历史会话：带上 title / firstPrompt 等，否则 meta 里这些是空的，
       // 第一次状态迁移就把空标题广播出去（评审 B3）
       const seed = resume ? await this.#seedFor(sessionId) : undefined;
@@ -1266,10 +1297,13 @@ export class Router {
     if (local !== undefined) return local;
     const meta = this.#deps.manager.metaOf(sessionId);
     if (meta !== undefined) {
+      const fallbackModel = meta.engine === undefined ? this.#deps.defaultModel : CODEX_DEFAULT_MODEL;
       return {
         cwd: meta.cwd,
-        model: meta.model || this.#deps.defaultModel,
+        model: meta.model || fallbackModel,
         permissionMode: meta.permissionMode,
+        ...(meta.engine === undefined ? {} : { engine: meta.engine }),
+        ...(meta.engineMode === undefined ? {} : { engineMode: meta.engineMode }),
       };
     }
     const listed = await this.#listAll();
@@ -1281,6 +1315,15 @@ export class Router {
    * 否则 getSessionInfo。都拿不到就不种——manager 会保留已有 meta 里的值。
    */
   async #seedFor(sessionId: string): Promise<SessionSeed | undefined> {
+    const known = this.#deps.manager.metaOf(sessionId);
+    if (known?.engine !== undefined) {
+      return {
+        title: known.title,
+        ...(known.firstPrompt === undefined ? {} : { firstPrompt: known.firstPrompt }),
+        ...(known.gitBranch === undefined ? {} : { gitBranch: known.gitBranch }),
+        ...(known.createdAt === undefined ? {} : { createdAt: known.createdAt }),
+      };
+    }
     const cache = this.#listCache;
     if (cache !== undefined && this.#now() - cache.at < this.#listCacheMs) {
       const hit = await cache.promise.then((m) => m.get(sessionId)).catch(() => undefined);
@@ -1337,16 +1380,25 @@ export class Router {
     const { manager, cwdStore } = this.#deps;
     switch (event.type) {
       case 'session.create': {
-        if (event.engine !== undefined && event.engine !== CLAUDE_ENGINE_ID) {
+        const codex = event.engine === CODEX_ENGINE_ID ? this.#deps.codexEngine : undefined;
+        if (event.engine !== undefined && event.engine !== CLAUDE_ENGINE_ID && codex === undefined) {
           this.#emitMachine({ type: 'error.fatal', kind: 'config', message: `这台机器不支持引擎 ${event.engine}` });
           return;
         }
         let sessionId: string;
         try {
-          sessionId = await this.#createSession(event.cwd, event.model, event.permissionMode);
+          sessionId =
+            codex === undefined
+              ? await this.#createSession(event.cwd, event.model, event.permissionMode)
+              : await this.#createCodexSession(codex, event.cwd, event.model, event.engineMode);
         } catch (err) {
           if (err instanceof ConcurrencyLimitError) {
             this.#emitMachine({ type: 'error.fatal', kind: 'config', message: err.message });
+            return;
+          }
+          if (codex !== undefined) {
+            const message = err instanceof Error ? err.message : String(err);
+            this.#emitMachine({ type: 'error.fatal', kind: 'other', message: `新建 Codex 会话失败：${message}`.slice(0, 300) });
             return;
           }
           throw err;
@@ -1459,6 +1511,35 @@ export class Router {
     this.#deps.manager.acquire({ sessionId, cwd, model, permissionMode });
     this.#deps.state.rememberSession(sessionId, params);
     return sessionId;
+  }
+
+  /** Codex 的 thread id 只能由它生成，所以要先 thread/start，再把会话挂上去 */
+  async #createCodexSession(
+    codex: RouterCodexEngine,
+    cwd: string,
+    model: string,
+    engineMode: string | undefined,
+  ): Promise<string> {
+    await this.#deps.manager.makeRoom();
+    const started = await codex.startThread({ cwd, model, engineMode });
+    const params: SessionParams = {
+      cwd,
+      model: started.model === '' ? CODEX_DEFAULT_MODEL : started.model,
+      permissionMode: started.permissionMode,
+      engine: CODEX_ENGINE_ID,
+      engineMode: started.engineMode,
+      started: false,
+    };
+    this.#deps.manager.acquire({
+      sessionId: started.threadId,
+      cwd,
+      model: params.model,
+      permissionMode: params.permissionMode,
+      engine: CODEX_ENGINE_ID,
+      engineMode: started.engineMode,
+    });
+    this.#deps.state.rememberSession(started.threadId, params);
+    return started.threadId;
   }
 
   // -------------------------------------------------------------------------

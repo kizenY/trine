@@ -1,0 +1,748 @@
+import { describe, expect, test } from 'bun:test';
+import { AgentToClientEventSchema } from '@trine/core';
+import type { EventBody } from '../../bridge/types.ts';
+import { CodexEngine } from './engine.ts';
+import { FakeAppServer, type FakeRoute } from './fake-app-server.ts';
+import { toUserInput, type CodexSession } from './session.ts';
+
+const THREAD = 'thread-1';
+
+function harness(options: { routes?: Record<string, FakeRoute>; resume?: boolean; engineMode?: string; model?: string } = {}) {
+  const server: FakeAppServer = new FakeAppServer({
+    'turn/start': () => ({ turn: { id: `turn-${server.calls.filter((c) => c.method === 'turn/start').length}` } }),
+    'turn/interrupt': () => ({}),
+    'thread/unsubscribe': () => ({ status: 'unsubscribed' }),
+    'thread/resume': () => ({ approvalPolicy: 'on-request', sandbox: { type: 'workspaceWrite' }, model: 'resumed-model' }),
+    ...options.routes,
+  });
+  const engine = new CodexEngine({ spawn: server.spawn, clientOptions: { idleMs: 60_000 }, now: () => 1000 });
+  const events: EventBody[] = [];
+  const metas: ReturnType<CodexSession['meta']>[] = [];
+  let idles = 0;
+  const session = engine.createSession({
+    sessionId: THREAD,
+    cwd: '/synthetic',
+    model: options.model ?? 'gpt-x',
+    permissionMode: 'default',
+    ...(options.engineMode === undefined ? {} : { engineMode: options.engineMode }),
+    resume: options.resume === true,
+    emit: (body) => events.push(body),
+    onMeta: (meta) => metas.push(meta),
+    onIdle: () => (idles += 1),
+  });
+  const flush = () => Bun.sleep(5);
+  const notify = (method: string, params: Record<string, unknown> = {}) =>
+    server.handlers!.onLine(JSON.stringify({ method, params: { threadId: THREAD, ...params } }));
+  const request = (id: number, method: string, params: Record<string, unknown> = {}) =>
+    server.handlers!.onLine(JSON.stringify({ id, method, params: { threadId: THREAD, ...params } }));
+  const types = () => events.map((e) => e.type);
+  const of = <T extends EventBody['type']>(type: T) => events.filter((e) => e.type === type) as Extract<EventBody, { type: T }>[];
+  const replyTo = (id: number) => server.sent.find((m) => (m as { id?: number; method?: string }).id === id && (m as { method?: string }).method === undefined);
+  const callsOf = (method: string) => server.calls.filter((c) => c.method === method);
+  const finish = async (turnId = 'turn-1', status = 'completed', error: unknown = null) => {
+    notify('turn/completed', { turn: { id: turnId, status, error } });
+    await flush();
+  };
+  return { server, engine, session, events, metas, flush, notify, request, types, of, replyTo, callsOf, finish, idles: () => idles };
+}
+
+describe('CodexSession · 一轮', () => {
+  test('帧序列对齐 Claude：回显 → running → 文本与工具 → run.done → idle', async () => {
+    const h = harness();
+    h.session.send('c1', 'hello');
+    await h.flush();
+    expect(h.session.state).toBe('running');
+    h.notify('item/agentMessage/delta', { itemId: 'm1', delta: 'hi ' });
+    h.notify('item/started', { item: { type: 'commandExecution', id: 't1', command: "zsh -lc 'ls'", status: 'inProgress', commandActions: [] } });
+    h.notify('item/completed', { item: { type: 'commandExecution', id: 't1', command: "zsh -lc 'ls'", status: 'completed', exitCode: 0, durationMs: 12, aggregatedOutput: 'a.txt', commandActions: [] } });
+    h.notify('item/completed', { item: { type: 'agentMessage', id: 'm1', text: 'hi there' } });
+    await h.finish();
+    expect(h.types().filter((t) => t !== 'run.heartbeat')).toEqual([
+      'user.message',
+      'run.state',
+      'assistant.delta',
+      'tool.start',
+      'tool.end',
+      'assistant.done',
+      'run.done',
+      'run.state',
+    ]);
+    expect(h.of('tool.start')[0]).toMatchObject({ toolUseId: 't1', toolName: 'Shell', argSummary: 'ls' });
+    expect(h.of('tool.end')[0]).toMatchObject({ status: 'ok', durationMs: 12, outputPreview: 'a.txt' });
+    expect(h.of('run.done')[0]).toMatchObject({ toolCount: 1, permissionCount: 0, costUsd: 0 });
+    expect(h.session.state).toBe('idle');
+    expect(h.idles()).toBe(1);
+    h.engine.dispose();
+  });
+
+  test('每一帧都过协议 schema', async () => {
+    const h = harness();
+    h.session.send('c1', 'hello');
+    await h.flush();
+    h.notify('item/agentMessage/delta', { itemId: 'm1', delta: 'x' });
+    h.request(1, 'item/commandExecution/requestApproval', { command: 'ls', itemId: 't', availableDecisions: ['accept', 'decline'] });
+    h.session.respondPermission({ requestId: h.of('permission.request')[0]!.requestId, verdict: 'allow' });
+    await h.finish();
+    for (const body of h.events) {
+      const parsed = AgentToClientEventSchema.safeParse({ ...body, ts: 1, seq: 1, dir: 'a2c', sessionId: THREAD });
+      expect(parsed.success).toBe(true);
+    }
+    h.engine.dispose();
+  });
+
+  test('turn/start 带 clientUserMessageId（历史去重）与当前模型、模式、目录', async () => {
+    const h = harness({ engineMode: 'workspace' });
+    h.session.send('c1', 'hello');
+    await h.flush();
+    const params = h.callsOf('turn/start')[0]!.params as Record<string, unknown>;
+    expect(params).toMatchObject({
+      threadId: THREAD,
+      clientUserMessageId: 'c1',
+      cwd: '/synthetic',
+      model: 'gpt-x',
+      approvalPolicy: 'on-request',
+      approvalsReviewer: 'user',
+    });
+    expect((params['sandboxPolicy'] as { type: string }).type).toBe('workspaceWrite');
+    h.engine.dispose();
+  });
+
+  test('default 模型不传；没指定模式不传覆盖', async () => {
+    const h = harness({ model: 'default' });
+    h.session.send('c1', 'hello');
+    await h.flush();
+    const params = h.callsOf('turn/start')[0]!.params as Record<string, unknown>;
+    expect(params['model']).toBeUndefined();
+    expect(params['approvalPolicy']).toBeUndefined();
+    expect(params['sandboxPolicy']).toBeUndefined();
+    expect(params['approvalsReviewer']).toBe('user');
+    h.engine.dispose();
+  });
+
+  test('上一轮的迟到通知不算这一轮结束', async () => {
+    const h = harness();
+    h.session.send('c1', 'hello');
+    await h.flush();
+    h.notify('turn/started', { turn: { id: 'turn-1' } });
+    h.notify('turn/completed', { turn: { id: 'old', status: 'completed' } });
+    await h.flush();
+    expect(h.session.state).toBe('running');
+    h.engine.dispose();
+  });
+
+  test('别的 thread 的通知不进这个会话', async () => {
+    const h = harness();
+    h.session.send('c1', 'hello');
+    await h.flush();
+    h.server.handlers!.onLine(JSON.stringify({ method: 'item/agentMessage/delta', params: { threadId: 'other', itemId: 'm', delta: 'x' } }));
+    expect(h.of('assistant.delta')).toEqual([]);
+    h.engine.dispose();
+  });
+
+  test('context 用量取 last，不取累计', async () => {
+    const h = harness();
+    h.session.send('c1', 'hello');
+    await h.flush();
+    h.notify('thread/tokenUsage/updated', {
+      tokenUsage: { last: { totalTokens: 100 }, total: { totalTokens: 9999 }, modelContextWindow: 1000 },
+    });
+    await h.finish();
+    expect(h.session.meta().context).toMatchObject({ usedTokens: 100, maxTokens: 1000, percent: 10 });
+    h.engine.dispose();
+  });
+
+  test('首条输入进 meta，给新会话当标题', async () => {
+    const h = harness();
+    h.session.send('c1', '第一句\n第二行');
+    await h.flush();
+    expect(h.session.meta().firstPrompt).toBe('第一句 第二行');
+    h.engine.dispose();
+  });
+});
+
+describe('CodexSession · 排队', () => {
+  test('运行中的消息排队，上一轮结束才执行；回显在出队时发', async () => {
+    const h = harness();
+    h.session.send('c1', 'a');
+    await h.flush();
+    h.session.send('c2', 'b');
+    expect(h.of('input.queued').map((e) => e.clientMsgId)).toEqual(['c2']);
+    expect(h.of('user.message').map((e) => e.clientMsgId)).toEqual(['c1']);
+    expect(h.callsOf('turn/start')).toHaveLength(1);
+    await h.finish();
+    expect(h.of('user.message').map((e) => e.clientMsgId)).toEqual(['c1', 'c2']);
+    expect(h.callsOf('turn/start')).toHaveLength(2);
+    h.engine.dispose();
+  });
+
+  test('撤回排队中的消息', async () => {
+    const h = harness();
+    h.session.send('c1', 'a');
+    await h.flush();
+    h.session.send('c2', 'b');
+    expect(h.session.recall('c2')).toBe(true);
+    expect(h.of('input.cancelled')[0]).toMatchObject({ clientMsgId: 'c2', reason: 'recalled' });
+    await h.finish();
+    expect(h.callsOf('turn/start')).toHaveLength(1);
+    expect(h.session.recall('c1')).toBe(false);
+    h.engine.dispose();
+  });
+
+  test('重复投递不重复执行，但仍回执', async () => {
+    const h = harness();
+    h.session.send('c1', 'a');
+    await h.flush();
+    expect(h.session.send('c1', 'a').duplicate).toBe(true);
+    expect(h.callsOf('turn/start')).toHaveLength(1);
+    expect(h.of('input.queued')).toHaveLength(1);
+    h.engine.dispose();
+  });
+});
+
+describe('CodexSession · 审批', () => {
+  async function asked(h: ReturnType<typeof harness>, id = 7) {
+    h.session.send('c1', 'a');
+    await h.flush();
+    h.notify('item/started', { item: { type: 'commandExecution', id: 't1', command: 'touch x', status: 'inProgress', commandActions: [] } });
+    h.request(id, 'item/commandExecution/requestApproval', {
+      itemId: 't1',
+      command: "/usr/bin/zsh -lc 'touch x'",
+      cwd: '/synthetic',
+      availableDecisions: ['accept', 'acceptForSession', { acceptWithExecpolicyAmendment: {} }, 'decline', 'cancel'],
+    });
+    return h.of('permission.request')[0]!;
+  }
+
+  test('命令审批：转成 permission.request，命令去壳，只给认识的选项', async () => {
+    const h = harness();
+    const req = await asked(h);
+    expect(req).toMatchObject({ toolName: 'Shell', input: { command: 'touch x', cwd: '/synthetic' } });
+    expect(req.options?.map((o) => o.id)).toEqual(['accept', 'acceptForSession', 'decline']);
+    expect(h.session.state).toBe('waiting_permission');
+    expect(h.session.meta().waitingFor).toBe('permission');
+    expect(h.session.permissions.snapshot()[0]?.options).toHaveLength(3);
+    h.engine.dispose();
+  });
+
+  test('批准：回 accept，发 resolved，状态回 running', async () => {
+    const h = harness();
+    const req = await asked(h);
+    expect(h.session.respondPermission({ requestId: req.requestId, verdict: 'allow', resolvedBy: 'phone' })).toBe(true);
+    expect(h.replyTo(7)).toEqual({ id: 7, result: { decision: 'accept' } });
+    expect(h.of('permission.resolved')[0]).toMatchObject({ verdict: 'allow', resolvedBy: 'phone' });
+    expect(h.session.state).toBe('running');
+    h.engine.dispose();
+  });
+
+  test('本会话都批准', async () => {
+    const h = harness();
+    const req = await asked(h);
+    h.session.respondPermission({ requestId: req.requestId, verdict: 'allow', optionId: 'acceptForSession' });
+    expect(h.replyTo(7)).toEqual({ id: 7, result: { decision: 'acceptForSession' } });
+    h.engine.dispose();
+  });
+
+  test('拒绝：回 decline；optionId 不能把拒绝变成批准', async () => {
+    const h = harness();
+    const req = await asked(h);
+    h.session.respondPermission({ requestId: req.requestId, verdict: 'deny', optionId: 'acceptForSession' });
+    expect(h.replyTo(7)).toEqual({ id: 7, result: { decision: 'decline' } });
+    h.engine.dispose();
+  });
+
+  test('不认识的 optionId 按单次批准，绝不放宽', async () => {
+    const h = harness();
+    const req = await asked(h);
+    h.session.respondPermission({ requestId: req.requestId, verdict: 'allow', optionId: 'acceptForever' });
+    expect(h.replyTo(7)).toEqual({ id: 7, result: { decision: 'accept' } });
+    h.engine.dispose();
+  });
+
+  test('Codex 没给「本会话」选项时，optionId 也放不宽', async () => {
+    const h = harness();
+    h.session.send('c1', 'a');
+    await h.flush();
+    h.request(8, 'item/commandExecution/requestApproval', { command: 'ls', availableDecisions: ['accept', 'decline'] });
+    const req = h.of('permission.request')[0]!;
+    h.session.respondPermission({ requestId: req.requestId, verdict: 'allow', optionId: 'acceptForSession' });
+    expect(h.replyTo(8)).toEqual({ id: 8, result: { decision: 'accept' } });
+    h.engine.dispose();
+  });
+
+  test('重复应答不命中，也不回第二次', async () => {
+    const h = harness();
+    const req = await asked(h);
+    h.session.respondPermission({ requestId: req.requestId, verdict: 'allow' });
+    expect(h.session.respondPermission({ requestId: req.requestId, verdict: 'deny' })).toBe(false);
+    expect(h.server.sent.filter((m) => (m as { id?: number; method?: string }).id === 7)).toHaveLength(1);
+    h.engine.dispose();
+  });
+
+  test('改文件审批：diff 来自 item/started', async () => {
+    const h = harness();
+    h.session.send('c1', 'a');
+    await h.flush();
+    h.notify('item/started', { item: { type: 'fileChange', id: 'f1', status: 'inProgress', changes: [{ path: '/a.txt', diff: '+x' }] } });
+    h.request(9, 'item/fileChange/requestApproval', { itemId: 'f1' });
+    expect(h.of('permission.request')[0]).toMatchObject({ toolName: 'Edit', input: { file_path: '/a.txt', new_string: '+x' } });
+    h.engine.dispose();
+  });
+
+  test('权限提升：批准给请求的范围，拒绝给空', async () => {
+    const h = harness();
+    h.session.send('c1', 'a');
+    await h.flush();
+    h.request(10, 'item/permissions/requestApproval', { permissions: { network: { enabled: true }, fileSystem: null } });
+    h.request(11, 'item/permissions/requestApproval', { permissions: { network: { enabled: true }, fileSystem: null } });
+    const [a, b] = h.of('permission.request');
+    h.session.respondPermission({ requestId: a!.requestId, verdict: 'allow' });
+    h.session.respondPermission({ requestId: b!.requestId, verdict: 'deny' });
+    expect(h.replyTo(10)).toEqual({ id: 10, result: { permissions: { network: { enabled: true } }, scope: 'turn' } });
+    expect(h.replyTo(11)).toEqual({ id: 11, result: { permissions: {}, scope: 'turn' } });
+    h.engine.dispose();
+  });
+
+  test('MCP elicitation：拒绝并说明，不让这一轮卡住', async () => {
+    const h = harness();
+    h.session.send('c1', 'a');
+    await h.flush();
+    h.request(12, 'mcpServer/elicitation/request', { serverName: 's', mode: 'form' });
+    expect(h.replyTo(12)).toEqual({ id: 12, result: { action: 'decline', content: null, _meta: null } });
+    expect(h.of('error.transient')).toHaveLength(1);
+    h.engine.dispose();
+  });
+
+  test('不认识的服务端请求：回错误', async () => {
+    const h = harness();
+    h.session.send('c1', 'a');
+    await h.flush();
+    h.request(13, 'item/tool/call', {});
+    expect(h.server.sent).toContainEqual({ id: 13, error: { code: -32601, message: 'not supported by this client' } });
+    h.engine.dispose();
+  });
+
+  test('Codex 不再等了：作废卡片', async () => {
+    const h = harness();
+    await asked(h);
+    h.notify('serverRequest/resolved', { requestId: 7 });
+    expect(h.of('permission.invalidated')).toHaveLength(1);
+    expect(h.session.state).toBe('running');
+    h.engine.dispose();
+  });
+
+  test('一轮结束时还挂着的审批作废', async () => {
+    const h = harness();
+    await asked(h);
+    await h.finish();
+    expect(h.of('permission.invalidated')).toHaveLength(1);
+    expect(h.session.permissions.snapshot()).toEqual([]);
+    h.engine.dispose();
+  });
+});
+
+describe('CodexSession · 停止与失败', () => {
+  test('停止：丢弃排队、拒绝挂起审批、turn/interrupt；状态 stopped，不发 run.done', async () => {
+    const h = harness();
+    h.session.send('c1', 'a');
+    await h.flush();
+    h.notify('turn/started', { turn: { id: 'turn-1' } });
+    h.session.send('c2', 'b');
+    h.request(7, 'item/commandExecution/requestApproval', { command: 'ls' });
+    h.notify('item/started', { item: { type: 'commandExecution', id: 't1', command: 'sleep 9', status: 'inProgress', commandActions: [] } });
+    await h.session.stop();
+    expect(h.of('input.cancelled')[0]).toMatchObject({ clientMsgId: 'c2', reason: 'stopped' });
+    expect(h.replyTo(7)).toEqual({ id: 7, result: { decision: 'decline' } });
+    expect(h.callsOf('turn/interrupt')[0]!.params).toEqual({ threadId: THREAD, turnId: 'turn-1' });
+    await h.finish('turn-1', 'interrupted');
+    expect(h.session.state).toBe('stopped');
+    expect(h.of('run.done')).toEqual([]);
+    // 没跑完的工具卡要收口，否则一直转圈
+    expect(h.of('tool.end')[0]).toMatchObject({ toolUseId: 't1', status: 'warn', resultSummary: '已中断' });
+    h.engine.dispose();
+  });
+
+  test('停止后再发消息：正常开新一轮', async () => {
+    const h = harness();
+    h.session.send('c1', 'a');
+    await h.flush();
+    await h.session.stop();
+    await h.finish('turn-1', 'interrupted');
+    h.session.send('c2', 'b');
+    await h.flush();
+    expect(h.callsOf('turn/start')).toHaveLength(2);
+    expect(h.session.state).toBe('running');
+    h.engine.dispose();
+  });
+
+  test('失败的轮：error.fatal 按错误类型分类，状态 error，不发 run.done', async () => {
+    const h = harness();
+    h.session.send('c1', 'a');
+    await h.flush();
+    await h.finish('turn-1', 'failed', { message: '额度用完了', codexErrorInfo: 'usageLimitExceeded' });
+    expect(h.of('error.fatal')[0]).toMatchObject({ kind: 'quota', message: '额度用完了' });
+    expect(h.session.state).toBe('error');
+    expect(h.of('run.done')).toEqual([]);
+    h.engine.dispose();
+  });
+
+  test('失败的轮之后排队的消息继续跑', async () => {
+    const h = harness();
+    h.session.send('c1', 'a');
+    await h.flush();
+    h.session.send('c2', 'b');
+    await h.finish('turn-1', 'failed', { message: 'x' });
+    expect(h.callsOf('turn/start')).toHaveLength(2);
+    h.engine.dispose();
+  });
+
+  test('会重试的错误是 transient，不结束这一轮', async () => {
+    const h = harness();
+    h.session.send('c1', 'a');
+    await h.flush();
+    h.notify('error', { willRetry: true, error: { message: '连接断了' } });
+    h.notify('error', { willRetry: false, error: { message: '不重试的由 turn/completed 报' } });
+    expect(h.of('error.transient')).toHaveLength(1);
+    expect(h.of('error.fatal')).toEqual([]);
+    expect(h.session.state).toBe('running');
+    h.engine.dispose();
+  });
+
+  test('turn/start 被拒：报错，能继续发下一条', async () => {
+    const server = { fail: true };
+    const h = harness({
+      routes: {
+        'turn/start': () => {
+          if (server.fail) throw Object.assign(new Error('rejected'), { code: -32600 });
+          return { turn: { id: 'turn-2' } };
+        },
+      },
+    });
+    h.session.send('c1', 'a');
+    await h.flush();
+    expect(h.of('error.fatal')[0]).toMatchObject({ kind: 'other', message: 'rejected' });
+    expect(h.session.state).toBe('error');
+    server.fail = false;
+    h.session.send('c2', 'b');
+    await h.flush();
+    expect(h.session.state).toBe('running');
+    h.engine.dispose();
+  });
+
+  test('app-server 退出：这一轮失败；下一条消息重新拉起并 resume', async () => {
+    const h = harness();
+    h.session.send('c1', 'a');
+    await h.flush();
+    h.server.handlers!.onExit();
+    await h.flush();
+    expect(h.of('error.fatal')[0]?.message).toContain('退出');
+    expect(h.session.hasProcess).toBe(false);
+    h.session.send('c2', 'b');
+    await h.flush();
+    expect(h.server.spawnCount).toBe(2);
+    expect(h.callsOf('thread/resume')).toHaveLength(1);
+    expect(h.callsOf('turn/start')).toHaveLength(2);
+    h.engine.dispose();
+  });
+});
+
+describe('CodexSession · 续接与设置', () => {
+  test('续接：先 thread/resume，再 turn/start', async () => {
+    const h = harness({ resume: true, engineMode: 'read-only' });
+    expect(h.session.hasProcess).toBe(false);
+    h.session.send('c1', 'a');
+    await h.flush();
+    expect(h.server.calls.map((c) => c.method).filter((m) => m === 'thread/resume' || m === 'turn/start')).toEqual([
+      'thread/resume',
+      'turn/start',
+    ]);
+    expect(h.callsOf('thread/resume')[0]!.params).toMatchObject({ approvalsReviewer: 'user', approvalPolicy: 'on-request', sandbox: 'read-only' });
+    expect(h.session.hasProcess).toBe(true);
+    h.engine.dispose();
+  });
+
+  test('续接外部 thread：不覆盖它自己的沙箱设置，如实回报', async () => {
+    const h = harness({ resume: true });
+    h.session.send('c1', 'a');
+    await h.flush();
+    const params = h.callsOf('thread/resume')[0]!.params as Record<string, unknown>;
+    expect(params['approvalPolicy']).toBeUndefined();
+    expect(params['sandbox']).toBeUndefined();
+    expect(params['approvalsReviewer']).toBe('user');
+    expect(h.session.meta()).toMatchObject({ engineMode: 'workspace', permissionMode: 'default', model: 'resumed-model' });
+    h.engine.dispose();
+  });
+
+  test('续接失败：报错，不发 turn/start', async () => {
+    const h = harness({
+      resume: true,
+      routes: {
+        'thread/resume': () => {
+          throw Object.assign(new Error('no rollout found'), { code: -32600 });
+        },
+      },
+    });
+    h.session.send('c1', 'a');
+    await h.flush();
+    expect(h.of('error.fatal')[0]?.message).toContain('no rollout');
+    expect(h.callsOf('turn/start')).toEqual([]);
+    h.engine.dispose();
+  });
+
+  test('切模式：engineMode 优先，下一轮生效', async () => {
+    const h = harness({ engineMode: 'full' });
+    await h.session.setPermissionMode('default', 'read-only');
+    expect(h.session.meta()).toMatchObject({ engineMode: 'read-only', permissionMode: 'plan' });
+    h.session.send('c1', 'a');
+    await h.flush();
+    expect(h.callsOf('turn/start')[0]!.params).toMatchObject({ approvalPolicy: 'on-request', sandboxPolicy: { type: 'readOnly' } });
+    h.engine.dispose();
+  });
+
+  test('旧 client 只发枚举：按表映射；acceptEdits 不会变成完全访问', async () => {
+    const h = harness();
+    await h.session.setPermissionMode('acceptEdits');
+    expect(h.session.meta().engineMode).toBe('workspace');
+    await h.session.setPermissionMode('bypassPermissions');
+    expect(h.session.meta().engineMode).toBe('full');
+    h.engine.dispose();
+  });
+
+  test('不认识的 engineMode 按枚举映射，不会放宽', async () => {
+    const h = harness();
+    await h.session.setPermissionMode('plan', 'super-full');
+    expect(h.session.meta().engineMode).toBe('read-only');
+    h.engine.dispose();
+  });
+
+  test('切模型、切目录：下一轮生效', async () => {
+    const h = harness();
+    await h.session.setModel('gpt-y');
+    h.session.setCwd('/other');
+    h.session.send('c1', 'a');
+    await h.flush();
+    expect(h.callsOf('turn/start')[0]!.params).toMatchObject({ model: 'gpt-y', cwd: '/other' });
+    h.engine.dispose();
+  });
+
+  test('关闭：丢弃排队，拒绝审批，卸载 thread；之后不再收通知', async () => {
+    const h = harness();
+    h.session.send('c1', 'a');
+    await h.flush();
+    h.notify('turn/started', { turn: { id: 'turn-1' } });
+    h.session.send('c2', 'b');
+    h.request(7, 'item/commandExecution/requestApproval', { command: 'ls' });
+    await h.session.close('test');
+    expect(h.of('input.cancelled')[0]).toMatchObject({ clientMsgId: 'c2', reason: 'closed' });
+    expect(h.replyTo(7)).toEqual({ id: 7, result: { decision: 'decline' } });
+    expect(h.callsOf('thread/unsubscribe')).toHaveLength(1);
+    const before = h.events.length;
+    h.notify('item/agentMessage/delta', { itemId: 'm', delta: 'x' });
+    expect(h.events.length).toBe(before);
+    h.engine.dispose();
+  });
+});
+
+describe('CodexSession · 权限边界（评审回归）', () => {
+  test('旧网页改参数后批准：按拒绝处理，绝不放行原命令', async () => {
+    const h = harness();
+    h.session.send('c1', 'a');
+    await h.flush();
+    h.request(7, 'item/commandExecution/requestApproval', { command: 'rm -rf x' });
+    const req = h.of('permission.request')[0]!;
+    h.session.respondPermission({ requestId: req.requestId, verdict: 'allow', updatedInput: { command: 'ls' } });
+    expect(h.replyTo(7)).toEqual({ id: 7, result: { decision: 'decline' } });
+    expect(h.of('permission.resolved')[0]).toMatchObject({ verdict: 'deny' });
+    expect(h.of('error.transient')[0]?.reason).toContain('改参数');
+    h.engine.dispose();
+  });
+
+  test('审批 id 不复用：会话重建后旧应答命中不了新请求', async () => {
+    const a = harness();
+    a.session.send('c1', 'a');
+    await a.flush();
+    a.request(7, 'item/commandExecution/requestApproval', { command: 'ls' });
+    const b = harness();
+    b.session.send('c1', 'a');
+    await b.flush();
+    b.request(7, 'item/commandExecution/requestApproval', { command: 'rm -rf x' });
+    const oldId = a.of('permission.request')[0]!.requestId;
+    expect(b.of('permission.request')[0]!.requestId).not.toBe(oldId);
+    expect(b.session.respondPermission({ requestId: oldId, verdict: 'allow' })).toBe(false);
+    a.engine.dispose();
+    b.engine.dispose();
+  });
+
+  test('续接外部 thread：显示它的档位，但 turn/start 不带覆盖（否则会放宽它的沙箱）', async () => {
+    const h = harness({ resume: true });
+    h.session.send('c1', 'a');
+    await h.flush();
+    expect(h.session.meta().engineMode).toBe('workspace');
+    const params = h.callsOf('turn/start')[0]!.params as Record<string, unknown>;
+    expect(params['approvalPolicy']).toBeUndefined();
+    expect(params['sandboxPolicy']).toBeUndefined();
+    h.engine.dispose();
+  });
+
+  test('自定义过的工作区沙箱不算「工作区」档', async () => {
+    const h = harness({
+      resume: true,
+      routes: {
+        'thread/resume': () => ({
+          approvalPolicy: 'on-request',
+          sandbox: { type: 'workspaceWrite', writableRoots: [], networkAccess: false, excludeSlashTmp: true, excludeTmpdirEnvVar: false },
+        }),
+      },
+    });
+    h.session.send('c1', 'a');
+    await h.flush();
+    expect(h.session.meta().engineMode).toBeUndefined();
+    h.engine.dispose();
+  });
+
+  test('用户明确切模式后才带覆盖', async () => {
+    const h = harness({ resume: true });
+    await h.session.setPermissionMode('default', 'read-only');
+    h.session.send('c1', 'a');
+    await h.flush();
+    expect(h.callsOf('turn/start')[0]!.params).toMatchObject({ approvalPolicy: 'on-request', sandboxPolicy: { type: 'readOnly' } });
+    h.engine.dispose();
+  });
+});
+
+describe('CodexSession · 竞态（评审回归）', () => {
+  /** 卡住某个方法，直到手动放行 */
+  function gated(method: string) {
+    let release: () => void = () => {};
+    const gate = new Promise<void>((resolve) => (release = resolve));
+    return { gate, release: () => release(), method };
+  }
+
+  function harnessWithGate(method: string, result: unknown, options: { resume?: boolean } = {}) {
+    const g = gated(method);
+    const server: FakeAppServer = new FakeAppServer({
+      'turn/start': () => ({ turn: { id: 'turn-1' } }),
+      'turn/interrupt': () => ({}),
+      'thread/unsubscribe': () => ({ status: 'unsubscribed' }),
+      'thread/resume': () => ({ approvalPolicy: 'never', sandbox: { type: 'dangerFullAccess' } }),
+    });
+    const spawn: typeof server.spawn = (handlers) => {
+      const inner = server.spawn(handlers);
+      return {
+        kill: inner.kill,
+        send: (line) => {
+          const message = JSON.parse(line) as { id?: number; method?: string };
+          if (message.method !== method) {
+            inner.send(line);
+            return;
+          }
+          server.calls.push({ method, params: message });
+          void g.gate.then(() => handlers.onLine(JSON.stringify({ id: message.id, result })));
+        },
+      };
+    };
+    const engine = new CodexEngine({ spawn, clientOptions: { idleMs: 60_000 } });
+    const events: EventBody[] = [];
+    const session = engine.createSession({
+      sessionId: THREAD,
+      cwd: '/s',
+      model: 'm',
+      permissionMode: 'default',
+      resume: options.resume === true,
+      emit: (body) => events.push(body),
+    });
+    const count = (m: string) => server.calls.filter((c) => c.method === m).length;
+    return { g, server, engine, session, events, count };
+  }
+
+  test('等待续接时关闭：不再发 turn/start', async () => {
+    const h = harnessWithGate('thread/resume', { approvalPolicy: 'never' }, { resume: true });
+    h.session.send('c1', 'a');
+    await Bun.sleep(5);
+    await h.session.close('reap');
+    h.g.release();
+    await Bun.sleep(5);
+    expect(h.count('turn/start')).toBe(0);
+    h.engine.dispose();
+  });
+
+  test('进程退出后的迟到异常不会算到新一轮头上', async () => {
+    const h = harnessWithGate('turn/start', { turn: { id: 't' } });
+    h.session.send('c1', 'a');
+    await Bun.sleep(5);
+    h.server.handlers!.onExit();
+    await Bun.sleep(5);
+    const fatals = h.events.filter((e) => e.type === 'error.fatal');
+    expect(fatals).toHaveLength(1);
+    h.engine.dispose();
+  });
+
+  test('turn id 没到时停止，紧接着发消息：不撤销停止，到手后补一次中断', async () => {
+    const h = harnessWithGate('turn/start', { turn: { id: 'turn-1' } });
+    h.session.send('c1', 'a');
+    await Bun.sleep(5);
+    await h.session.stop();
+    h.session.send('c2', 'b');
+    expect(h.count('turn/interrupt')).toBe(0);
+    h.g.release();
+    await Bun.sleep(5);
+    expect(h.count('turn/interrupt')).toBe(1);
+    h.engine.dispose();
+  });
+
+  test('新实例接管后，旧实例关闭不解绑、不卸载', async () => {
+    const h = harness();
+    const next = h.engine.createSession({
+      sessionId: THREAD,
+      cwd: '/s',
+      model: 'm',
+      permissionMode: 'default',
+      resume: true,
+      emit: (body) => h.events.push(body),
+    });
+    await h.session.close('reap');
+    expect(h.callsOf('thread/unsubscribe')).toEqual([]);
+    next.send('c1', 'a');
+    await h.flush();
+    h.notify('item/agentMessage/delta', { itemId: 'm', delta: 'still routed' });
+    expect(h.of('assistant.delta')[0]?.text).toBe('still routed');
+    h.engine.dispose();
+  });
+
+  test('重复的完成通知不会结束新一轮', async () => {
+    const h = harness();
+    h.session.send('c1', 'a');
+    await h.flush();
+    h.notify('turn/started', { turn: { id: 'turn-1' } });
+    h.session.send('c2', 'b');
+    await h.finish('turn-1');
+    expect(h.session.state).toBe('running');
+    const doneBefore = h.of('run.done').length;
+    // 第二轮的 turn id 假装还没到（清掉）：重复通知仍要被认出来
+    h.notify('turn/completed', { turn: { id: 'turn-1', status: 'completed' } });
+    await h.flush();
+    expect(h.of('run.done').length).toBe(doneBefore);
+    expect(h.session.state).toBe('running');
+    h.engine.dispose();
+  });
+});
+
+describe('toUserInput', () => {
+  test('纯文本', () => {
+    expect(toUserInput('hi', undefined)).toEqual([{ type: 'text', text: 'hi', text_elements: [] }]);
+  });
+
+  test('内容块：文本与内联图片；文件路径已在文本块里', () => {
+    const out = toUserInput('hi', [
+      { type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'AAAA' } },
+      { type: 'text', text: 'hi\n<attached-files>/a.pdf</attached-files>' },
+    ] as never);
+    expect(out).toEqual([
+      { type: 'image', url: 'data:image/png;base64,AAAA' },
+      { type: 'text', text: 'hi\n<attached-files>/a.pdf</attached-files>', text_elements: [] },
+    ]);
+  });
+
+  test('认不出的块跳过；全认不出时退回文本', () => {
+    expect(toUserInput('hi', [{ type: 'mystery' }] as never)).toEqual([{ type: 'text', text: 'hi', text_elements: [] }]);
+  });
+});

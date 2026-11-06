@@ -239,6 +239,10 @@ export interface SessionRuntimeMeta {
   bgRunning?: number;
   /** 最近一次取到的 context 用量；本实例还没取到时不带（manager 保留缓存里的旧值） */
   context?: ContextUsage;
+  /** 非 Claude 引擎的权限模式（SessionMeta.engineMode） */
+  engineMode?: string;
+  /** 首条输入：还没有标题的新会话拿它作标题（Claude 的标题来自转录，不用） */
+  firstPrompt?: string;
 }
 
 /** stopBgTask 的结果（router 转成 session.mutate.response） */

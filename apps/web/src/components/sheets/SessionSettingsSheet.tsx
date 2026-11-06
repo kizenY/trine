@@ -18,7 +18,7 @@
  * `session.updated` 广播回来，store 自然更新。
  */
 import { useEffect, useState } from 'react';
-import type { PermissionMode, SessionMeta } from '@trine/core';
+import type { EngineSummary, PermissionMode, SessionMeta } from '@trine/core';
 import { Button } from '@/components/ui/button.tsx';
 import { Input } from '@/components/ui/input.tsx';
 import {
@@ -32,7 +32,9 @@ import { Chip } from '@/components/shell/StatusDot.tsx';
 import { Disclosure } from '@/components/chat/Messages.tsx';
 import { cn } from '@/lib/utils.ts';
 import {
+  clickEngineMode,
   clickMode,
+  engineModeWarning,
   PERMISSION_MODE_OPTIONS,
   pendingWarning,
   type ModePickerState,
@@ -42,7 +44,7 @@ export type SettingsSection = 'model' | 'cwd' | 'permission';
 
 export interface SessionSettingsActions {
   setModel: (model: string) => void;
-  setPermissionMode: (mode: PermissionMode) => void;
+  setPermissionMode: (mode: PermissionMode, engineMode?: string) => void;
   setCwd: (cwd: string) => void;
   addCwd: (path: string) => void;
   removeCwd: (path: string) => void;
@@ -58,6 +60,7 @@ export function SessionSettingsSheet({
   section,
   meta,
   knownModels,
+  engine,
   resolvedModel,
   cwd,
   actions,
@@ -68,6 +71,8 @@ export function SessionSettingsSheet({
   section: SettingsSection | null;
   meta: SessionMeta | undefined;
   knownModels: string[];
+  /** 会话的引擎：带模型或模式目录时用它，不用 Claude 的列表和四档 */
+  engine?: EngineSummary | undefined;
   /** 当前别名实际对应的具体模型（见 resolvedAliasModel）；未知不显示 */
   resolvedModel?: string | undefined;
   /** agent 端的目录 favorites（`cwd.list.response`），null = 还没拿到 */
@@ -85,6 +90,7 @@ export function SessionSettingsSheet({
   useEffect(() => {
     if (open) {
       setPending(null);
+      setEnginePending(null);
       setCustomModel('');
       setNewCwd('');
     }
@@ -98,7 +104,23 @@ export function SessionSettingsSheet({
     if (next.pending === null && next.value !== modeState.value) actions.setPermissionMode(next.value);
   };
 
-  const warning = pendingWarning(modeState);
+  const engineModes = engine?.modes;
+  const modelChips = engine?.models === undefined ? knownModels.map((m) => ({ id: m, label: m })) : engine.models;
+  const [enginePending, setEnginePending] = useState<string | null>(null);
+  const pickEngineMode = (clicked: string): void => {
+    if (engineModes === undefined) return;
+    const current = { value: meta?.engineMode, pending: enginePending };
+    const next = clickEngineMode(current, clicked, engineModes);
+    setEnginePending(next.pending);
+    if (next.pending === null && next.value !== undefined && next.value !== current.value) {
+      // 枚举字段只是给旧版 agent 的近似值，agent 以 engineMode 为准
+      actions.setPermissionMode('default', next.value);
+    }
+  };
+  const warning =
+    engineModes === undefined
+      ? pendingWarning(modeState)
+      : engineModeWarning({ value: meta?.engineMode, pending: enginePending }, engineModes);
   const favorites = cwd?.favorites ?? [];
   const defaultCwd = cwd?.defaultCwd ?? '';
 
@@ -120,14 +142,14 @@ export function SessionSettingsSheet({
           {/* --- 模型 --- */}
           <Section title="模型" highlight={section === 'model'}>
             <div className="flex flex-wrap gap-1.5">
-              {knownModels.map((m) => (
+              {modelChips.map((m) => (
                 <Chip
-                  key={m}
+                  key={m.id}
                   data-testid="model-chip"
-                  selected={meta?.model === m}
-                  onClick={() => actions.setModel(m)}
+                  selected={meta?.model === m.id}
+                  onClick={() => actions.setModel(m.id)}
                 >
-                  <span className="font-mono">{m}</span>
+                  <span className="font-mono">{m.label}</span>
                 </Chip>
               ))}
             </div>
@@ -170,7 +192,24 @@ export function SessionSettingsSheet({
           {/* --- 权限模式 --- */}
           <Section title="权限模式" highlight={section === 'permission'}>
             <div className="flex flex-wrap gap-1.5">
-              {PERMISSION_MODE_OPTIONS.map((opt) => {
+              {engineModes?.map((mode) => {
+                const danger = enginePending === mode.id;
+                return (
+                  <Chip
+                    key={mode.id}
+                    data-testid="mode-chip"
+                    data-mode={mode.id}
+                    data-pending={String(danger)}
+                    title={mode.description}
+                    selected={meta?.engineMode === mode.id}
+                    className={cn(danger && 'border-red bg-red-soft text-red font-medium')}
+                    onClick={() => pickEngineMode(mode.id)}
+                  >
+                    {mode.label}
+                  </Chip>
+                );
+              })}
+              {engineModes === undefined && PERMISSION_MODE_OPTIONS.map((opt) => {
                 const danger = pending === opt.value;
                 return (
                   <Chip

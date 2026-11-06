@@ -902,6 +902,9 @@ describe('SessionManager · 其他引擎的会话', () => {
           return external;
         },
         metaOf: (id) => (external instanceof Error ? undefined : external.find((m) => m.sessionId === id)),
+        rename: async () => {},
+        delete: async () => {},
+        createSession: () => undefined,
       },
     });
   }

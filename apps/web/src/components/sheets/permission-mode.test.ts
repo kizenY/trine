@@ -1,3 +1,4 @@
+import { clickEngineMode, engineModeWarning, initialEngineMode } from './permission-mode.ts';
 import { describe, expect, test } from 'bun:test';
 import { readFileSync } from 'node:fs';
 import {
@@ -128,4 +129,46 @@ describe('离线机器文案（M3）', () => {
     // create() 自身也挡一道（按钮禁用是 UI，逻辑不能只靠 UI）
     expect(src).toMatch(/if \(!client \|\| offline/);
   });
+});
+
+describe('引擎权限模式的两击确认', () => {
+  const modes = [
+    { id: 'safe', label: 'S' },
+    { id: 'full', label: 'F', description: '不再询问', dangerous: true, default: true },
+  ];
+
+  test('普通档位立即生效', () => {
+    expect(clickEngineModeT({ value: 'full', pending: null }, 'safe')).toEqual({ value: 'safe', pending: null });
+  });
+
+  test('危险档位：首击只置 pending，不改 value；再击才生效', () => {
+    const first = clickEngineModeT({ value: 'safe', pending: null }, 'full');
+    expect(first).toEqual({ value: 'safe', pending: 'full' });
+    expect(engineModeWarningT(first)).toContain('不再询问');
+    expect(clickEngineModeT(first, 'full')).toEqual({ value: 'full', pending: null });
+  });
+
+  test('点别的档位清掉待确认', () => {
+    expect(clickEngineModeT({ value: 'safe', pending: 'full' }, 'safe')).toEqual({ value: 'safe', pending: null });
+  });
+
+  test('已选中的危险档位不再要求确认', () => {
+    expect(clickEngineModeT({ value: 'full', pending: null }, 'full')).toEqual({ value: 'full', pending: null });
+  });
+
+  test('预选：设置过且还在目录里的优先，否则目录默认', () => {
+    expect(initialEngineModeT('safe')).toBe('safe');
+    expect(initialEngineModeT('gone')).toBe('full');
+    expect(initialEngineModeT(undefined)).toBe('full');
+  });
+
+  function clickEngineModeT(state: { value: string | undefined; pending: string | null }, id: string) {
+    return clickEngineMode(state, id, modes);
+  }
+  function engineModeWarningT(state: { value: string | undefined; pending: string | null }) {
+    return engineModeWarning(state, modes);
+  }
+  function initialEngineModeT(preferred: string | undefined) {
+    return initialEngineMode(modes, preferred);
+  }
 });

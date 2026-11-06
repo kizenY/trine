@@ -942,6 +942,7 @@ export class TrineClient {
       message?: string;
       /** 批准同时切权限模式（同上） */
       setMode?: PermissionMode;
+      optionId?: string;
     } = {},
   ): void {
     this.#safeSend(machineId, {
@@ -953,6 +954,7 @@ export class TrineClient {
       ...(options.remember === undefined ? {} : { remember: options.remember }),
       ...(options.message === undefined ? {} : { message: options.message }),
       ...(options.setMode === undefined ? {} : { setMode: options.setMode }),
+      ...(options.optionId === undefined ? {} : { optionId: options.optionId }),
     });
   }
 
@@ -1277,7 +1279,13 @@ export class TrineClient {
 
   async createSession(
     machineId: string,
-    args: { cwd: string; model: string; permissionMode: SessionMeta['permissionMode'] },
+    args: {
+      cwd: string;
+      model: string;
+      permissionMode: SessionMeta['permissionMode'];
+      engine?: string;
+      engineMode?: string;
+    },
   ): Promise<SessionMeta> {
     const res = await this.request(machineId, { type: 'session.create', ...args });
     if (res.type !== 'session.create.response') throw new Error(`意外的应答 ${res.type}`);

@@ -7,7 +7,7 @@
  * 不生效、再击才生效、点别的档位后红色清掉、已选中的 bypass 不再要求确认」
  * 这四条任何一条错了都是安全问题。零 React，`bun test` 直接覆盖。
  */
-import type { PermissionMode } from '@trine/core';
+import type { EngineMode, PermissionMode } from '@trine/core';
 
 /**
  * 离线机器为什么不能新建会话。
@@ -87,4 +87,36 @@ export function pendingWarning(state: ModePickerState): string {
 /** `/permission <arg>` 的入参校验：唯一一份合法档位清单 */
 export function isPermissionMode(value: string): value is PermissionMode {
   return PERMISSION_MODE_OPTIONS.some((o) => o.value === value);
+}
+
+// ---------------------------------------------------------------------------
+// 引擎自己的权限模式（EngineSummary.modes）：两击确认规则同上，危险与否由目录决定
+// ---------------------------------------------------------------------------
+
+export interface EngineModePickerState {
+  value: string | undefined;
+  pending: string | null;
+}
+
+export function clickEngineMode(
+  state: EngineModePickerState,
+  clicked: string,
+  modes: readonly EngineMode[],
+): EngineModePickerState {
+  const dangerous = modes.find((m) => m.id === clicked)?.dangerous === true;
+  if (!dangerous || state.value === clicked || state.pending === clicked) return { value: clicked, pending: null };
+  return { value: state.value, pending: clicked };
+}
+
+export function engineModeWarning(state: EngineModePickerState, modes: readonly EngineMode[]): string {
+  if (state.pending === null) return '';
+  const mode = modes.find((m) => m.id === state.pending);
+  const text = mode?.description ?? '';
+  return `${WARNING_PREFIX}${text === '' ? '' : `${text}。`}再点一次确认`;
+}
+
+/** 新会话预选的模式：设置里选过且还在目录里的，否则目录标的默认 */
+export function initialEngineMode(modes: readonly EngineMode[], preferred: string | undefined): string | undefined {
+  if (preferred !== undefined && modes.some((m) => m.id === preferred)) return preferred;
+  return modes.find((m) => m.default === true)?.id ?? modes[0]?.id;
 }

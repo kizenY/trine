@@ -51,6 +51,10 @@ export const SessionParamsSchema = z.object({
    * 会话，所以 resume 与否要看它。
    */
   started: z.boolean().optional(),
+  /** 引擎；省略 = Claude Code。旧版 agent 回滚时会 strip 掉，不影响解析 */
+  engine: z.string().min(1).optional(),
+  /** 非 Claude 引擎的权限模式；permissionMode 是它的近似值 */
+  engineMode: z.string().min(1).optional(),
 });
 export type SessionParams = z.infer<typeof SessionParamsSchema>;
 export type RewindPoint = z.infer<typeof RewindPointSchema>;
@@ -208,7 +212,9 @@ export class AgentState {
       previous.cwd === params.cwd &&
       previous.model === params.model &&
       previous.permissionMode === params.permissionMode &&
-      previous.started === params.started
+      previous.started === params.started &&
+      previous.engine === params.engine &&
+      previous.engineMode === params.engineMode
     ) {
       return;
     }

@@ -42,6 +42,16 @@ export interface AppServerClientOptions {
   startRetryMs?: number;
   now?: () => number;
   log?: (line: string) => void;
+  onNotification?: (method: string, params: Record<string, unknown>) => void;
+  /** 服务端发来的请求（审批等）。返回 false = 不处理，这里回错误，免得对端干等 */
+  onServerRequest?: (
+    id: unknown,
+    method: string,
+    params: Record<string, unknown>,
+    reply: (result: unknown) => void,
+  ) => boolean;
+  /** 进程退出（不含空闲退出和 dispose）：加载的 thread 都没了 */
+  onExit?: () => void;
 }
 
 interface PendingCall {
@@ -98,6 +108,7 @@ export class AppServerClient {
   #nextId = 1;
   #idleTimer: ReturnType<typeof setTimeout> | undefined;
   #inFlight = 0;
+  #holds = 0;
   #startFailedAt: number | undefined;
   #startError: Error | undefined;
   #userAgent: string | undefined;
@@ -129,8 +140,19 @@ export class AppServerClient {
       return await this.#request(method, params);
     } finally {
       this.#inFlight -= 1;
-      if (this.#inFlight === 0) this.#armIdle();
+      if (this.#inFlight === 0 && this.#holds === 0) this.#armIdle();
     }
+  }
+
+  /** 有加载中的 thread 时持有：空闲退出会把它们一起带走 */
+  hold(): void {
+    this.#holds += 1;
+    this.#clearIdle();
+  }
+
+  release(): void {
+    this.#holds = Math.max(0, this.#holds - 1);
+    if (this.#holds === 0 && this.#inFlight === 0) this.#armIdle();
   }
 
   dispose(): void {
@@ -167,6 +189,7 @@ export class AppServerClient {
         if (this.#transport !== transport) return;
         this.#options.log?.('[codex] app-server 已退出');
         this.#stop(new AppServerError('app-server 进程已退出'));
+        this.#options.onExit?.();
       },
     });
     this.#transport = transport;
@@ -211,11 +234,18 @@ export class AppServerClient {
     if (!isRecord(message)) return;
     const id = message['id'];
     if (typeof message['method'] === 'string') {
-      // 服务端发来的请求（审批等）：这一层还不处理，明确拒绝，免得对端一直等
-      if (id !== undefined) {
-        this.#transport?.send(
-          `${JSON.stringify({ id, error: { code: -32601, message: 'not supported by this client' } })}\n`,
-        );
+      const params = isRecord(message['params']) ? message['params'] : {};
+      if (id === undefined) {
+        this.#options.onNotification?.(message['method'], params);
+        return;
+      }
+      const transport = this.#transport;
+      const handled = this.#options.onServerRequest?.(id, message['method'], params, (result) => {
+        // 请求所在的进程已经没了，回复不了也不需要回复
+        if (this.#transport === transport) transport?.send(`${JSON.stringify({ id, result })}\n`);
+      });
+      if (handled !== true) {
+        transport?.send(`${JSON.stringify({ id, error: { code: -32601, message: 'not supported by this client' } })}\n`);
       }
       return;
     }
@@ -258,7 +288,7 @@ export class AppServerClient {
     this.#clearIdle();
     if (this.#transport === undefined || this.#disposed) return;
     this.#idleTimer = setTimeout(() => {
-      if (this.#inFlight === 0) this.#stop(new AppServerError('app-server 空闲退出'));
+      if (this.#inFlight === 0 && this.#holds === 0) this.#stop(new AppServerError('app-server 空闲退出'));
     }, this.#idleMs);
     this.#idleTimer.unref?.();
   }

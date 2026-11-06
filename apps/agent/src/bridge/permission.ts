@@ -20,7 +20,7 @@
  * 正常路径，Claude 会得到「这次工具没批准」的明确结果并继续（或收尾）。
  */
 import type { CanUseTool, PermissionResult, PermissionUpdate } from '@anthropic-ai/claude-agent-sdk';
-import type { PermissionMode, WaitingFor } from '@trine/core';
+import type { PermissionMode, PermissionOption, WaitingFor } from '@trine/core';
 import { isSafeRememberPattern, matchesPattern, waitingForTool } from '@trine/core/permission';
 import type { EventBody } from './types.ts';
 
@@ -54,6 +54,7 @@ export interface PendingPermissionSnapshot {
   requestedAt: number;
   suggestions?: unknown[];
   parentToolUseId?: string;
+  options?: PermissionOption[];
 }
 
 /** client 的应答（对应协议 permission.respond 帧） */
@@ -68,6 +69,8 @@ export interface PermissionVerdict {
   message?: string;
   /** 批准同时切换会话权限模式（只在 allow 时生效，见 respond 的说明） */
   setMode?: PermissionMode;
+  /** 选中的决定（permission.request.options 的 id），Claude 不用 */
+  optionId?: string;
 }
 
 export interface PermissionBridgeOptions {

@@ -179,9 +179,16 @@ agent 端同样校验，因为已打开的旧标签页可能发来任何请求�
 `engineMode` 才是非 Claude 引擎的真值。放宽再要求「先部署 web」不够：部署不会替换已打开的标签页；agent 回滚时旧版也解析
 不了 state.json，会按空状态启动并丢掉防重放游标。代价是两个字段表达一件事，旧标签页上模式标签不准。
 
-**只读先行。** Codex 先只读：列会话、读历史都不加载 thread，也不写 Codex 的任何状态。agent 自己持有一个 app-server 子进程，
-惰性启动、空闲退出，不接本机共享的 daemon（生命周期不归我们）。归档、置顶是 trine 自己的标记，判断标记是否过期时要同时问 Codex，
-否则 Codex 会话的标记过 30 天会被当成失效清掉。
+**Codex 会话。** agent 自己持有一个 app-server 子进程，多个 thread 复用，有活跃会话时不退出，空闲后退出；不接本机共享的 daemon
+（生命周期不归我们）。列会话、读历史不加载 thread。帧序列与 Claude 一致，client 不区分引擎；排队用 trine 自己的队列而不是 `turn/steer`，
+排队的消息才能撤回。thread id 只能由 Codex 生成，所以新建要先 `thread/start`。归档、置顶是 trine 自己的标记，判断标记是否过期时要同时问
+Codex，否则 Codex 会话的标记过 30 天会被当成失效清掉。
+
+同一个 thread 同时只能有一个进程写（Codex 回 `already has an active writer`），与 D3「同一会话只有一个活跃控制进程」一致：在 CLI 里正开着的 thread，trine 续接或删除会失败并显示原因，不强占。
+
+**权限。** 审批一律显式路由给用户（`approvalsReviewer: user`），否则会继承配置里的自动审核，绕过浏览器。续接外部 thread 时不传权限覆盖，
+如实回报它自己的设置，不能因为在 trine 里打开就悄悄放宽。模型和模式目录直接放进 `machine.info.engines`：内容小，换来不用另拉、不用缓存；
+这和 D18 按 rev 另拉扩展目录的取舍不同，扩展目录可能很大。
 
 **集成。** Codex 走 `codex app-server`（stdio JSON-RPC）：它有双向审批、历史和限额接口；Codex SDK 与 `codex exec --json` 没有
 审批。ACP 暂不用：它只覆盖各家的公共部分，用它会让 Claude 现有的回退、用量等能力退化。将来可作为另一种引擎接入。

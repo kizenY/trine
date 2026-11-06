@@ -42,6 +42,8 @@ export interface PermissionDecision {
   message?: string;
   /** 批准同时切换会话权限模式（计划卡「批准并自动接受编辑」） */
   setMode?: PermissionMode;
+  /** 选中的决定（引擎给的 options） */
+  optionId?: string;
 }
 
 const RESULT_TONE = {
@@ -208,7 +210,35 @@ export function PermissionCard({
         )}
       </div>
 
-      {pending ? (
+      {pending && entry.options !== undefined ? (
+        // 引擎给了决定选项：这些引擎不支持改参数后批准，也不用 trine 的「记住」
+        <div className="flex flex-wrap gap-2 px-3.5 pb-3">
+          {entry.options.map((option) =>
+            option.kind === 'reject' ? (
+              <Button
+                key={option.id}
+                size="sm"
+                variant="outline"
+                data-testid="perm-deny"
+                className="border-red-border text-red"
+                onClick={() => onRespond({ verdict: 'deny', optionId: option.id })}
+              >
+                {option.label}
+              </Button>
+            ) : (
+              <Button
+                key={option.id}
+                size="sm"
+                variant={option.kind === 'allow_once' ? 'default' : 'outline'}
+                data-testid={option.kind === 'allow_once' ? 'perm-allow' : 'perm-allow-session'}
+                onClick={() => onRespond({ verdict: 'allow', optionId: option.id })}
+              >
+                {option.label}
+              </Button>
+            ),
+          )}
+        </div>
+      ) : pending ? (
         <>
           <div className="flex flex-wrap gap-2 px-3.5 pb-2.5">
             <Button

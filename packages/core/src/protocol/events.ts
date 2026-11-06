@@ -240,6 +240,8 @@ export const RunDoneSchema = z.object({
   ...a2cBase,
   durationMs: z.number().int().nonnegative(),
   costUsd: z.number().nonnegative(),
+  /** 引擎不回报费用：costUsd 只是占位的 0，不显示（D12） */
+  costUnknown: z.boolean().optional(),
   toolCount: z.number().int().nonnegative(),
   permissionCount: z.number().int().nonnegative(),
   turns: z.number().int().nonnegative().optional(),
@@ -248,6 +250,18 @@ export const RunDoneSchema = z.object({
 // ---------------------------------------------------------------------------
 // §1.4 权限卡
 // ---------------------------------------------------------------------------
+
+/**
+ * 引擎提供的决定选项（multi-engine，可选）。带了就由 client 按它显示按钮，并把选中的 id 放进
+ * permission.respond.optionId；旧 client 忽略它，allow / deny 仍然有效。
+ * 没有 updatedInput：这些引擎不支持改参数后批准，client 也不给编辑入口。
+ */
+export const PermissionOptionSchema = z.object({
+  id: z.string().min(1).max(64),
+  label: z.string().min(1).max(64),
+  kind: z.enum(['allow_once', 'allow_session', 'reject']),
+});
+export type PermissionOption = z.infer<typeof PermissionOptionSchema>;
 
 /** agent → client：canUseTool 转发 */
 export const PermissionRequestSchema = z.object({
@@ -266,6 +280,7 @@ export const PermissionRequestSchema = z.object({
    * task_started 建的映射查得；查不到就不带。client 据此在卡片上标注来源。
    */
   parentToolUseId: ParentToolUseIdSchema.optional(),
+  options: z.array(PermissionOptionSchema).max(8).optional(),
 });
 
 /** 拒绝附言上限：够写几段反馈，又不让单帧无界膨胀 */
@@ -306,6 +321,8 @@ export const PermissionRespondSchema = z.object({
    * 两者竞态。
    */
   setMode: PermissionModeSchema.optional(),
+  /** 选中的决定（permission.request.options 的 id）；只能细化 verdict，不能改变它 */
+  optionId: z.string().min(1).max(64).optional(),
 });
 
 /** agent → client：多设备同步——谁批的、结果（其余设备把卡片置为已响应） */

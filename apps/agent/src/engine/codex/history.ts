@@ -164,7 +164,8 @@ export function codexItemToHistory(item: unknown, fallbackTs: number): HistoryIt
   const ts = started === undefined || started < 0 ? fallbackTs : Math.round(started);
   switch (item['type']) {
     case 'userMessage':
-      return { kind: 'user', id, text: truncateText(userText(item['content'])), ts };
+      // 经 trine 发的消息有 clientId，等于实时流的 messageId，client 才能去重
+      return { kind: 'user', id: str(item['clientId']) ?? id, text: truncateText(userText(item['content'])), ts };
     case 'agentMessage':
       return { kind: 'assistant', id, text: truncateText(str(item['text']) ?? ''), ts };
     case 'commandExecution':

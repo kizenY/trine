@@ -92,6 +92,10 @@ export interface ExternalSessions {
   /** 全部会话。自己处理失败（如退回上次结果），这里抛错只记日志 */
   list(): Promise<SessionMeta[]>;
   metaOf(sessionId: string): SessionMeta | undefined;
+  rename(sessionId: string, title: string): Promise<void>;
+  delete(sessionId: string): Promise<void>;
+  /** 这个引擎的活跃会话；不是它的返回 undefined */
+  createSession(args: CreateSessionArgs): EngineSession | undefined;
 }
 
 export interface SessionManagerOptions {
@@ -161,6 +165,9 @@ export interface CreateSessionArgs {
   cwd: string;
   model: string;
   permissionMode: PermissionMode;
+  /** 引擎；省略 = Claude Code */
+  engine?: string;
+  engineMode?: string;
   emit: (body: EventBody) => void;
   resume?: boolean;
   /** 透传给 SDK 的 pathToClaudeCodeExecutable；不给 = SDK 内置 */
@@ -259,7 +266,10 @@ export class SessionManager {
     this.#headlessProbe = options.headlessProbe;
     this.#onRateLimits = options.onRateLimits;
     this.#createSession =
-      options.createSession ?? ((args) => new ClaudeSession(args));
+      (() => {
+        const claude = options.createSession ?? ((args: CreateSessionArgs) => new ClaudeSession(args));
+        return (args: CreateSessionArgs) => this.#external?.createSession(args) ?? claude(args);
+      })();
   }
 
   /** 当前活跃（持有实例的）会话数 */
@@ -305,6 +315,9 @@ export class SessionManager {
     seed?: SessionSeed;
     /** 待生效的对话截断点（调用方从 state.json 取；见 session.ts「回退」） */
     rewindPoint?: RewindPoint;
+    /** 引擎；省略 = Claude Code */
+    engine?: string | undefined;
+    engineMode?: string | undefined;
   }): AcquireResult {
     const existing = this.#sessions.get(args.sessionId);
     if (existing !== undefined) {
@@ -325,6 +338,8 @@ export class SessionManager {
       cwd: args.cwd,
       model: args.model,
       permissionMode: args.permissionMode,
+      ...(args.engine === undefined ? {} : { engine: args.engine }),
+      ...(args.engineMode === undefined ? {} : { engineMode: args.engineMode }),
       emit: (body) => {
         scoped.emit(body);
       },
@@ -363,6 +378,8 @@ export class SessionManager {
       model: args.model,
       permissionMode: args.permissionMode,
       costUsd: 0,
+      ...(args.engine === undefined ? {} : { engine: args.engine }),
+      ...(args.engineMode === undefined ? {} : { engineMode: args.engineMode }),
       // 与 #fromInfo 同口径：没有更新的摘要时用首条输入，下面广播的 updated 不会把摘要清空
       ...((previous?.lastEvent ?? seed?.firstPrompt) === undefined
         ? {}
@@ -527,6 +544,22 @@ export class SessionManager {
       out.push(this.decorate(this.#fromInfo(info), { hasCustomTitle: info.customTitle !== undefined }));
     }
 
+    // 同时在运行的其他引擎会话：标题、分支等以目录为准（如 CLI 里改了名），运行时字段以缓存为准
+    for (const meta of external) {
+      const cached = this.#meta.get(meta.sessionId);
+      if (cached === undefined) continue;
+      this.#meta.set(meta.sessionId, {
+        ...cached,
+        title: meta.title === '' ? cached.title : meta.title,
+        ...(meta.firstPrompt === undefined ? {} : { firstPrompt: meta.firstPrompt }),
+        ...(meta.lastEvent === undefined ? {} : { lastEvent: meta.lastEvent }),
+        ...(meta.gitBranch === undefined ? {} : { gitBranch: meta.gitBranch }),
+        ...(meta.createdAt === undefined ? {} : { createdAt: meta.createdAt }),
+        ...(meta.headless === true ? { headless: true } : {}),
+      });
+      if (meta.headless === true) this.#headless.add(meta.sessionId);
+    }
+
     // 本进程新建但尚未落盘的会话（还没发过消息就不会有 jsonl）
     for (const [id, meta] of this.#meta) {
       if (seen.has(id)) continue;
@@ -551,6 +584,10 @@ export class SessionManager {
 
     out.sort((a, b) => b.lastActivityAt - a.lastActivityAt);
     return out;
+  }
+
+  #isExternal(sessionId: string): boolean {
+    return (this.#meta.get(sessionId) ?? this.#external?.metaOf(sessionId))?.engine !== undefined;
   }
 
   /** 其他引擎的 meta：headless 来自它自己（decorate 的唯一来源是 #headless，先登记） */
@@ -673,11 +710,13 @@ export class SessionManager {
 
   /** 写转录的 custom-title（与 CLI `/rename` 同格式）。文件不存在 / 0 字节时 SDK 抛错 */
   renameTranscript(sessionId: string, title: string): Promise<void> {
+    if (this.#isExternal(sessionId)) return this.#external!.rename(sessionId, title);
     return this.#renameSession(sessionId, title);
   }
 
   /** 删转录 jsonl 与子代理目录。找不到时 SDK 抛错 */
   deleteTranscript(sessionId: string): Promise<void> {
+    if (this.#isExternal(sessionId)) return this.#external!.delete(sessionId);
     return this.#deleteSession(sessionId);
   }
 
@@ -798,7 +837,8 @@ export class SessionManager {
     const previous = this.#meta.get(sid);
     // waitingFor / bgRunning 是运行时字段：以本次 runtime 为准，离开等待态 / 后台任务
     // 归零时要从缓存里去掉（否则列表会一直挂着「后台 1」）
-    const { waitingFor: _stale, bgRunning: _staleBg, ...kept } = previous ?? { title: '' };
+    const { waitingFor: _stale, bgRunning: _staleBg, engineMode: _staleMode, ...kept } = previous ?? { title: '' };
+    const needsTitle = kept.title === '' && runtime.firstPrompt !== undefined;
     const merged: SessionMeta = {
       ...kept,
       sessionId: sid,
@@ -812,6 +852,8 @@ export class SessionManager {
       ...bgRunningOf(runtime.bgRunning),
       // context 只在取到时覆盖；没带就保留缓存里的上一次值
       ...(runtime.context === undefined ? {} : { context: runtime.context }),
+      ...(runtime.engineMode === undefined ? {} : { engineMode: runtime.engineMode }),
+      ...(needsTitle ? { title: runtime.firstPrompt!, firstPrompt: runtime.firstPrompt!, lastEvent: runtime.firstPrompt! } : {}),
     };
     this.#meta.set(sid, merged);
     if (runtime.state === 'running' && this.#flags?.archivedAt(sid) !== undefined) {

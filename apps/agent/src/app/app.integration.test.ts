@@ -881,8 +881,8 @@ describe('agent 接线 · 端到端', () => {
 });
 
 
-describe('AgentApp · Codex 只读引擎（假 app-server）', () => {
-  test('machine.info 带两个引擎；列表带 Codex 会话；历史可读；发消息被拒且不建会话', async () => {
+describe('AgentApp · Codex 引擎（假 app-server）', () => {
+  test('machine.info 带两个引擎；列表带 Codex 会话；历史可读；发消息走 resume 和 turn/start，一轮跑完', async () => {
     const fake = new FakeAppServer({
       'thread/list': () => ({ data: [fakeThread('codex-thread-1')], nextCursor: null }),
       'thread/read': (p) => {
@@ -898,6 +898,9 @@ describe('AgentApp · Codex 只读引擎（假 app-server）', () => {
       'account/rateLimits/read': () => ({
         rateLimitsByLimitId: { codex: { primary: { usedPercent: 5, windowDurationMins: 10080, resetsAt: 2000 } } },
       }),
+      'thread/resume': () => ({ approvalPolicy: 'never', sandbox: { type: 'dangerFullAccess' } }),
+      'turn/start': () => ({ turn: { id: 'turn-1' } }),
+      'thread/unsubscribe': () => ({ status: 'unsubscribed' }),
     });
     await app.stop();
     app = await createApp({ spawnCodexAppServer: fake.spawn });
@@ -922,10 +925,16 @@ describe('AgentApp · Codex 只读引擎（假 app-server）', () => {
     expect(history?.type === 'session.history.response' && history.items[0]).toMatchObject({ text: 'from codex' });
 
     send(client, { type: 'input.send', sessionId: 'codex-thread-1', clientMsgId: 'c1', text: 'hi' });
-    await waitFor(() => eventsOf(client).some((e) => e.type === 'error.fatal'), '发消息被拒');
-    expect(eventsOf(client).some((e) => e.type === 'user.message')).toBe(false);
-    const forbidden = ['thread/start', 'thread/resume', 'turn/start'];
-    expect(fake.calls.filter((c) => forbidden.includes(c.method))).toEqual([]);
+    await waitFor(() => fake.calls.some((c) => c.method === 'turn/start'), 'turn/start');
+    expect(fake.calls.map((c) => c.method).filter((m) => m === 'thread/resume' || m === 'turn/start')).toEqual(['thread/resume', 'turn/start']);
+    const notify = (method: string, params: Record<string, unknown>) =>
+      fake.handlers!.onLine(JSON.stringify({ method, params: { threadId: 'codex-thread-1', ...params } }));
+    notify('item/completed', { item: { type: 'agentMessage', id: 'm1', text: 'hello from codex' } });
+    notify('turn/completed', { turn: { id: 'turn-1', status: 'completed' } });
+    await waitFor(() => eventsOf(client).some((e) => e.type === 'run.done'), 'run.done');
+    const done = eventsOf(client).find((e) => e.type === 'assistant.done');
+    expect(done?.type === 'assistant.done' && done.text).toBe('hello from codex');
+    expect(eventsOf(client).some((e) => e.type === 'user.message')).toBe(true);
     client.close();
   });
 });

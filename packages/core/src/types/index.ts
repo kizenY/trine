@@ -416,8 +416,29 @@ export const EngineCapabilitiesSchema = z.object({
   attachments: z.boolean().optional(),
   /** 能重命名、永久删除会话（归档、置顶是 trine 自己的标记，所有引擎都能用） */
   mutations: z.boolean().optional(),
+  /** 能手动刷新 context 用量 */
+  contextRefresh: z.boolean().optional(),
 });
 export type EngineCapabilities = z.infer<typeof EngineCapabilitiesSchema>;
+
+/** 引擎的一个权限模式；含义由引擎解释，见 SessionMeta.engineMode */
+export const EngineModeOptionSchema = z.object({
+  id: EngineModeSchema,
+  label: z.string().min(1).max(32),
+  description: z.string().max(200).optional(),
+  /** 选中前要两击确认 */
+  dangerous: z.boolean().optional(),
+  /** 新会话默认选它 */
+  default: z.boolean().optional(),
+});
+export type EngineMode = z.infer<typeof EngineModeOptionSchema>;
+
+/** 引擎提供的模型 */
+export const EngineModelSchema = z.object({
+  id: z.string().min(1).max(128),
+  label: z.string().min(1).max(128),
+});
+export type EngineModel = z.infer<typeof EngineModelSchema>;
 
 /** 引擎的一个限额窗口。窗口数量和时长因账号而异，不能假设固定是 5 小时 + 7 天 */
 export const EngineRateWindowSchema = z.object({
@@ -442,6 +463,10 @@ export const EngineSummarySchema = z.object({
   /** available 为 false 的原因（给人看） */
   unavailableReason: z.string().max(300).optional(),
   capabilities: EngineCapabilitiesSchema,
+  /** 模型目录；省略 = 由 client 自己的已知模型列表决定（Claude） */
+  models: z.array(EngineModelSchema).max(64).optional(),
+  /** 权限模式目录；省略 = 协议的四档 PermissionMode（Claude） */
+  modes: z.array(EngineModeOptionSchema).max(16).optional(),
   /** 账号限额。Claude 的仍在 MachineInfo.rateLimits，这里不重复 */
   rateLimits: z
     .object({ windows: z.array(EngineRateWindowSchema).max(16), updatedAt: TimestampSchema })

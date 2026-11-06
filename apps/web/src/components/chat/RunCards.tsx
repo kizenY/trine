@@ -22,7 +22,7 @@ export function DoneCard({ entry }: { entry: RunDoneEntry }): React.JSX.Element 
       <div className="mb-1 font-semibold">✓ 任务完成</div>
       <div className="text-text-2 tabular flex flex-wrap gap-x-3.5 gap-y-1 font-mono text-[12.5px]">
         <span>⏱ {formatDuration(entry.durationMs)}</span>
-        <span>{formatCost(entry.costUsd)}</span>
+        {entry.costUnknown !== true && <span>{formatCost(entry.costUsd)}</span>}
         <span>{entry.toolCount} 次工具</span>
         <span>{entry.permissionCount} 次权限</span>
         {entry.turns !== undefined && <span>{entry.turns} 轮</span>}

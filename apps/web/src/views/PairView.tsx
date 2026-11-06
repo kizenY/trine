@@ -118,7 +118,7 @@ export function PairView(): React.JSX.Element {
           n={1}
           active={step === 1}
           title="在目标机器上启动 agent"
-          desc="在装有 claude CLI 的机器上运行（它会在终端打印二维码与 trine1: 配对码）："
+          desc="在装有 claude 或 codex CLI 的机器上运行（它会在终端打印二维码与 trine1: 配对码）："
         >
           <CodeBlock>{agentCommand(serverUrl)}</CodeBlock>
           {serverUrl === null && (

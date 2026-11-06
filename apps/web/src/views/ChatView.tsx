@@ -92,7 +92,7 @@ import {
 } from '@/lib/reducer.ts';
 import { timelineKey } from '@/lib/storage.ts';
 import { CLAUDE_ENGINE_ID } from '@trine/core';
-import { capabilitiesOf, engineOf, sessionEngineTag } from '@/lib/engine-model.ts';
+import { capabilitiesOf, engineModeLabel, engineOf, sessionEngineTag } from '@/lib/engine-model.ts';
 import { formatCost } from '@/lib/format.ts';
 import { waitingForOfTool } from '@/lib/waiting.ts';
 import { ExtHeadEntry, ExtPanelSheet } from '@/components/ext/ExtPanel.tsx';
@@ -311,6 +311,7 @@ export function ChatView(): React.JSX.Element {
   const engineCaps = capabilitiesOf(machine?.info, meta);
   /** 非 Claude 会话在头部标出引擎，且不显示 Claude 的权限模式 */
   const engineTagText = meta?.engine === undefined ? undefined : (sessionEngineTag(machine?.info, meta) ?? meta.engine);
+  const engineModeText = engineModeLabel(engineOf(machine?.info, meta), meta?.engineMode);
   const attachDisabledReason = !agentSupportsAttachments(machine?.info?.agentVersion)
     ? machine?.info === undefined
       ? '还不知道这台 agent 的版本，暂时不能添加附件'
@@ -440,6 +441,7 @@ export function ChatView(): React.JSX.Element {
           ...(decision.remember === undefined ? {} : { remember: decision.remember }),
           ...(decision.message === undefined ? {} : { message: decision.message }),
           ...(decision.setMode === undefined ? {} : { setMode: decision.setMode }),
+          ...(decision.optionId === undefined ? {} : { optionId: decision.optionId }),
         });
       },
       onResumeAt: (at) => {
@@ -496,7 +498,7 @@ export function ChatView(): React.JSX.Element {
 
   // 头部 ctx 手动刷新（agent ≥ 0.13.0）：新值随 session.updated 到；这里只提示失败
   const canRefreshContext =
-    client !== null && meta !== undefined && supportsContextRefresh(machine?.info) && engineCaps.interactive === true;
+    client !== null && meta !== undefined && supportsContextRefresh(machine?.info) && engineCaps.contextRefresh === true;
   const refreshContext = useCallback(async (): Promise<void> => {
     if (!client) return;
     try {
@@ -519,7 +521,7 @@ export function ChatView(): React.JSX.Element {
           rows: [
             { label: '模型', value: res.model === '' ? '默认' : res.model },
             { label: '工作目录', value: res.cwd },
-            { label: '权限模式', value: res.permissionMode },
+            { label: '权限模式', value: engineModeText ?? res.permissionMode },
             ...(engineCaps.cost === true ? [{ label: '本会话成本', value: formatCost(res.costUsd) }] : []),
             {
               label: '上下文',
@@ -557,8 +559,13 @@ export function ChatView(): React.JSX.Element {
   const settingsActions: SessionSettingsActions = useMemo(
     () => ({
       setModel: (model) => client?.send(machineId, { type: 'session.setModel', sessionId, model }),
-      setPermissionMode: (mode) =>
-        client?.send(machineId, { type: 'session.setPermissionMode', sessionId, mode }),
+      setPermissionMode: (mode, engineMode) =>
+        client?.send(machineId, {
+          type: 'session.setPermissionMode',
+          sessionId,
+          mode,
+          ...(engineMode === undefined ? {} : { engineMode }),
+        }),
       setCwd: (cwd) => client?.send(machineId, { type: 'session.setCwd', sessionId, cwd }),
       addCwd: (path) => client?.send(machineId, { type: 'cwd.add', path }),
       removeCwd: (path) => client?.send(machineId, { type: 'cwd.remove', path }),
@@ -596,8 +603,9 @@ export function ChatView(): React.JSX.Element {
           if (action.command === 'model') settingsActions.setModel(action.arg);
           else if (action.command === 'cwd') settingsActions.setCwd(action.arg);
           else if (isPermissionMode(action.arg)) {
-            // bypass 不许从命令行一步到位——两击确认在 sheet 里
-            if (action.arg === 'bypassPermissions') openSettings('permission');
+            // bypass 不许从命令行一步到位——两击确认在 sheet 里。
+            // 非 Claude 引擎的模式名不一样，也去 sheet 里选
+            if (action.arg === 'bypassPermissions' || meta?.engine !== undefined) openSettings('permission');
             else settingsActions.setPermissionMode(action.arg);
           } else {
             openSettings('permission');
@@ -673,7 +681,7 @@ export function ChatView(): React.JSX.Element {
               {meta === undefined
                 ? '会话设置 ▾'
                 : engineTagText !== undefined
-                  ? `${cwdTail(meta.cwd)} · ${engineTagText} · ${meta.model === '' ? '默认模型' : shortModel(meta.model)}`
+                  ? `${cwdTail(meta.cwd)} · ${engineTagText} · ${meta.model === '' || meta.model === 'default' ? '默认模型' : shortModel(meta.model)}${engineModeText === undefined ? '' : ` · ${engineModeText}`}${engineCaps.interactive === true ? ' ▾' : ''}`
                   : `${cwdTail(meta.cwd)} · ${shortModel(meta.model)} · ${meta.permissionMode} ▾`}
             </button>
             <SessionUsage
@@ -859,6 +867,7 @@ export function ChatView(): React.JSX.Element {
         section={settingsSection}
         meta={meta}
         knownModels={knownModels}
+        engine={engineOf(machine?.info, meta)}
         resolvedModel={resolvedModel}
         cwd={machine?.cwd ?? null}
         actions={settingsActions}
