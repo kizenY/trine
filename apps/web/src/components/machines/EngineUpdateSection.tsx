@@ -1,5 +1,5 @@
 /**
- * 机器详情里的「更新 Claude」（claude-update）：确认 → 发 `machine.claude.update.request`
+ * 机器详情里的「更新引擎」（claude-update，Codex 复用）：确认 → 发更新请求
  * → loading（可能几十秒）→ 结论（旧→新 / 已是最新 / 失败原因）+ 可展开的输出尾部。
  *
  * 只在 agent >= 0.4.0 时由 MachineDetailView 渲染（能力探测见 claude-update.ts）。
@@ -17,10 +17,11 @@ import {
   summarizeClaudeCheck,
   summarizeClaudeUpdate,
   summarizeClaudeUpdateError,
+  type CheckResult,
   type ClaudeLatestView,
   type ClaudeUpdateSummary,
+  type UpdateResult,
 } from '@/components/machines/claude-update.ts';
-import type { ClaudeCheckResult, ClaudeUpdateResult } from '@/lib/client.ts';
 import { formatRelativeTime } from '@/lib/format.ts';
 import { cn } from '@/lib/utils.ts';
 
@@ -30,25 +31,40 @@ const TONE_CLASS: Record<ClaudeUpdateSummary['tone'], string> = {
   error: 'border-red bg-red-soft text-red',
 };
 
-export function ClaudeUpdateSection({
+export function EngineUpdateSection({
+  engineName = 'Claude',
+  command = 'claude update',
+  idPrefix = 'claude',
+  runningNote = RUNNING_SESSIONS_NOTE,
+  showTitle = true,
   machineName,
   online,
-  claudeVersion,
+  version,
   update,
   latest = null,
   check,
   now = Date.now(),
 }: {
+  /** 界面上的引擎名 */
+  engineName?: string;
+  /** 给人看的更新命令 */
+  command?: string;
+  /** data-testid 前缀 */
+  idPrefix?: string;
+  /** 更新对运行中会话的影响，引擎之间不一样 */
+  runningNote?: string;
+  /** 放在引擎卡里时标题由卡片显示 */
+  showTitle?: boolean;
   machineName: string;
   /** false = 已知离线（按钮禁用）；null = 未知，允许尝试 */
   online: boolean | null;
   /** 当前 machine.info 里的版本（确认框里给用户看） */
-  claudeVersion: string | undefined;
-  update: () => Promise<ClaudeUpdateResult>;
+  version: string | undefined;
+  update: () => Promise<UpdateResult>;
   /** 最新版本（machine.info.claudeLatest 整理后）；null = agent 不支持检查 */
   latest?: ClaudeLatestView | null;
   /** 立即检查最新版本；latest 不为 null 时才有意义 */
-  check?: () => Promise<ClaudeCheckResult>;
+  check?: () => Promise<CheckResult>;
   now?: number;
 }): React.JSX.Element {
   const [confirming, setConfirming] = useState(false);
@@ -63,7 +79,7 @@ export function ClaudeUpdateSection({
     setResult(null);
     setShowOutput(false);
     void update()
-      .then(summarizeClaudeUpdate, summarizeClaudeUpdateError)
+      .then((res) => summarizeClaudeUpdate(res, engineName, runningNote), summarizeClaudeUpdateError)
       .then((summary) => {
         setResult(summary);
         const notify = summary.tone === 'error' ? toast.error : summary.tone === 'success' ? toast.success : toast.info;
@@ -76,7 +92,7 @@ export function ClaudeUpdateSection({
     if (check === undefined) return;
     setChecking(true);
     void check()
-      .then(summarizeClaudeCheck, (err: unknown) => ({
+      .then((res) => summarizeClaudeCheck(res, engineName), (err: unknown) => ({
         tone: 'error' as const,
         title: `检查失败：${err instanceof Error ? err.message : String(err)}`,
       }))
@@ -88,17 +104,17 @@ export function ClaudeUpdateSection({
   };
 
   const updateAvailable = latest?.updateAvailable === true;
-  const current = claudeVersion === undefined || claudeVersion.trim() === '' ? '未知' : shortClaudeVersion(claudeVersion);
+  const current = version === undefined || version.trim() === '' ? '未知' : shortClaudeVersion(version);
 
   return (
-    <section className="flex flex-col gap-2" data-testid="claude-update-section">
-      <h2 className="font-medium">Claude</h2>
+    <section className="flex flex-col gap-2" data-testid={`${idPrefix}-update-section`}>
+      {showTitle && <h2 className="font-medium">{engineName}</h2>}
       <p className="text-text-3 text-xs">
-        在这台机器上执行 <code className="font-mono">claude update</code>，把远程会话使用的 claude
-        更新到最新版。{RUNNING_SESSIONS_NOTE}
+        在这台机器上执行 <code className="font-mono">{command}</code>，把远程会话使用的 {command.split(' ')[0]}{' '}
+        更新到最新版。{runningNote}
       </p>
       {latest !== null && (
-        <div className="flex flex-col gap-0.5 text-xs" data-testid="claude-latest">
+        <div className="flex flex-col gap-0.5 text-xs" data-testid={`${idPrefix}-latest`}>
           <p>
             <span className="text-text-3">当前 </span>
             <span className="font-mono">{latest.current ?? '未知'}</span>
@@ -106,7 +122,7 @@ export function ClaudeUpdateSection({
             <span className="font-mono">{latest.latest ?? '未知'}</span>
             {latest.updateAvailable !== null && (
               <span
-                data-testid="claude-latest-status"
+                data-testid={`${idPrefix}-latest-status`}
                 data-available={String(latest.updateAvailable)}
                 className={cn('ml-2', latest.updateAvailable ? 'text-amber' : 'text-green')}
               >
@@ -115,12 +131,14 @@ export function ClaudeUpdateSection({
             )}
           </p>
           <p className="text-text-3">
-            {latest.channel} 渠道
-            {latest.checkedAt !== null && ` · ${formatRelativeTime(latest.checkedAt, now)}检查`}
-            {' · agent 每 6 小时自动检查'}
+            {[
+              ...(latest.channel === undefined ? [] : [`${latest.channel} 渠道`]),
+              ...(latest.checkedAt === null ? [] : [`${formatRelativeTime(latest.checkedAt, now)}检查`]),
+              'agent 每 6 小时自动检查',
+            ].join(' · ')}
           </p>
           {latest.error !== null && (
-            <p className="text-red" data-testid="claude-latest-error">
+            <p className="text-red" data-testid={`${idPrefix}-latest-error`}>
               {latest.error}
             </p>
           )}
@@ -130,7 +148,7 @@ export function ClaudeUpdateSection({
         <Button
           variant={updateAvailable ? 'default' : 'outline'}
           className="w-fit"
-          data-testid="claude-update"
+          data-testid={`${idPrefix}-update`}
           disabled={updating || online === false}
           onClick={() => setConfirming(true)}
         >
@@ -144,14 +162,14 @@ export function ClaudeUpdateSection({
           ) : updateAvailable && latest?.latest ? (
             `更新到 ${latest.latest}`
           ) : (
-            '更新 Claude'
+            `更新 ${engineName}`
           )}
         </Button>
         {latest !== null && check !== undefined && (
           <Button
             variant="outline"
             className="w-fit"
-            data-testid="claude-check"
+            data-testid={`${idPrefix}-check`}
             disabled={checking || updating || online === false}
             onClick={runCheck}
           >
@@ -161,13 +179,13 @@ export function ClaudeUpdateSection({
       </div>
       {online === false && !updating && <p className="text-text-3 text-xs">机器离线，上线后才能更新。</p>}
       {updating && (
-        <p className="text-text-3 text-xs" data-testid="claude-update-progress">
+        <p className="text-text-3 text-xs" data-testid={`${idPrefix}-update-progress`}>
           正在检查并安装更新，可能需要数十秒到几分钟，可以先离开此页面，完成后会有提示。
         </p>
       )}
       {result !== null && (
         <div
-          data-testid="claude-update-result"
+          data-testid={`${idPrefix}-update-result`}
           data-tone={result.tone}
           className={cn('rounded-[12px] border px-3 py-2 text-xs', TONE_CLASS[result.tone])}
         >
@@ -177,7 +195,7 @@ export function ClaudeUpdateSection({
             <div className="mt-1.5">
               <button
                 type="button"
-                data-testid="claude-update-output-toggle"
+                data-testid={`${idPrefix}-update-output-toggle`}
                 aria-expanded={showOutput}
                 className="cursor-pointer underline underline-offset-2"
                 onClick={() => setShowOutput((v) => !v)}
@@ -186,7 +204,7 @@ export function ClaudeUpdateSection({
               </button>
               {showOutput && (
                 <pre
-                  data-testid="claude-update-output"
+                  data-testid={`${idPrefix}-update-output`}
                   className="bg-code-bg border-border text-text-2 mt-1.5 max-h-64 overflow-auto rounded-lg border px-2.5 py-2 font-mono text-[11.5px] whitespace-pre-wrap"
                 >
                   {result.outputTruncated ? `…（前略）\n${result.output}` : result.output}
@@ -200,16 +218,16 @@ export function ClaudeUpdateSection({
       <ConfirmDialog
         open={confirming}
         onOpenChange={setConfirming}
-        testId="confirm-claude-update"
+        testId={`confirm-${idPrefix}-update`}
         destructive={false}
-        title={`更新 ${machineName} 上的 Claude？`}
+        title={`更新 ${machineName} 上的 ${engineName}？`}
         description={
           <>
             <p>
               当前版本：<span className="font-mono">{current}</span>。agent 会在这台机器上执行{' '}
-              <code className="font-mono">claude update</code>，最长 5 分钟。
+              <code className="font-mono">{command}</code>，最长 5 分钟。
             </p>
-            <p>{RUNNING_SESSIONS_NOTE}</p>
+            <p>{runningNote}</p>
           </>
         }
         confirmLabel="更新"

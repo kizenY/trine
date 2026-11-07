@@ -805,6 +805,21 @@ describe('远程更新 claude（claude-update）', () => {
     expect(() => assertEnvelopeBinding(parsed, { seq: 1 }, 'c2a')).not.toThrow();
   });
 
+  test('引擎：setEffort、machine.engine.*、开放的强度取值', () => {
+    const noSession = { ts, seq: 1, dir: 'c2a' } as const;
+    expect(ClientToAgentEventSchema.safeParse({ ...c2a, type: 'session.setEffort', effort: 'ultra' }).success).toBe(true);
+    expect(ClientToAgentEventSchema.safeParse({ ...c2a, type: 'session.setEffort' }).success).toBe(true);
+    expect(ClientToAgentEventSchema.safeParse({ ...noSession, type: 'machine.engine.update.request', reqId: 'r', engine: 'codex' }).success).toBe(true);
+    expect(ClientToAgentEventSchema.safeParse({ ...noSession, type: 'machine.engine.check.request', reqId: 'r' }).success).toBe(false);
+    const machine = { ts, seq: 1, dir: 'a2c' } as const;
+    expect(
+      AgentToClientEventSchema.safeParse({ ...machine, type: 'machine.engine.update.response', reqId: 'r', engine: 'codex', ok: true, fromVersion: '1', toVersion: '2', output: '' }).success,
+    ).toBe(true);
+    expect(
+      AgentToClientEventSchema.safeParse({ ...machine, type: 'machine.engine.check.response', reqId: 'r', engine: 'codex', ok: true, latest: { version: '2' } }).success,
+    ).toBe(true);
+  });
+
   test('machine.claude.update.response：成功 / 各失败码 / 输出长度上限', () => {
     const ok = {
       type: 'machine.claude.update.response',

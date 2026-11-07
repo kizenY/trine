@@ -56,6 +56,7 @@ import {
   ExtWireViewSchema,
   HistoryItemSchema,
   EngineIdSchema,
+  EngineEffortSchema,
   EngineModeSchema,
   MachineInfoSchema,
   MachineStatsSchema,
@@ -819,6 +820,8 @@ export const SessionCreateSchema = z.object({
   engine: EngineIdSchema.optional(),
   /** 非 Claude 引擎自己的权限模式，见 SessionMeta.engineMode；Claude 忽略 */
   engineMode: EngineModeSchema.optional(),
+  /** 推理强度（agent ≥ 0.22.0，capabilities.effort）；省略 = 跟随引擎自己的配置 */
+  effort: EngineEffortSchema.optional(),
 });
 
 /**
@@ -949,6 +952,16 @@ export const SessionSetModelSchema = z.object({
   type: z.literal('session.setModel'),
   ...c2aBase,
   model: z.string().min(1),
+});
+
+/**
+ * client → agent：改推理强度，下一轮生效（agent ≥ 0.22.0，只在 capabilities.effort 为真时发）。
+ * 省略 effort = 回到模型的默认强度。结果随 session.updated 回来。
+ */
+export const SessionSetEffortSchema = z.object({
+  type: z.literal('session.setEffort'),
+  ...c2aBase,
+  effort: EngineEffortSchema.optional(),
 });
 
 export const SessionSetPermissionModeSchema = z.object({
@@ -1168,6 +1181,41 @@ export const MachineClaudeUpdateResponseSchema = z.object({
       message: z.string(),
     })
     .optional(),
+});
+
+// --- §3.1b 更新其他引擎（agent 0.22.0 起，capabilities.update 为真才发） ---
+
+/** client → agent：在代理机上更新引擎（机器级帧，语义同 machine.claude.update.request） */
+export const MachineEngineUpdateRequestSchema = z.object({
+  type: z.literal('machine.engine.update.request'),
+  ...c2aBase,
+  reqId: ReqIdSchema,
+  engine: EngineIdSchema,
+});
+
+export const MachineEngineUpdateResponseSchema = MachineClaudeUpdateResponseSchema.extend({
+  type: z.literal('machine.engine.update.response'),
+  engine: EngineIdSchema,
+});
+
+/** client → agent：立即查一次引擎的最新版本；结果先随 machine.info 广播，再回应答 */
+export const MachineEngineCheckRequestSchema = z.object({
+  type: z.literal('machine.engine.check.request'),
+  ...c2aBase,
+  reqId: ReqIdSchema,
+  engine: EngineIdSchema,
+});
+
+export const MachineEngineCheckResponseSchema = z.object({
+  type: z.literal('machine.engine.check.response'),
+  ...a2cBase,
+  reqId: ReqIdSchema,
+  engine: EngineIdSchema,
+  ok: z.boolean(),
+  /** 引擎当前版本；未知时省略 */
+  currentVersion: z.string().max(64).optional(),
+  latest: z.object({ version: z.string().max(64) }).optional(),
+  error: z.object({ code: z.enum(['failed']), message: z.string().max(300) }).optional(),
 });
 
 // --- §3.1a 检查 claude 最新版本（claude-latest，agent 0.19.0 起） ---
@@ -1680,6 +1728,8 @@ export const AgentToClientEventSchema = z.discriminatedUnion('type', [
   MachineInfoEventSchema,
   MachineClaudeUpdateResponseSchema,
   MachineClaudeCheckResponseSchema,
+  MachineEngineUpdateResponseSchema,
+  MachineEngineCheckResponseSchema,
   MachineUsageResponseSchema,
   MachineAgentRestartResponseSchema,
   MachineStatsEventSchema,
@@ -1713,6 +1763,7 @@ export const ClientToAgentEventSchema = z.discriminatedUnion('type', [
   SessionPinSchema,
   SessionDeleteSchema,
   SessionSetModelSchema,
+  SessionSetEffortSchema,
   SessionSetPermissionModeSchema,
   SessionSetCwdSchema,
   SessionStatusRequestSchema,
@@ -1730,6 +1781,8 @@ export const ClientToAgentEventSchema = z.discriminatedUnion('type', [
   MachineUnpairSchema,
   MachineClaudeUpdateRequestSchema,
   MachineClaudeCheckRequestSchema,
+  MachineEngineUpdateRequestSchema,
+  MachineEngineCheckRequestSchema,
   MachineUsageRequestSchema,
   MachineAgentRestartRequestSchema,
   MachineStatsRequestSchema,

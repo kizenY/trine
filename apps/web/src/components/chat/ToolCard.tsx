@@ -39,6 +39,9 @@ const TOOL_ICON: Record<string, string> = {
   WebSearch: '🌐',
   Task: '🤖',
   Agent: '🤖',
+  // Codex：派生、等待子 agent 等操作；压缩上下文
+  SubAgent: '🤖',
+  Compact: '🗜️',
   TodoWrite: '☑️',
   NotebookEdit: '📓',
   // 后台任务相关（agent 的 summarize.ts 给的摘要：`后台 · cmd` / `stop <id>` / `<id> · 等待完成`）

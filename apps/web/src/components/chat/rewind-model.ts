@@ -15,11 +15,15 @@ export interface RewindChoice {
 }
 
 /** 预览 → 三个选项（顺序即界面顺序，与 Claude Code `/rewind` 一致） */
-export function rewindChoices(preview: RewindPreviewResult): RewindChoice[] {
+export function rewindChoices(
+  preview: RewindPreviewResult,
+  /** 引擎支持的模式（capabilities.rewind）；不支持的不列出来。省略 = 全部 */
+  supported?: readonly RewindMode[],
+): RewindChoice[] {
   const conversation = preview.conversation ?? { available: false, reason: 'agent 没有给出对话部分的结果' };
   const files = preview.files ?? { available: false, reason: 'agent 没有给出文件部分的结果' };
   const both = conversation.available && files.available;
-  return [
+  const choices: RewindChoice[] = [
     {
       mode: 'both',
       label: '还原代码和对话',
@@ -42,6 +46,7 @@ export function rewindChoices(preview: RewindPreviewResult): RewindChoice[] {
       ...(files.available ? {} : { reason: files.reason ?? '不可用' }),
     },
   ];
+  return supported === undefined ? choices : choices.filter((c) => supported.includes(c.mode));
 }
 
 /** 默认选第一个可用的；都不可用 → undefined（确认按钮禁用） */

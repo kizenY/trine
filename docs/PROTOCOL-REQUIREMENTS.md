@@ -304,7 +304,11 @@ agent 侧所有产出 SessionMeta 的出口（list、session.created、session.u
 - `permission.request.options`：引擎给的决定选项（`allow_once`、`allow_session`、`reject`）。client 按它显示按钮，选中的 id 放进 `permission.respond.optionId`。`optionId` 只能细化 `verdict`，不能改变它；不认识的 id 按单次批准。带 options 的请求不支持 `updatedInput` 和 `remember`。
 - `EngineSummary.models`、`modes`：引擎的模型和权限模式目录。省略时 client 用自己的已知模型列表和四档 `PermissionMode`（Claude）。
 - `run.done.costUnknown`：引擎不回报费用，`costUsd` 只是占位的 0，不显示。
-- Codex 不支持的请求（回退、后台任务、刷新 context）由 agent 拒绝。斜杠命令清单回空列表。
+- Codex 不支持的请求（后台任务、刷新 context）由 agent 拒绝。
+- 回退（agent ≥ 0.22.0）：`capabilities.rewind` 列出支持的模式，Codex 只有 `conversation`，`code`、`both` 回 `unavailable`。Codex 第一条消息也能回退；一轮中追加的消息回 `invalid`，因为撤掉的是整轮；旧格式 thread 回 `unavailable`。预览的 `files` 恒为不可用。
+- 压缩和 skill 不加帧：`session.commands.response` 给出清单（`compact` + 启用的 skill），client 照常把 `/name …` 当文本发送，Codex 引擎在 agent 端转成压缩或 skill 调用。不是 skill 的文本原样发给模型。
+- `session.setEffort`、`session.create.effort`、`SessionMeta.effort`（agent ≥ 0.22.0，`capabilities.effort`）：推理强度，开放字符串，选项在 `EngineModel.efforts`。模型不支持的值不采用。`session.setEffort` 省略 `effort` = 回到模型默认值。
+- `machine.engine.update.request`、`machine.engine.check.request` 及其应答（agent ≥ 0.22.0，`capabilities.update`）：语义同 `machine.claude.*`，多一个 `engine`。最新版本在 `EngineSummary.latest`，先随 `machine.info` 广播再回应答。
 - `EngineSummary.rateLimits.windows`：引擎的限额窗口，数量和时长因账号而异（实测有只给周窗口的账号），不能假设是 5 小时 + 7 天。Claude 的限额仍在 `MachineInfo.rateLimits`。
 
 ## 协议约定汇总

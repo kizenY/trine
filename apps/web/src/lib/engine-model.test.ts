@@ -3,6 +3,7 @@ import type { EngineSummary } from '@trine/core';
 import {
   capabilitiesOf,
   creatableEngines,
+  effortOptions,
   engineFilterOptions,
   engineModeLabel,
   engineOf,
@@ -109,5 +110,26 @@ describe('新建与模式', () => {
     expect(engineModeLabel(engine, 'full')).toBe('完全访问');
     expect(engineModeLabel(engine, 'x')).toBe('x');
     expect(engineModeLabel(engine, undefined)).toBeUndefined();
+  });
+});
+
+
+describe('effortOptions', () => {
+  const engine: Pick<EngineSummary, 'capabilities' | 'models'> = {
+    capabilities: { effort: true },
+    models: [
+      { id: 'a', label: 'A', efforts: ['low', 'ultra'], defaultEffort: 'low', isDefault: true },
+      { id: 'b', label: 'B' },
+    ],
+  };
+  test('按模型给选项；默认模型取 isDefault', () => {
+    expect(effortOptions(engine, 'a')).toEqual({ efforts: ['low', 'ultra'], defaultEffort: 'low' });
+    expect(effortOptions(engine, 'default')?.efforts).toEqual(['low', 'ultra']);
+  });
+  test('引擎不支持、模型没有强度、手填的模型：都不显示', () => {
+    expect(effortOptions({ ...engine, capabilities: {} }, 'a')).toBeUndefined();
+    expect(effortOptions(engine, 'b')).toBeUndefined();
+    expect(effortOptions(engine, 'typed-by-hand')).toBeUndefined();
+    expect(effortOptions(undefined, 'a')).toBeUndefined();
   });
 });

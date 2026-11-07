@@ -195,10 +195,10 @@ export function countLiveSessions(map: Record<string, SessionMeta> | undefined):
 }
 
 /**
- * 「子进程 3/10」：上限来自 machine.info.maxSessions（agent ≥ 0.10.0）。旧 agent
+ * 「活跃会话 3/10」：上限来自 machine.info.maxSessions（agent ≥ 0.10.0）。旧 agent
  * 不发上限也不发 live，返回空串（调用方不显示）。
  */
 export function liveSessionsLine(live: number, maxSessions: number | undefined): string {
-  if (maxSessions === undefined) return live > 0 ? `子进程 ${live}` : '';
-  return `子进程 ${live}/${maxSessions}`;
+  if (maxSessions === undefined) return live > 0 ? `活跃会话 ${live}` : '';
+  return `活跃会话 ${live}/${maxSessions}`;
 }

@@ -241,6 +241,8 @@ export interface SessionRuntimeMeta {
   context?: ContextUsage;
   /** 非 Claude 引擎的权限模式（SessionMeta.engineMode） */
   engineMode?: string;
+  /** 推理强度（SessionMeta.effort） */
+  effort?: string;
   /** 首条输入：还没有标题的新会话拿它作标题（Claude 的标题来自转录，不用） */
   firstPrompt?: string;
 }

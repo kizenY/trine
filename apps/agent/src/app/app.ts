@@ -20,7 +20,7 @@
  */
 import { homedir } from 'node:os';
 import { join, resolve } from 'node:path';
-import { FS_READ_DEFAULT_MAX_BYTES, type AgentToClientEvent, type MachineInfo, type TransportFrame } from '@trine/core';
+import { FS_READ_DEFAULT_MAX_BYTES, type AgentToClientEvent, type EngineSummary, type MachineInfo, type TransportFrame } from '@trine/core';
 import type {
   deleteSession,
   getSessionInfo,
@@ -64,6 +64,7 @@ import { ClaudeLatestChecker } from './claude-latest.ts';
 import { claudeEngineSummary } from '../engine/claude.ts';
 import { spawnCodexAppServer, type SpawnAppServer } from '../engine/codex/app-server.ts';
 import { CODEX_ENGINE_ID, CodexEngine } from '../engine/codex/engine.ts';
+import { CodexLatestChecker, codexVersionNumber } from '../engine/codex/update.ts';
 import { AGENT_VERSION, buildMachineInfo } from './machine-info.ts';
 import {
   findUp,
@@ -173,6 +174,8 @@ export class AgentApp {
   #filesMaxBytes: number | undefined;
   #planUsage!: PlanUsageTracker;
   #codex: CodexEngine | undefined;
+  /** 能找到 codex 可执行文件时才有：测试注入的 app-server 不能更新 */
+  #codexUpdate: { updater: ClaudeUpdater; latest: CodexLatestChecker } | undefined;
   #machineStats!: MachineStatsWatcher;
   #extRegistry!: ExtensionRegistry;
   #extLinks!: SessionLinksStore;
@@ -393,6 +396,8 @@ export class AgentApp {
       renameMachine: (name) => app.#rename(name, paths.identity),
       updateClaude: () => app.#updateClaude(),
       checkClaude: () => app.#claudeLatest.check(),
+      updateEngine: async (engine) => (engine === CODEX_ENGINE_ID ? app.#codexUpdate?.updater.run() : undefined),
+      checkEngine: async (engine) => (engine === CODEX_ENGINE_ID ? app.#codexUpdate?.latest.check() : undefined),
       refreshUsage: () => {
         void app.#codex?.refresh();
         return app.#planUsage.refresh();
@@ -481,6 +486,25 @@ export class AgentApp {
       now,
       log,
     });
+
+    const codexPath = config.codexEnabled === true ? (Bun.which(config.codexBin ?? 'codex') ?? undefined) : undefined;
+    if (codex !== undefined && codexPath !== undefined && deps.spawnCodexAppServer === undefined) {
+      const spawn = deps.spawnFn;
+      const emitInfo = () => app.#emitMachine({ type: 'machine.info', info: app.machineInfo() });
+      app.#codexUpdate = {
+        updater: new ClaudeUpdater({
+          executable: codexPath,
+          label: 'codex',
+          currentVersion: () => codex.summary().version ?? 'unknown',
+          detectVersion: async () =>
+            codexVersionNumber(await detectClaudeVersion(codexPath, spawn === undefined ? {} : { spawn })),
+          onVersion: (version) => codex.noteUpdated(version),
+          ...(spawn === undefined ? {} : { spawn }),
+          log,
+        }),
+        latest: new CodexLatestChecker({ onChange: emitInfo, now, log }),
+      };
+    }
 
     // ---- 自重启（见 restart.ts）----
     const restartDeps = deps.restart ?? {};
@@ -585,6 +609,8 @@ export class AgentApp {
     this.router.dispose();
     this.#updater.dispose();
     this.#claudeLatest.dispose();
+    this.#codexUpdate?.updater.dispose();
+    this.#codexUpdate?.latest.dispose();
     this.#commandsProbe.dispose();
     this.#planUsage.dispose();
     this.#codex?.dispose();
@@ -660,9 +686,19 @@ export class AgentApp {
       files: this.#filesMaxBytes === undefined ? undefined : { maxBytes: this.#filesMaxBytes },
       engines: [
         claudeEngineSummary(this.claudeVersion),
-        ...(this.#codex === undefined ? [] : [this.#codex.summary()]),
+        ...(this.#codex === undefined ? [] : [this.#codexSummary(this.#codex)]),
       ],
     });
+  }
+
+  #codexSummary(codex: CodexEngine): EngineSummary {
+    const summary = codex.summary();
+    if (this.#codexUpdate === undefined) return summary;
+    return {
+      ...summary,
+      capabilities: { ...summary.capabilities, update: true },
+      latest: this.#codexUpdate.latest.current,
+    };
   }
 
   #restartInfo(): NonNullable<MachineInfo['restart']> {
@@ -832,6 +868,7 @@ export class AgentApp {
    */
   startClaudeLatestChecks(): void {
     this.#claudeLatest.startAuto();
+    this.#codexUpdate?.latest.startAuto();
   }
 
   #emitMachine(body: EventBody): void {

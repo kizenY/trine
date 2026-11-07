@@ -176,9 +176,9 @@ describe('countLiveSessions / liveSessionsLine', () => {
     };
     expect(countLiveSessions(map)).toBe(2);
     expect(countLiveSessions(undefined)).toBe(0);
-    expect(liveSessionsLine(2, 10)).toBe('子进程 2/10');
-    expect(liveSessionsLine(0, 10)).toBe('子进程 0/10');
-    expect(liveSessionsLine(2, undefined)).toBe('子进程 2');
+    expect(liveSessionsLine(2, 10)).toBe('活跃会话 2/10');
+    expect(liveSessionsLine(0, 10)).toBe('活跃会话 0/10');
+    expect(liveSessionsLine(2, undefined)).toBe('活跃会话 2');
     expect(liveSessionsLine(0, undefined)).toBe('');
   });
 });

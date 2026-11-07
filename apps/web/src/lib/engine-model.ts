@@ -118,3 +118,20 @@ export function engineModeLabel(engine: EngineSummary | undefined, modeId: strin
   if (modeId === undefined) return undefined;
   return engine?.modes?.find((m) => m.id === modeId)?.label ?? modeId;
 }
+
+/**
+ * 这个引擎、这个模型能选的推理强度；不能选时为 undefined（不显示这一节）。
+ * 引擎目录里没有的模型（手填的名字）也不知道支持什么，同样不显示。
+ */
+export function effortOptions(
+  engine: Pick<EngineSummary, 'capabilities' | 'models'> | undefined,
+  model: string | undefined,
+): { efforts: readonly string[]; defaultEffort?: string | undefined } | undefined {
+  if (engine?.capabilities.effort !== true) return undefined;
+  const entry =
+    model === undefined || model === '' || model === ENGINE_DEFAULT_MODEL
+      ? engine.models?.find((m) => m.isDefault === true)
+      : engine.models?.find((m) => m.id === model);
+  if (entry?.efforts === undefined || entry.efforts.length === 0) return undefined;
+  return { efforts: entry.efforts, defaultEffort: entry.defaultEffort };
+}

@@ -61,7 +61,10 @@ import type {
 //   MachineInfo 带 files（web 按有无判断）；tool.start / history tool 条目带 filePath
 // - 0.21.0 起 MachineInfo 带 engines（机器上的引擎与能力，web 按有无判断）；session.create /
 //   session.setPermissionMode 可带 engine / engineMode，SessionMeta 可带 engine / engineMode
-export const AGENT_VERSION = '0.21.0';
+// - 0.22.0 起引擎能力多了 effort / update，Codex 支持回退对话、推理强度（session.create 的 effort、
+//   session.setEffort，SessionMeta 带 effort）、压缩和 skills（session.commands.response）；
+//   支持 machine.engine.update.request / machine.engine.check.request
+export const AGENT_VERSION = '0.22.0';
 
 export function buildMachineInfo(input: {
   name: string;

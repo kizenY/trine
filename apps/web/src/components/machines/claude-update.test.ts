@@ -9,7 +9,7 @@ import {
   shortClaudeVersion,
   summarizeClaudeUpdate,
   summarizeClaudeUpdateError,
-  supportsClaudeUpdate,
+  supportsClaudeUpdate, engineLatestView, CODEX_RUNNING_NOTE,
 } from './claude-update.ts';
 
 function res(over: Partial<ClaudeUpdateResult> = {}): ClaudeUpdateResult {
@@ -142,5 +142,26 @@ describe('最新版本（claude-latest）', () => {
     expect(
       summarizeClaudeCheck({ ...base, ok: false, latest: undefined, error: { code: 'failed', message: '检查失败：x' } }),
     ).toEqual({ tone: 'error', title: '检查失败：x' });
+  });
+});
+
+
+describe('其他引擎', () => {
+  test('engineLatestView：能更新才有；按版本号比较', () => {
+    expect(engineLatestView({ capabilities: {} })).toBeNull();
+    expect(engineLatestView({ capabilities: { update: true }, version: '0.166.0', latest: { version: '0.167.0', checkedAt: 5 } })).toEqual({
+      current: '0.166.0',
+      latest: '0.167.0',
+      checkedAt: 5,
+      error: null,
+      updateAvailable: true,
+    });
+    expect(engineLatestView({ capabilities: { update: true }, version: '0.167.0' })?.updateAvailable).toBeNull();
+  });
+  test('结论里用引擎自己的名字和说明', () => {
+    const summary = summarizeClaudeUpdate({ ok: true, fromVersion: '1', toVersion: '2', output: '' }, 'Codex', CODEX_RUNNING_NOTE);
+    expect(summary.title).toBe('Codex 已更新：1 → 2');
+    expect(summary.detail).toBe(CODEX_RUNNING_NOTE);
+    expect(summarizeClaudeCheck({ ok: true, currentVersion: '0.1.0', latest: { version: '0.2.0' } }, 'Codex').title).toBe('Codex 有新版本：0.1.0 → 0.2.0');
   });
 });

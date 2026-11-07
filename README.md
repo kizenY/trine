@@ -62,9 +62,14 @@ the agent runs on your own computer.
 - Runs Codex next to Claude Code when the machine has a signed-in `codex` CLI: start and continue
   sessions (including ones from the CLI or VS Code), streaming, approvals, stop, queued messages,
   model and permission mode, images and files, rename and delete. New sessions pick an engine and
-  the list can filter by it. New Codex sessions default to full access; change it in Settings. Rewind,
-  plan mode, background tasks and cost are Claude-only for now. Set `TRINE_ENGINES=claude` to turn
+  the list can filter by it. New Codex sessions default to full access; change it in Settings. Plan
+  mode, background tasks, cost and restoring files on rewind are Claude-only for now. Set `TRINE_ENGINES=claude` to turn
   Codex off, `TRINE_CODEX_BIN` to choose the executable. Requires agent 0.21.0 or later.
+- With agent 0.22.0 or later, Codex sessions can also rewind the conversation (files are not
+  restored, and the dialog says so), compact with `/compact`, run skills from the `/` menu and choose a
+  reasoning effort. Sub-agent activity shows as tool cards. The machine page has a card per engine, with
+  Codex's version and an update button (`codex update`). The agent checks GitHub for the latest Codex
+  release shortly after start and every 6 hours.
 - Hides temporary sessions by default (working directory under a system temp directory, or
   non-interactive runs such as `claude -p`); a list filter shows them again.
 - Relays tool approval requests and interactive questions to your browser.

@@ -2,7 +2,7 @@ import { describe, expect, test } from 'bun:test';
 import { HistoryItemSchema, MachineInfoSchema, SessionMetaSchema } from '@trine/core';
 import { buildMachineInfo } from '../../app/machine-info.ts';
 import { AppServerClient, AppServerError } from './app-server.ts';
-import { CodexEngine, rateWindows, threadToMeta } from './engine.ts';
+import { CodexEngine, modelFromList, rateWindows, threadToMeta } from './engine.ts';
 import { FakeAppServer, fakeThread, rpcError } from './fake-app-server.ts';
 import { codexItemToHistory, unwrapShellCommand } from './history.ts';
 
@@ -601,5 +601,70 @@ describe('CodexEngine · 写操作', () => {
     await Bun.sleep(20);
     expect(client.running).toBe(false);
     client.dispose();
+  });
+});
+
+
+describe('M4：目录、斜杠菜单、子 agent 卡', () => {
+  test('模型目录带推理强度；取值开放，隐藏模型不要', () => {
+    expect(
+      modelFromList({ id: 'm', displayName: 'M', isDefault: true, defaultReasoningEffort: 'low', supportedReasoningEfforts: [{ reasoningEffort: 'low' }, { reasoningEffort: 'ultra' }] }),
+    ).toEqual({ id: 'm', label: 'M', efforts: ['low', 'ultra'], defaultEffort: 'low', isDefault: true });
+    expect(modelFromList({ id: 'h', hidden: true })).toBeUndefined();
+    expect(modelFromList({ id: 'bare' })).toEqual({ id: 'bare', label: 'bare' });
+    expect(MachineInfoSchema.safeParse({ name: 'n', platform: 'p', osVersion: 'o', agentVersion: '1', claudeVersion: '1', activeSessionCount: 0, engines: [{ id: 'codex', displayName: 'Codex', available: true, capabilities: { effort: true, update: true, rewind: ['conversation'] }, models: [modelFromList({ id: 'm', supportedReasoningEfforts: [{ reasoningEffort: 'ultra' }] })], latest: { version: '1.2.3', checkedAt: 1 } }] }).success).toBe(true);
+  });
+
+  test('斜杠菜单：压缩在前，只列启用的 skill；skills 读不到也有压缩', async () => {
+    const { codex } = engine({
+      'skills/list': () => ({ data: [{ cwd: '/x', errors: [], skills: [
+        { name: 'a', description: 'long', shortDescription: 'short', path: '/x/a', scope: 'repo', enabled: true },
+        { name: 'b', description: 'b', path: '/x/b', scope: 'user', enabled: false },
+      ] }] }),
+    });
+    expect(await codex.slashCommands('/x')).toEqual([
+      { name: 'compact', description: '压缩对话上下文', source: 'user' },
+      { name: 'a', description: 'short', source: 'skill' },
+    ]);
+    const { codex: broken } = engine({});
+    expect((await broken.slashCommands('/x')).map((c) => c.name)).toEqual(['compact']);
+  });
+
+  test('子 agent 操作显示成卡；字段缺失也不报错', () => {
+    const spawn = codexItemToHistory({ type: 'collabAgentToolCall', id: 'c1', tool: 'spawnAgent', status: 'completed', prompt: '查一下', agentsStates: { x: { status: 'completed', message: '查完了' } } }, 5);
+    expect(spawn).toMatchObject({ kind: 'tool', toolName: 'SubAgent', argSummary: '查一下', status: 'ok', resultSummary: 'completed 1', outputPreview: '查完了' });
+    const wait = codexItemToHistory({ type: 'collabAgentToolCall', id: 'c2', tool: 'wait', status: 'completed', prompt: null, agentsStates: { x: { status: 'errored', message: null } } }, 5);
+    expect(wait).toMatchObject({ toolName: 'SubAgent', argSummary: '等待子 agent', status: 'error' });
+    expect(codexItemToHistory({ type: 'collabAgentToolCall', id: 'c3', status: 'interrupted' }, 5)).toMatchObject({ status: 'warn' });
+    expect(codexItemToHistory({ type: 'subAgentActivity', id: 's1', kind: 'completed', agentPath: 'root/a', agentThreadId: 't' }, 5)).toMatchObject({ toolName: 'SubAgent', argSummary: '子 agent 已完成 · root/a', status: 'ok' });
+    expect(HistoryItemSchema.safeParse(spawn).success).toBe(true);
+  });
+
+  test('压缩显示成卡；skill 消息不把名字写两遍', () => {
+    expect(codexItemToHistory({ type: 'contextCompaction', id: 'k' }, 5)).toMatchObject({ kind: 'tool', toolName: 'Compact', status: 'ok' });
+    expect(codexItemToHistory({ type: 'userMessage', id: 'u', content: [{ type: 'text', text: '$a hi' }, { type: 'skill', name: 'a', path: '/a' }] }, 5)).toMatchObject({ text: '$a hi' });
+    expect(codexItemToHistory({ type: 'userMessage', id: 'u', content: [{ type: 'skill', name: 'a', path: '/a' }] }, 5)).toMatchObject({ text: '$a' });
+  });
+
+  test('更新后显示磁盘上的新版本，空闲时换掉进程；有 thread 在用时不动', async () => {
+    const server = new FakeAppServer({
+      'account/read': () => ({ account: { type: 'chatgpt' }, requiresOpenaiAuth: true }),
+      'model/list': () => ({ data: [] }),
+      'account/rateLimits/read': () => ({}),
+      'thread/start': () => ({ thread: { id: 'th' }, model: 'm' }),
+    });
+    const codex = new CodexEngine({ spawn: server.spawn, clientOptions: { idleMs: 60_000 } });
+    await codex.refresh();
+    expect(codex.summary().version).toBe('9.9.9');
+    const session = codex.createSession({ sessionId: 'th', cwd: '/x', model: 'm', permissionMode: 'default', emit: () => {} });
+    codex.noteUpdated('10.0.0');
+    expect(codex.summary().version).toBe('10.0.0');
+    expect(server.killed).toBe(0);
+    await session.close();
+    codex.noteUpdated('10.0.0');
+    expect(server.killed).toBe(1);
+    codex.noteUpdated('unknown');
+    expect(codex.summary().version).toBe('10.0.0');
+    codex.dispose();
   });
 });

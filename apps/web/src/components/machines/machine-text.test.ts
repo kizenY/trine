@@ -34,6 +34,16 @@ describe('机器状态文案', () => {
 
   test('版本缺失显示「未知」（新配对设备等 machine.info 补发时）', () => {
     expect(machineVersionLine(null)).toBe('agent 未知 · claude 未知');
+    expect(
+      machineVersionLine({
+        agentVersion: '0.22.0',
+        claudeVersion: '2.5.1',
+        engines: [
+          { id: 'claude', displayName: 'Claude Code', version: '2.5.1' },
+          { id: 'codex', displayName: 'Codex', version: '0.166.0' },
+        ],
+      }),
+    ).toBe('agent 0.22.0 · claude 2.5.1 · codex 0.166.0');
     expect(machineVersionLine({ agentVersion: '', claudeVersion: '2.5.1' })).toBe(
       'agent 未知 · claude 2.5.1',
     );

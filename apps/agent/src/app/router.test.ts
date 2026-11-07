@@ -232,6 +232,8 @@ async function makeHarness(options: {
   updateClaude?: () => Promise<ClaudeUpdateOutcome>;
   /** 注入 claude 最新版本检查；省略 = router 回「不支持」 */
   checkClaude?: () => Promise<ClaudeCheckOutcome>;
+  updateEngine?: RouterDeps['updateEngine'];
+  checkEngine?: RouterDeps['checkEngine'];
   /** 注入限额用量刷新；省略 = router 回「不支持」 */
   refreshUsage?: () => Promise<PlanUsageRefreshOutcome>;
   /** 注入资源订阅；省略 = router 忽略 machine.stats.request */
@@ -323,6 +325,8 @@ async function makeHarness(options: {
       })),
     ...(options.refreshUsage === undefined ? {} : { refreshUsage: options.refreshUsage }),
     ...(options.checkClaude === undefined ? {} : { checkClaude: options.checkClaude }),
+    ...(options.updateEngine === undefined ? {} : { updateEngine: options.updateEngine }),
+    ...(options.checkEngine === undefined ? {} : { checkEngine: options.checkEngine }),
     ...(options.machineStats === undefined ? {} : { machineStats: options.machineStats }),
     now,
     log: (l) => logs.push(l),
@@ -2699,6 +2703,89 @@ describe('Router · Codex 引擎', () => {
     history: async () => [{ kind: 'assistant' as const, id: 'a', text: 'from codex', ts: 1 }],
     startThread,
   };
+
+  test('斜杠清单来自引擎：不起 Claude 探测', async () => {
+    const h = await makeHarness({
+      codexEngine: { ...codexEngine, slashCommands: async () => [{ name: 'compact', source: 'user' as const }] },
+    });
+    await h.router.handle({ type: 'session.commands.request', ...c2a('codex-1'), reqId: 'c1' }, phone);
+    await h.router.idle();
+    expect(h.byType('session.commands.response')[0]).toMatchObject({ slashCommands: [{ name: 'compact' }] });
+  });
+
+  test('新建带推理强度：记下并传给会话', async () => {
+    const h = await makeHarness({ codexEngine });
+    await h.router.handle(
+      { type: 'session.create', ...c2a(), reqId: 'q', cwd: '/a', model: 'default', permissionMode: 'default', engine: 'codex', effort: 'high' },
+      phone,
+    );
+    expect(h.created[0]!.args).toMatchObject({ effort: 'high' });
+    expect(h.state.sessionParams('codex-new')).toMatchObject({ effort: 'high' });
+  });
+
+  test('推理强度：记下用户的选择，换模型调整后的值也记；不支持的引擎不理', async () => {
+    const h = await makeHarness({ codexEngine });
+    await h.router.handle({ type: 'session.create', ...c2a(), reqId: 'q', cwd: '/a', model: 'default', permissionMode: 'default', engine: 'codex', effort: 'high' }, phone);
+    const fake = h.created[0]! as unknown as { effort?: string | undefined; setEffort?: (e?: string) => Promise<void>; setModel: (m: string) => Promise<void> };
+    await h.router.handle({ type: 'session.setEffort', ...c2a('codex-new'), effort: 'low' }, phone);
+    await h.router.idle();
+    // FakeSession 没有 setEffort，等于旧标签页对不支持的引擎发帧
+    expect(h.state.sessionParams('codex-new')).toMatchObject({ effort: 'high' });
+    fake.effort = 'high';
+    fake.setEffort = async (e) => {
+      fake.effort = e;
+    };
+    await h.router.handle({ type: 'session.setEffort', ...c2a('codex-new'), effort: 'low' }, phone);
+    await h.router.idle();
+    expect(h.state.sessionParams('codex-new')?.effort).toBe('low');
+    fake.effort = 'medium';
+    await h.router.handle({ type: 'session.setModel', ...c2a('codex-new'), model: 'other' }, phone);
+    await h.router.idle();
+    expect(h.state.sessionParams('codex-new')).toMatchObject({ model: 'other', effort: 'medium' });
+    await h.router.handle({ type: 'session.setEffort', ...c2a('codex-new') }, phone);
+    await h.router.idle();
+    expect(h.state.sessionParams('codex-new')?.effort).toBeUndefined();
+  });
+
+  test('换目录后推新目录的斜杠清单', async () => {
+    const asked: string[] = [];
+    const h = await makeHarness({
+      codexEngine: {
+        ...codexEngine,
+        owns: async (id: string) => id === 'codex-1' || id === 'codex-new',
+        slashCommands: async (cwd: string) => {
+          asked.push(cwd);
+          return [{ name: 'compact', source: 'user' as const }];
+        },
+      },
+    });
+    await h.router.handle({ type: 'session.create', ...c2a(), reqId: 'q', cwd: '/a', model: 'default', permissionMode: 'default', engine: 'codex' }, phone);
+    const fake = h.created[0]! as unknown as { setCwd?: (cwd: string) => void };
+    fake.setCwd = () => {};
+    await h.router.handle({ type: 'session.setCwd', ...c2a('codex-new'), cwd: '/b' }, phone);
+    await h.router.idle();
+    expect(asked).toEqual(['/b']);
+    expect(h.byType('session.capabilities')[0]).toMatchObject({ slashCommands: [{ name: 'compact' }] });
+  });
+
+  test('machine.engine.*：链外执行；不支持的引擎如实回失败', async () => {
+    const h = await makeHarness({
+      updateEngine: async (engine: string) =>
+        engine === 'codex' ? { ok: true, fromVersion: '1.0.0', toVersion: '1.1.0', output: 'done', outputTruncated: false } : undefined,
+      checkEngine: async (engine: string) => (engine === 'codex' ? { ok: true as const, version: '1.1.0' } : undefined),
+    });
+    await h.router.handle({ type: 'machine.engine.update.request', ...c2a(), reqId: 'u1', engine: 'codex' }, phone);
+    await h.router.handle({ type: 'machine.engine.update.request', ...c2a(), reqId: 'u2', engine: 'other' }, phone);
+    await h.router.handle({ type: 'machine.engine.check.request', ...c2a(), reqId: 'k1', engine: 'codex' }, phone);
+    await h.router.handle({ type: 'machine.engine.check.request', ...c2a(), reqId: 'k2', engine: 'other' }, phone);
+    await h.router.idle();
+    const updates = h.byType('machine.engine.update.response');
+    expect(updates).toContainEqual(expect.objectContaining({ reqId: 'u1', ok: true, engine: 'codex', toVersion: '1.1.0' }));
+    expect(updates).toContainEqual(expect.objectContaining({ reqId: 'u2', ok: false, error: expect.objectContaining({ code: 'not_found' }) }));
+    const checks = h.byType('machine.engine.check.response');
+    expect(checks).toContainEqual(expect.objectContaining({ reqId: 'k1', ok: true, latest: { version: '1.1.0' } }));
+    expect(checks).toContainEqual(expect.objectContaining({ reqId: 'k2', ok: false, error: expect.objectContaining({ code: 'failed' }) }));
+  });
 
   test('历史走引擎，不读 Claude 转录', async () => {
     const h = await makeHarness({ codexEngine });

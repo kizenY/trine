@@ -48,3 +48,15 @@ describe('rewind-model', () => {
     expect(rewindTouchesFiles('both')).toBe(true);
   });
 });
+
+
+describe('rewindChoices · 引擎能力', () => {
+  test('只支持回退对话的引擎只列这一项，默认选中', () => {
+    const choices = rewindChoices(
+      { conversation: { available: true }, files: { available: false, reason: '没有快照' } } as never,
+      ['conversation'],
+    );
+    expect(choices.map((c) => c.mode)).toEqual(['conversation']);
+    expect(defaultRewindMode(choices)).toBe('conversation');
+  });
+});

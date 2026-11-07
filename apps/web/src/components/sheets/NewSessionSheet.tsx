@@ -22,7 +22,7 @@ import { useEffect, useMemo, useState } from 'react';
 import { useNavigate } from 'react-router';
 import { toast } from 'sonner';
 import { CLAUDE_ENGINE_ID, type PermissionMode } from '@trine/core';
-import { creatableEngines, ENGINE_DEFAULT_MODEL } from '@/lib/engine-model.ts';
+import { creatableEngines, effortOptions, ENGINE_DEFAULT_MODEL } from '@/lib/engine-model.ts';
 import { Button } from '@/components/ui/button.tsx';
 import { Input } from '@/components/ui/input.tsx';
 import { Textarea } from '@/components/ui/textarea.tsx';
@@ -78,6 +78,8 @@ export function NewSessionSheet({
   const [machineId, setMachineId] = useState('');
   const [cwd, setCwd] = useState('');
   const [model, setModel] = useState('');
+  /** undefined = 模型默认 */
+  const [effort, setEffort] = useState<string | undefined>(undefined);
   const [modeState, setModeState] = useState<ModePickerState>(() => initialModeState(defaultMode));
   const [customModel, setCustomModel] = useState('');
   const [creating, setCreating] = useState(false);
@@ -177,6 +179,12 @@ export function NewSessionSheet({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open, engineKey]);
 
+  // 换了模型或引擎：之前选的强度新模型不一定有，回到默认
+  useEffect(() => {
+    setEffort(undefined);
+  }, [engineKey, model]);
+  const efforts = effortOptions(engine, model);
+
   const engineModels = engine?.models;
   const usesCatalog = engineModes !== undefined;
   const modelChips = useMemo(() => {
@@ -203,6 +211,7 @@ export function NewSessionSheet({
         permissionMode: modeState.value,
         ...(engine === undefined || engine.id === CLAUDE_ENGINE_ID ? {} : { engine: engine.id }),
         ...(engineMode.value === undefined || !usesCatalog ? {} : { engineMode: engineMode.value }),
+        ...(effort === undefined || efforts === undefined ? {} : { effort }),
       });
       const from = startAvailable ? start : null;
       if (from?.link !== undefined) await linkNewSession(meta.sessionId, from);
@@ -377,6 +386,22 @@ export function NewSessionSheet({
                   </Button>
                 </div>
               </section>
+
+              {efforts !== undefined && (
+                <section>
+                  <Label>推理强度</Label>
+                  <div className="flex flex-wrap gap-1.5">
+                    <Chip data-testid="ns-effort" selected={effort === undefined} onClick={() => setEffort(undefined)}>
+                      默认{efforts.defaultEffort === undefined ? '' : ` (${efforts.defaultEffort})`}
+                    </Chip>
+                    {efforts.efforts.map((e) => (
+                      <Chip key={e} data-testid="ns-effort" selected={effort === e} onClick={() => setEffort(e)} className="font-mono">
+                        {e}
+                      </Chip>
+                    ))}
+                  </div>
+                </section>
+              )}
 
               <section>
                 <Label>权限模式</Label>

@@ -34,6 +34,7 @@ export function RewindDialog({
   messageText,
   loadPreview,
   onConfirm,
+  supportedModes,
 }: {
   open: boolean;
   onOpenChange: (open: boolean) => void;
@@ -43,6 +44,8 @@ export function RewindDialog({
   loadPreview: () => Promise<RewindPreviewResult>;
   /** 确认回退；resolve 后对话框由调用方关掉，reject 的 message 原样展示 */
   onConfirm: (mode: RewindMode) => Promise<void>;
+  /** 引擎支持的模式（capabilities.rewind）；省略 = 全部 */
+  supportedModes?: readonly RewindMode[] | undefined;
 }): React.JSX.Element {
   const [state, setState] = useState<PreviewState>({ kind: 'loading' });
   const [mode, setMode] = useState<RewindMode | undefined>(undefined);
@@ -61,7 +64,7 @@ export function RewindDialog({
       (preview) => {
         if (cancelled) return;
         setState({ kind: 'ready', preview });
-        setMode(defaultRewindMode(rewindChoices(preview)));
+        setMode(defaultRewindMode(rewindChoices(preview, supportedModes)));
       },
       (err: unknown) => {
         if (!cancelled) setState({ kind: 'error', message: err instanceof Error ? err.message : String(err) });
@@ -70,11 +73,15 @@ export function RewindDialog({
     return () => {
       cancelled = true;
     };
+    // supportedModes 每次渲染可能是新数组，内容只随引擎变，不能因此重新预览
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open, loadPreview]);
 
-  const choices = state.kind === 'ready' ? rewindChoices(state.preview) : [];
+  /** 不能还原文件的引擎：对话框要写明文件不会变 */
+  const conversationOnly = supportedModes !== undefined && !supportedModes.includes('code');
+  const choices = state.kind === 'ready' ? rewindChoices(state.preview, supportedModes) : [];
   const files = state.kind === 'ready' ? state.preview.files : undefined;
-  const summary = filesSummary(files);
+  const summary = conversationOnly ? undefined : filesSummary(files);
   const listed = files?.available === true ? (files.filesChanged ?? []) : [];
   const text = state.kind === 'ready' ? (state.preview.text ?? messageText) : messageText;
   const canConfirm = !busy && state.kind === 'ready' && mode !== undefined;
@@ -101,7 +108,7 @@ export function RewindDialog({
 
         {state.kind === 'loading' && (
           <p data-testid="rewind-dialog-loading" className="text-text-3 text-sm motion-safe:animate-pulse">
-            正在读取文件快照…
+            {conversationOnly ? '正在读取对话…' : '正在读取文件快照…'}
           </p>
         )}
         {state.kind === 'error' && (
@@ -156,9 +163,15 @@ export function RewindDialog({
               </div>
             )}
 
-            <p className="text-text-3 text-[12px]">
-              只能还原 Claude 用编辑工具改过的文件；Bash 命令和手工做的改动不会被还原。
-            </p>
+            {conversationOnly ? (
+              <p data-testid="rewind-dialog-note" className="text-amber text-[12px]">
+                只撤掉对话，已经改动的文件不会还原。如需还原文件请自己处理。
+              </p>
+            ) : (
+              <p data-testid="rewind-dialog-note" className="text-text-3 text-[12px]">
+                只能还原 Claude 用编辑工具改过的文件；Bash 命令和手工做的改动不会被还原。
+              </p>
+            )}
           </div>
         )}
 

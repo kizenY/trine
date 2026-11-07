@@ -171,7 +171,7 @@ export function PlanUsageRefreshButton({ machine }: { machine: MachineState }): 
       size="icon-xs"
       variant="ghost"
       data-testid="plan-usage-refresh"
-      title="刷新用量（没有活跃会话时会临时启动一次 claude）"
+      title="刷新用量（Claude 没有活跃会话时会临时启动一次）"
       aria-label="刷新用量"
       disabled={refreshing || machine.online === false}
       onClick={refresh}

@@ -181,6 +181,8 @@ export interface ClaudeUpdateOutcome {
 export interface ClaudeUpdaterOptions {
   /** 解析出的可执行文件；undefined → 一律回 not_found */
   executable: string | undefined;
+  /** 文案和日志里的名字；默认 claude */
+  label?: string;
   /** agent 当前记着的版本（busy / not_found 时原样回报，探测失败时兜底） */
   currentVersion: () => string;
   /** 更新跑完（无论成败）后重新探测到的版本；app 据此刷新 claudeVersion 并广播 machine.info */
@@ -225,39 +227,41 @@ export class ClaudeUpdater {
     const executable = this.#opts.executable;
     const current = this.#opts.currentVersion();
     if (this.#running) {
-      return this.#refuse(current, 'busy', '已有一次 claude 更新在进行中，请等它结束');
+      return this.#refuse(current, 'busy', `已有一次 ${this.#label} 更新在进行中，请等它结束`);
     }
     if (executable === undefined) {
       return this.#refuse(
         current,
         'not_found',
-        '未找到全局 claude：会话正在用 SDK 内置版本，无法更新（可用 --claude-bin 指定路径）',
+        this.#opts.label === undefined
+          ? '未找到全局 claude：会话正在用 SDK 内置版本，无法更新（可用 --claude-bin 指定路径）'
+          : `未找到 ${this.#label} 可执行文件，无法更新`,
       );
     }
     // 置位必须在任何 await 之前：同一宏任务里的第二个请求要看到它
     this.#running = true;
     try {
       const fromVersion = await this.#detect(current);
-      this.#log(`[claude] 开始更新 ${executable}（当前 ${fromVersion}）`);
+      this.#log(`[${this.#label}] 开始更新 ${executable}（当前 ${fromVersion}）`);
       const run = await this.#exec(executable);
       const toVersion = await this.#detect('unknown');
       if (!this.#disposed) this.#opts.onVersion?.(toVersion);
       const { text, truncated } = tailOutput(run.raw);
       const base = { fromVersion, toVersion, output: text, outputTruncated: truncated || run.rawTruncated };
-      this.#log(`[claude] 更新结束 ${run.kind}${run.kind === 'exit' ? ` code=${run.code}` : ''}：${fromVersion} → ${toVersion}`);
+      this.#log(`[${this.#label}] 更新结束 ${run.kind}${run.kind === 'exit' ? ` code=${run.code}` : ''}：${fromVersion} → ${toVersion}`);
       switch (run.kind) {
         case 'exit':
           return run.code === 0
             ? { ok: true, ...base }
-            : { ok: false, ...base, error: { code: 'failed', message: `claude update 退出码 ${run.code}` } };
+            : { ok: false, ...base, error: { code: 'failed', message: `${this.#label} update 退出码 ${run.code}` } };
         case 'timeout':
           return {
             ok: false,
             ...base,
-            error: { code: 'timeout', message: `claude update 超过 ${Math.round(this.#timeoutMs / 1000)}s 未结束，已终止` },
+            error: { code: 'timeout', message: `${this.#label} update 超过 ${Math.round(this.#timeoutMs / 1000)}s 未结束，已终止` },
           };
         case 'spawn_error':
-          return { ok: false, ...base, error: { code: 'failed', message: `无法启动 claude update：${run.message}` } };
+          return { ok: false, ...base, error: { code: 'failed', message: `无法启动 ${this.#label} update：${run.message}` } };
       }
     } finally {
       this.#running = false;
@@ -269,6 +273,10 @@ export class ClaudeUpdater {
   dispose(): void {
     this.#disposed = true;
     this.#current?.kill('SIGTERM');
+  }
+
+  get #label(): string {
+    return this.#opts.label ?? 'claude';
   }
 
   get #timeoutMs(): number {

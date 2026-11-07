@@ -746,3 +746,288 @@ describe('toUserInput', () => {
     expect(toUserInput('hi', [{ type: 'mystery' }] as never)).toEqual([{ type: 'text', text: 'hi', text_elements: [] }]);
   });
 });
+
+
+describe('CodexSession · 压缩', () => {
+  test('/compact 走 thread/compact/start，不发 turn/start；一轮结束后正常收尾', async () => {
+    const h = harness({ routes: { 'thread/compact/start': () => ({}) } });
+    h.session.send('c1', '/compact ');
+    await h.flush();
+    expect(h.callsOf('thread/compact/start')).toHaveLength(1);
+    expect(h.callsOf('turn/start')).toHaveLength(0);
+    expect(h.of('user.message')[0]).toMatchObject({ messageId: 'c1', text: '/compact ' });
+    h.notify('turn/started', { turn: { id: 'compact-turn' } });
+    h.notify('item/started', { item: { type: 'contextCompaction', id: 'k1' } });
+    h.notify('item/completed', { item: { type: 'contextCompaction', id: 'k1' } });
+    await h.finish('compact-turn');
+    expect(h.of('tool.start')[0]).toMatchObject({ toolName: 'Compact' });
+    expect(h.of('tool.end')[0]).toMatchObject({ toolUseId: 'k1', status: 'ok' });
+    expect(h.of('run.done')).toHaveLength(1);
+    expect(h.session.state).toBe('idle');
+    // 命令不能当标题
+    expect(h.session.meta().firstPrompt).toBeUndefined();
+  });
+
+  test('压缩进行中发的消息排队，压缩结束才 turn/start（Codex 会拒绝并行）', async () => {
+    const h = harness({ routes: { 'thread/compact/start': () => ({}) } });
+    h.session.send('c1', '/compact');
+    await h.flush();
+    h.session.send('c2', 'next');
+    await h.flush();
+    expect(h.callsOf('turn/start')).toHaveLength(0);
+    h.notify('turn/started', { turn: { id: 'compact-turn' } });
+    await h.finish('compact-turn');
+    expect(h.callsOf('turn/start')).toHaveLength(1);
+  });
+
+  test('压缩中可以停止：turn id 来自 turn/started', async () => {
+    const h = harness({ routes: { 'thread/compact/start': () => ({}) } });
+    h.session.send('c1', '/compact');
+    await h.flush();
+    h.notify('turn/started', { turn: { id: 'compact-turn' } });
+    await h.session.stop();
+    expect(h.callsOf('turn/interrupt')[0]?.params).toMatchObject({ turnId: 'compact-turn' });
+  });
+
+  test('turn/started 之前点的停止：等 id 到了补发中断', async () => {
+    const h = harness({ routes: { 'thread/compact/start': () => ({}) } });
+    h.session.send('c1', '/compact');
+    await h.flush();
+    await h.session.stop();
+    expect(h.callsOf('turn/interrupt')).toHaveLength(0);
+    h.notify('turn/started', { turn: { id: 'compact-turn' } });
+    await h.flush();
+    expect(h.callsOf('turn/interrupt')[0]?.params).toMatchObject({ turnId: 'compact-turn' });
+  });
+
+  test('带参数或附件的不是压缩命令', async () => {
+    const h = harness({ routes: { 'thread/compact/start': () => ({}) } });
+    h.session.send('c1', '/compact 只保留结论');
+    await h.flush();
+    expect(h.callsOf('thread/compact/start')).toHaveLength(0);
+    expect(h.callsOf('turn/start')).toHaveLength(1);
+    const withFile = harness({ routes: { 'thread/compact/start': () => ({}) } });
+    withFile.session.send('c1', '/compact', {
+      content: '/compact\n\n附件：/synthetic/a.txt',
+      attachments: [{ blobId: 'b', name: 'a.txt', mimeType: 'text/plain', size: 1 }],
+    } as never);
+    await withFile.flush();
+    expect(withFile.callsOf('thread/compact/start')).toHaveLength(0);
+    expect(withFile.callsOf('turn/start')).toHaveLength(1);
+  });
+
+  test('压缩失败按这一轮失败处理，不会卡在运行中', async () => {
+    const h = harness({
+      routes: {
+        'thread/compact/start': () => {
+          throw new Error('compact boom');
+        },
+      },
+    });
+    h.session.send('c1', '/compact');
+    await h.flush();
+    expect(h.of('error.fatal')[0]).toMatchObject({ message: expect.stringContaining('compact boom') });
+    expect(h.session.state).toBe('error');
+  });
+});
+
+describe('CodexSession · skills', () => {
+  const routes = {
+    'skills/list': () => ({
+      data: [
+        {
+          cwd: '/synthetic',
+          errors: [],
+          skills: [
+            { name: 'review', description: 'd', path: '/synthetic/.agents/skills/review/SKILL.md', scope: 'repo', enabled: true },
+            { name: 'off', description: 'd', path: '/synthetic/off/SKILL.md', scope: 'repo', enabled: false },
+          ],
+        },
+      ],
+    }),
+  };
+  const inputOf = (h: ReturnType<typeof harness>) => (h.callsOf('turn/start')[0]?.params as { input: unknown[] }).input;
+
+  test('/name 和 $name 都按 Codex 的形式调用', async () => {
+    for (const text of ['/review 看看这个', '$review 看看这个']) {
+      const h = harness({ routes });
+      h.session.send('c1', text);
+      await h.flush();
+      expect(inputOf(h)).toEqual([
+        { type: 'text', text: '$review 看看这个', text_elements: [] },
+        { type: 'skill', name: 'review', path: '/synthetic/.agents/skills/review/SKILL.md' },
+      ]);
+    }
+  });
+
+  test('不是 skill、已禁用、路径、列表读不到：都原样发', async () => {
+    for (const text of ['/nope hi', '/off hi', '/tmp/review hi', 'review hi']) {
+      const h = harness({ routes });
+      h.session.send('c1', text);
+      await h.flush();
+      expect(inputOf(h)).toEqual([{ type: 'text', text, text_elements: [] }]);
+    }
+    const broken = harness({
+      routes: {
+        'skills/list': () => {
+          throw new Error('boom');
+        },
+      },
+    });
+    broken.session.send('c1', '/review hi');
+    await broken.flush();
+    expect(inputOf(broken)).toEqual([{ type: 'text', text: '/review hi', text_elements: [] }]);
+  });
+
+  test('普通消息不查 skill 列表', async () => {
+    const h = harness({ routes });
+    h.session.send('c1', 'hello');
+    await h.flush();
+    expect(h.callsOf('skills/list')).toHaveLength(0);
+  });
+});
+
+describe('CodexSession · 推理强度', () => {
+  const models = {
+    'account/read': () => ({ account: { type: 'chatgpt' }, requiresOpenaiAuth: true }),
+    'model/list': () => ({
+      data: [
+        { id: 'gpt-x', displayName: 'X', hidden: false, isDefault: true, defaultReasoningEffort: 'medium', supportedReasoningEfforts: [{ reasoningEffort: 'low' }, { reasoningEffort: 'medium' }, { reasoningEffort: 'ultra' }] },
+        { id: 'gpt-y', displayName: 'Y', hidden: false, isDefault: false, defaultReasoningEffort: 'low', supportedReasoningEfforts: [{ reasoningEffort: 'low' }] },
+      ],
+    }),
+  };
+
+  test('没选过就不传；选了之后每轮都带', async () => {
+    const h = harness({ routes: models });
+    await h.engine.refresh();
+    h.session.send('c1', 'one');
+    await h.flush();
+    expect(h.callsOf('turn/start')[0]?.params).not.toHaveProperty('effort');
+    await h.finish();
+    await h.session.setEffort('ultra');
+    expect(h.session.meta().effort).toBe('ultra');
+    h.session.send('c2', 'two');
+    await h.flush();
+    expect(h.callsOf('turn/start')[1]?.params).toMatchObject({ effort: 'ultra' });
+  });
+
+  test('「默认」写成模型默认值：不传撤销不了之前的选择', async () => {
+    const h = harness({ routes: models });
+    await h.engine.refresh();
+    await h.session.setEffort('ultra');
+    await h.session.setEffort(undefined);
+    expect(h.session.meta().effort).toBe('medium');
+  });
+
+  test('模型不支持的强度不采用；换到不支持当前强度的模型回到它的默认值', async () => {
+    const h = harness({ routes: models });
+    await h.engine.refresh();
+    await h.session.setEffort('low');
+    await h.session.setEffort('nonsense');
+    expect(h.session.meta().effort).toBe('low');
+    await h.session.setEffort('ultra');
+    await h.session.setModel('gpt-y');
+    expect(h.session.meta().effort).toBe('low');
+  });
+
+  test('续接时如实显示 thread 自己的强度，但不拿它覆盖', async () => {
+    const h = harness({
+      resume: true,
+      routes: { 'thread/resume': () => ({ approvalPolicy: 'on-request', sandbox: { type: 'workspaceWrite' }, model: 'm', reasoningEffort: 'xhigh' }) },
+    });
+    h.session.send('c1', 'hi');
+    await h.flush();
+    expect(h.session.meta().effort).toBe('xhigh');
+    expect(h.session.effort).toBeUndefined();
+    expect(h.callsOf('turn/start')[0]?.params).not.toHaveProperty('effort');
+  });
+});
+
+describe('CodexSession · 回退', () => {
+  const items = [
+    { turnId: 't1', item: { type: 'userMessage', id: 'u1', clientId: 'c1', content: [{ type: 'text', text: '第一条' }] } },
+    { turnId: 't1', item: { type: 'agentMessage', id: 'a1', text: 'ok' } },
+    { turnId: 't2', item: { type: 'userMessage', id: 'u2', clientId: 'c2', content: [{ type: 'text', text: '第二条' }] } },
+    { turnId: 't2', item: { type: 'userMessage', id: 'u3', content: [{ type: 'text', text: '追加' }] } },
+  ];
+  const routes = { 'thread/items/list': () => ({ data: items, nextCursor: null }), 'thread/revert': () => ({ thread: {} }) };
+
+  test('预览不加载 thread、不改东西；文件部分明确不可用', async () => {
+    const h = harness({ resume: true, routes });
+    const preview = await h.session.previewThreadRewind('c2');
+    expect(preview).toMatchObject({ ok: true, text: '第二条', conversation: { available: true }, files: { available: false } });
+    expect(h.callsOf('thread/resume')).toHaveLength(0);
+    expect(h.callsOf('thread/revert')).toHaveLength(0);
+  });
+
+  test('按 clientId 或 item id 都能定位；回退前先加载 thread，广播全部 id', async () => {
+    const h = harness({ resume: true, routes });
+    const done = await h.session.rewindThread('c2', 'conversation');
+    expect(h.callsOf('thread/resume')).toHaveLength(1);
+    expect(h.callsOf('thread/revert')[0]?.params).toEqual({ threadId: THREAD, beforeTurnId: 't2' });
+    expect(done).toMatchObject({ ok: true, text: '第二条', rewound: { mode: 'conversation', targetMessageIds: ['c2', 'u2'] } });
+    const byItemId = harness({ routes });
+    expect(await byItemId.session.rewindThread('u1', 'conversation')).toMatchObject({ ok: true, rewound: { targetMessageIds: ['u1', 'c1'] } });
+    expect(byItemId.callsOf('thread/revert')[0]?.params).toMatchObject({ beforeTurnId: 't1' });
+  });
+
+  test('还原文件的模式一律拒绝，绝不调 revert（旧标签页）', async () => {
+    const h = harness({ routes });
+    for (const mode of ['both', 'code'] as const) {
+      expect(await h.session.rewindThread('c2', mode)).toMatchObject({ ok: false, error: { code: 'unavailable' } });
+    }
+    expect(h.callsOf('thread/revert')).toHaveLength(0);
+  });
+
+  test('一轮中追加的消息不能作为回退点：整轮都会被撤掉', async () => {
+    const h = harness({ routes });
+    expect(await h.session.rewindThread('u3', 'conversation')).toMatchObject({ ok: false, error: { code: 'invalid' } });
+    expect(h.callsOf('thread/revert')).toHaveLength(0);
+  });
+
+  test('找不到、运行中、有排队：拒绝', async () => {
+    const h = harness({ routes });
+    expect(await h.session.rewindThread('nope', 'conversation')).toMatchObject({ ok: false, error: { code: 'not_found' } });
+    h.session.send('c9', 'run');
+    await h.flush();
+    expect(await h.session.rewindThread('c1', 'conversation')).toMatchObject({ ok: false, error: { code: 'busy' } });
+    expect(await h.session.previewThreadRewind('c1')).toMatchObject({ ok: false, error: { code: 'busy' } });
+    h.session.send('c10', 'queued');
+    await h.finish();
+    await h.flush();
+    expect(h.callsOf('thread/revert')).toHaveLength(0);
+  });
+
+  test('等待期间实例被回收：不再加载、不再回退', async () => {
+    const h = harness({ resume: true, routes });
+    const pending = h.session.rewindThread('c1', 'conversation');
+    await h.session.close();
+    expect(await pending).toMatchObject({ ok: false, error: { code: 'busy' } });
+    expect(h.callsOf('thread/resume')).toHaveLength(0);
+    expect(h.callsOf('thread/revert')).toHaveLength(0);
+  });
+
+  test('legacy thread（-32601）说明不支持；revert 失败把原因带回来', async () => {
+    const legacy = harness({
+      routes: {
+        'thread/items/list': () => {
+          throw Object.assign(new Error('not supported yet'), { code: -32601 });
+        },
+      },
+    });
+    expect(await legacy.session.previewThreadRewind('c1')).toMatchObject({ ok: false, error: { code: 'unavailable' } });
+    const writer = harness({
+      routes: {
+        ...routes,
+        'thread/revert': () => {
+          throw new Error('already has an active writer');
+        },
+      },
+    });
+    expect(await writer.session.rewindThread('c1', 'conversation')).toMatchObject({
+      ok: false,
+      error: { code: 'io', message: expect.stringContaining('active writer') },
+    });
+  });
+});

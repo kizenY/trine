@@ -14,10 +14,14 @@ import type {
   ContextUsage,
   PermissionMode,
   PermissionOption,
+  RewindErrorCode,
+  RewindMode,
   SessionState,
 } from '@trine/core';
+import type { RewindDone, RewindFailure, RewindPreview } from '../../app/rewind.ts';
 import type { PreparedInput } from '../../bridge/attachments.ts';
 import { Heartbeat } from '../../bridge/heartbeat.ts';
+import { AppServerError } from './app-server.ts';
 import type { PendingPermissionSnapshot, PermissionVerdict } from '../../bridge/permission.ts';
 import { InputQueue } from '../../bridge/queue.ts';
 import type { SessionRuntimeMeta, StopBgTaskResult } from '../../bridge/session.ts';
@@ -51,6 +55,19 @@ export interface CodexSessionClient {
   attach(threadId: string, session: CodexSessionEvents): void;
   /** 只解绑自己：回收等待期间可能已经建了新实例。返回是否真的解绑了 */
   detach(threadId: string, session: CodexSessionEvents): boolean;
+  /** thread 的全部 item（旧的在前），带 turnId */
+  readItems(threadId: string): Promise<unknown[]>;
+  /** 这个目录下能用的 skill */
+  skills(cwd: string): Promise<CodexSkill[]>;
+  /** 模型支持的推理强度；模型目录还没拿到或没有这个模型时为 undefined */
+  effortsOf(model: string): { efforts: readonly string[]; defaultEffort?: string | undefined } | undefined;
+}
+
+export interface CodexSkill {
+  name: string;
+  description: string;
+  path: string;
+  scope: string;
 }
 
 export interface CodexSessionEvents {
@@ -66,6 +83,7 @@ export interface CodexSessionOptions {
   model: string;
   permissionMode: PermissionMode;
   engineMode?: string | undefined;
+  effort?: string | undefined;
   /** true = 磁盘上已有的 thread，要先 thread/resume；false = 刚 thread/start 的，已加载 */
   resume: boolean;
   client: CodexSessionClient;
@@ -106,6 +124,17 @@ function errorKind(info: unknown): 'quota' | 'auth' | 'config' | 'other' {
   if (info === 'unauthorized') return 'auth';
   if (info === 'modelNotFound' || info === 'badRequest') return 'config';
   return 'other';
+}
+
+/** 压缩不是消息：Codex 有单独的接口。带参数时当普通消息，因为接口不接受压缩指引 */
+const COMPACT_COMMAND = '/compact';
+/** 消息开头的 `/name` 或 `$name`（路径如 /tmp/x 不算：名字后面必须是空白或结尾） */
+const SKILL_INVOCATION = /^[/$]([A-Za-z0-9_:.-]+)(?=\s|$)/;
+/** thread 级错误里表示「旧格式 thread 没有这个接口」 */
+const METHOD_NOT_FOUND = -32601;
+
+function rewindFail(code: RewindErrorCode, message: string): RewindFailure {
+  return { ok: false, error: { code, message: toSingleLine(message, 300) } };
 }
 
 /** 带附件的内容（Claude 的内容块）→ Codex 的 UserInput */
@@ -161,6 +190,10 @@ export class CodexSession implements EngineSession, CodexSessionEvents {
   /** thread 自己的设置对应哪一档，只用来显示 */
   #reportedMode: CodexModeId | undefined;
   #legacyMode: PermissionMode;
+  /** 用户明确选的推理强度，才会传给 Codex 覆盖 */
+  #effort: string | undefined;
+  /** thread 自己的推理强度，只用来显示 */
+  #reportedEffort: string | undefined;
   #context: ContextUsage | undefined;
   #loaded: boolean;
   #lastActivityAt: number;
@@ -191,6 +224,7 @@ export class CodexSession implements EngineSession, CodexSessionEvents {
     this.#model = options.model;
     this.#mode = isCodexMode(options.engineMode) ? options.engineMode : undefined;
     this.#legacyMode = this.#mode === undefined ? options.permissionMode : legacyFromMode(this.#mode);
+    this.#effort = this.#supportedEffort(options.effort);
     this.#loaded = !options.resume;
     this.#lastActivityAt = this.#now();
     this.#client.attach(this.sessionId, this);
@@ -217,6 +251,10 @@ export class CodexSession implements EngineSession, CodexSessionEvents {
   get permissionMode(): PermissionMode {
     return this.#legacyMode;
   }
+  /** 用户选的推理强度，要持久化的是它；thread 自己的只显示（meta().effort），不能变成覆盖 */
+  get effort(): string | undefined {
+    return this.#effort;
+  }
 
   meta(): SessionRuntimeMeta {
     return {
@@ -228,6 +266,7 @@ export class CodexSession implements EngineSession, CodexSessionEvents {
       model: this.#model,
       permissionMode: this.#legacyMode,
       ...((this.#mode ?? this.#reportedMode) === undefined ? {} : { engineMode: (this.#mode ?? this.#reportedMode)! }),
+      ...((this.#effort ?? this.#reportedEffort) === undefined ? {} : { effort: (this.#effort ?? this.#reportedEffort)! }),
       ...(this.#state === 'waiting_permission' && this.#pending.size > 0 ? { waitingFor: 'permission' as const } : {}),
       ...(this.#context === undefined ? {} : { context: this.#context }),
       ...(this.#firstPrompt === undefined ? {} : { firstPrompt: this.#firstPrompt }),
@@ -277,8 +316,10 @@ export class CodexSession implements EngineSession, CodexSessionEvents {
     this.#turnStartedAt = this.#now();
     this.#toolCount = 0;
     this.#permissionCount = 0;
-    this.#firstPrompt ??= toSingleLine(next.text);
     const attachments = this.#attachments.get(next.clientMsgId) ?? [];
+    // 带附件就是普通消息：压缩接口不接受输入，附件会被吞掉
+    const compact = next.text.trim() === COMPACT_COMMAND && attachments.length === 0;
+    if (!compact) this.#firstPrompt ??= toSingleLine(next.text);
     this.#attachments.delete(next.clientMsgId);
     this.#emit({
       type: 'user.message',
@@ -294,13 +335,23 @@ export class CodexSession implements EngineSession, CodexSessionEvents {
     try {
       await this.#ensureLoaded();
       if (stale()) return;
+      if (compact) {
+        // 回 {}，这一轮的 id 从 turn/started 来；之后和普通一轮一样以 turn/completed 结束
+        await this.#client.call('thread/compact/start', { threadId: this.sessionId });
+        if (stale()) return;
+        if (this.#stopping) await this.#interrupt();
+        return;
+      }
+      const input = await this.#withSkill(toUserInput(next.text, next.content));
+      if (stale()) return;
       const result = await this.#client.call('turn/start', {
         threadId: this.sessionId,
         clientUserMessageId: next.clientMsgId,
         cwd: this.#cwd,
-        input: toUserInput(next.text, next.content),
+        input,
         approvalsReviewer: 'user',
         ...(this.#model === CODEX_DEFAULT_MODEL || this.#model === '' ? {} : { model: this.#model }),
+        ...(this.#effort === undefined ? {} : { effort: this.#effort }),
         ...(this.#mode === undefined ? {} : turnModeParams(this.#mode)),
       });
       if (stale()) return;
@@ -314,6 +365,30 @@ export class CodexSession implements EngineSession, CodexSessionEvents {
       if (stale()) return;
       this.#failTurn('other', err instanceof Error ? err.message : String(err));
     }
+  }
+
+  /**
+   * 消息以 `/name` 或 `$name` 开头且 name 是这个目录下的 skill：按 Codex 的形式调用，文本写成
+   * `$name …` 并带上 skill 条目。读不到 skill 列表或没有这个 skill 就原样当普通消息发。
+   */
+  async #withSkill(input: unknown[]): Promise<unknown[]> {
+    const first = input.find((part): part is Rec => isRecord(part) && part['type'] === 'text');
+    const text = first === undefined ? undefined : str(first['text']);
+    const match = text === undefined ? null : SKILL_INVOCATION.exec(text);
+    if (first === undefined || text === undefined || match === null) return input;
+    const name = match[1]!;
+    const skills = await this.#client.skills(this.#cwd).catch((): CodexSkill[] => []);
+    const skill = skills.find((s) => s.name === name);
+    if (skill === undefined) return input;
+    first['text'] = `$${name}${text.slice(match[0].length)}`;
+    return [...input, { type: 'skill', name: skill.name, path: skill.path }];
+  }
+
+  /** 这个模型支持才用；模型目录没拿到时信任调用方（不支持的话 Codex 会在 turn/start 报错并显示） */
+  #supportedEffort(effort: string | undefined): string | undefined {
+    if (effort === undefined) return undefined;
+    const catalog = this.#client.effortsOf(this.#model);
+    return catalog === undefined || catalog.efforts.includes(effort) ? effort : undefined;
   }
 
   async #ensureLoaded(): Promise<void> {
@@ -333,6 +408,7 @@ export class CodexSession implements EngineSession, CodexSessionEvents {
       this.#reportedMode = modeFromThreadResponse(response);
       if (this.#reportedMode !== undefined) this.#legacyMode = legacyFromMode(this.#reportedMode);
     }
+    this.#reportedEffort = isRecord(response) ? str(response['reasoningEffort']) : undefined;
     if (isRecord(response) && typeof response['model'] === 'string' && response['model'] !== '') {
       this.#model = response['model'];
     }
@@ -345,6 +421,8 @@ export class CodexSession implements EngineSession, CodexSessionEvents {
         const turn = params['turn'];
         const id = isRecord(turn) ? str(turn['id']) : undefined;
         if (id !== undefined) this.#turnId = id;
+        // 压缩的 turn id 只从这里来：之前点的停止当时没有 id 可中断，这里补上
+        if (this.#stopping && this.#running) void this.#interrupt();
         return;
       }
       case 'item/agentMessage/delta': {
@@ -672,9 +750,86 @@ export class CodexSession implements EngineSession, CodexSessionEvents {
   async setModel(model: string): Promise<void> {
     this.#touch();
     this.#model = model;
+    // 新模型不支持当前强度：回到它的默认值，否则之后每一轮都会被拒绝
+    if (this.#effort !== undefined && this.#supportedEffort(this.#effort) === undefined) {
+      this.#effort = this.#client.effortsOf(model)?.defaultEffort;
+    }
     this.#onMeta?.(this.meta());
   }
 
+  async setEffort(effort: string | undefined): Promise<void> {
+    this.#touch();
+    // turn/start 的 effort 对后续轮次都生效，不传不能撤销之前的选择，所以「默认」要写成具体值
+    this.#effort = effort === undefined ? this.#client.effortsOf(this.#model)?.defaultEffort : (this.#supportedEffort(effort) ?? this.#effort);
+    if (effort === undefined && this.#effort === undefined) this.#reportedEffort = undefined;
+    this.#onMeta?.(this.meta());
+  }
+
+  #rewindBusy(): string | undefined {
+    if (this.#running || this.#pending.size > 0) return '这一轮还在进行，等它结束或先停止';
+    if (this.#queue.length > 0) return '还有排队的消息，先撤回或等它们发完';
+    return undefined;
+  }
+
+  /** 在 thread 的 item 里找到目标消息所在的轮；被撤掉的是整轮，所以它必须是这一轮的第一条用户消息 */
+  async #locateTurn(targetMessageId: string): Promise<{ ok: true; turnId: string; text: string; ids: string[] } | RewindFailure> {
+    let items: unknown[];
+    try {
+      items = await this.#client.readItems(this.sessionId);
+    } catch (err) {
+      if (err instanceof AppServerError && err.code === METHOD_NOT_FOUND) {
+        return rewindFail('unavailable', '这个会话是旧格式（legacy thread），Codex 不支持回退它');
+      }
+      return rewindFail('io', `读取会话失败：${err instanceof Error ? err.message : String(err)}`);
+    }
+    const users = items.filter((item): item is Rec => isRecord(item) && item['type'] === 'userMessage');
+    const target = users.find((item) => item['id'] === targetMessageId || item['clientId'] === targetMessageId);
+    if (target === undefined) return rewindFail('not_found', '对话里找不到这条消息（可能已经被回退）');
+    const turnId = str(target['turnId']);
+    if (turnId === undefined) return rewindFail('unavailable', 'Codex 没有给出这条消息所在的轮次');
+    if (users.find((item) => item['turnId'] === turnId) !== target) {
+      return rewindFail('invalid', '这条消息是在一轮进行中追加的，只能回退到这一轮的开头');
+    }
+    const converted = codexItemToHistory(target, 0);
+    const ids = [targetMessageId, str(target['id']), str(target['clientId'])].filter((id) => id !== undefined);
+    return { ok: true, turnId, text: converted?.kind === 'user' ? converted.text : '', ids: [...new Set(ids)] };
+  }
+
+  async previewThreadRewind(targetMessageId: string): Promise<RewindPreview | RewindFailure> {
+    const busy = this.#rewindBusy();
+    if (busy !== undefined) return rewindFail('busy', busy);
+    const located = await this.#locateTurn(targetMessageId);
+    if (!located.ok) return located;
+    return {
+      ok: true,
+      text: located.text,
+      conversation: { available: true },
+      files: { available: false, reason: 'Codex 没有文件快照，文件保持现状' },
+    };
+  }
+
+  async rewindThread(targetMessageId: string, mode: RewindMode): Promise<RewindDone | RewindFailure> {
+    // 能力在 agent 端强制：旧标签页可能还发 code / both
+    if (mode !== 'conversation') return rewindFail('unavailable', 'Codex 只能回退对话，不能还原文件');
+    const busy = this.#rewindBusy();
+    if (busy !== undefined) return rewindFail('busy', busy);
+    const located = await this.#locateTurn(targetMessageId);
+    if (!located.ok) return located;
+    try {
+      // 等待期间实例可能被回收：thread 已归别的实例或已卸载，不能再动它
+      if (this.#closed) return rewindFail('busy', '会话刚被回收，请重试');
+      await this.#ensureLoaded();
+      if (this.#closed) return rewindFail('busy', '会话刚被回收，请重试');
+      await this.#client.call('thread/revert', { threadId: this.sessionId, beforeTurnId: located.turnId });
+    } catch (err) {
+      return rewindFail('io', `Codex 回退失败：${err instanceof Error ? err.message : String(err)}`);
+    }
+    this.#touch();
+    this.#log(`[codex] 会话 ${this.sessionId} 回退到轮次 ${located.turnId} 之前`);
+    return { ok: true, text: located.text, rewound: { targetMessageIds: located.ids, mode } };
+  }
+
+  /** app-server 退出（崩溃或 agent 关停）：thread 要重新加载
   /** app-server 退出（崩溃或 agent 关停）：thread 要重新加载，下一条消息会 resume */
   onExit(): void {
     this.#loaded = false;

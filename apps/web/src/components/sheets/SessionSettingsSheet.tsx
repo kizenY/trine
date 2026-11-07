@@ -17,6 +17,7 @@
  * 所有改动都是发协议帧（`session.setModel` 等），不等应答：agent 会用
  * `session.updated` 广播回来，store 自然更新。
  */
+import { effortOptions } from '@/lib/engine-model.ts';
 import { useEffect, useState } from 'react';
 import type { EngineSummary, PermissionMode, SessionMeta } from '@trine/core';
 import { Button } from '@/components/ui/button.tsx';
@@ -45,6 +46,8 @@ export type SettingsSection = 'model' | 'cwd' | 'permission';
 export interface SessionSettingsActions {
   setModel: (model: string) => void;
   setPermissionMode: (mode: PermissionMode, engineMode?: string) => void;
+  /** 改推理强度；省略 = 模型默认 */
+  setEffort: (effort?: string) => void;
   setCwd: (cwd: string) => void;
   addCwd: (path: string) => void;
   removeCwd: (path: string) => void;
@@ -105,6 +108,7 @@ export function SessionSettingsSheet({
   };
 
   const engineModes = engine?.modes;
+  const efforts = effortOptions(engine, meta?.model);
   const modelChips = engine?.models === undefined ? knownModels.map((m) => ({ id: m, label: m })) : engine.models;
   const [enginePending, setEnginePending] = useState<string | null>(null);
   const pickEngineMode = (clicked: string): void => {
@@ -134,7 +138,7 @@ export function SessionSettingsSheet({
         <SheetHeader className="px-4 pt-4 pb-2">
           <SheetTitle>会话设置</SheetTitle>
           <SheetDescription className="text-text-3 text-[12px]">
-            模型与权限模式立即生效，切换目录下一轮生效
+            模型与权限模式立即生效，推理强度和目录下一轮生效
           </SheetDescription>
         </SheetHeader>
 
@@ -188,6 +192,27 @@ export function SessionSettingsSheet({
               </div>
             )}
           </Section>
+
+          {/* --- 推理强度：引擎和模型都支持才有 --- */}
+          {efforts !== undefined && (
+            <Section title="推理强度" highlight={false}>
+              <div className="flex flex-wrap gap-1.5">
+                <Chip data-testid="effort-chip" selected={meta?.effort === undefined} onClick={() => actions.setEffort()}>
+                  默认{efforts.defaultEffort === undefined ? '' : ` (${efforts.defaultEffort})`}
+                </Chip>
+                {efforts.efforts.map((effort) => (
+                  <Chip
+                    key={effort}
+                    data-testid="effort-chip"
+                    selected={meta?.effort === effort}
+                    onClick={() => actions.setEffort(effort)}
+                  >
+                    <span className="font-mono">{effort}</span>
+                  </Chip>
+                ))}
+              </div>
+            </Section>
+          )}
 
           {/* --- 权限模式 --- */}
           <Section title="权限模式" highlight={section === 'permission'}>

@@ -11,7 +11,7 @@ import type { ClaudeLatestView } from './claude-update.ts';
 // react-dom 必须在 DOM 环境装好之后再加载（见 .local learnings / session-list.test.tsx）
 const { act } = await import('react');
 const { createRoot } = await import('react-dom/client');
-const { ClaudeUpdateSection } = await import('./ClaudeUpdateSection.tsx');
+const { EngineUpdateSection } = await import('./EngineUpdateSection.tsx');
 
 let root: Root | null = null;
 let host: HTMLDivElement | null = null;
@@ -27,10 +27,10 @@ function render(props: {
   root = createRoot(host);
   act(() =>
     root!.render(
-      <ClaudeUpdateSection
+      <EngineUpdateSection
         machineName="MBP"
         online={props.online === undefined ? true : props.online}
-        claudeVersion="2.1.251 (Claude Code)"
+        version="2.1.251 (Claude Code)"
         update={props.update}
         latest={props.latest ?? null}
         {...(props.check === undefined ? {} : { check: props.check })}
@@ -71,7 +71,7 @@ afterEach(() => {
   document.body.innerHTML = '';
 });
 
-describe('ClaudeUpdateSection', () => {
+describe('EngineUpdateSection', () => {
   test('点按钮只弹确认，确认后才发请求；等待中按钮禁用并显示进度；完成后给旧→新', async () => {
     let calls = 0;
     let resolve!: (r: ClaudeUpdateResult) => void;

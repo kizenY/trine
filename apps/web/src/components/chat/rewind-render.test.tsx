@@ -75,6 +75,27 @@ describe('用户消息上的回退入口', () => {
 });
 
 describe('RewindDialog', () => {
+  test('只能回退对话的引擎：只有一个选项，写明文件不会还原，确认用普通色', async () => {
+    const onConfirm = mock((_mode: RewindMode) => Promise.resolve());
+    mount(
+      <RewindDialog
+        open
+        onOpenChange={() => {}}
+        messageText="x"
+        loadPreview={() => Promise.resolve(preview({ files: { available: false, reason: '没有快照' } } as never))}
+        onConfirm={onConfirm}
+        supportedModes={['conversation']}
+      />,
+    );
+    await flush();
+    expect($('rewind-mode-both')).toBeNull();
+    expect($('rewind-mode-code')).toBeNull();
+    expect($('rewind-dialog-note')?.textContent).toContain('不会还原');
+    act(() => ($('rewind-dialog-confirm') as HTMLButtonElement).click());
+    expect(onConfirm).toHaveBeenCalledWith('conversation');
+    await flush();
+  });
+
   test('预览中 → 列出三种模式与文件，默认「代码和对话」，确认带上所选模式', async () => {
     let resolve: (p: RewindPreviewResult) => void = () => {};
     const loadPreview = mock(() => new Promise<RewindPreviewResult>((r) => (resolve = r)));

@@ -9,6 +9,7 @@
  * - **版本缺失显示「未知」**：新配对设备在 agent 补发 machine.info 之前
  *   `info` 为 null（评审 B5），此时空着比写「未知」更像 UI 坏了。
  */
+import { CLAUDE_ENGINE_ID } from '@trine/core';
 import { formatRelativeTime } from '@/lib/format.ts';
 
 export type MachineOnline = boolean | null;
@@ -44,11 +45,14 @@ export function machineHeartbeatLine(
 
 /** 版本行：缺 machine.info 时给「未知」而不是空白 */
 export function machineVersionLine(
-  info: { agentVersion: string; claudeVersion: string } | null,
+  info: { agentVersion: string; claudeVersion: string; engines?: readonly { id: string; displayName: string; version?: string | undefined }[] | undefined } | null,
 ): string {
   const agent = info?.agentVersion.trim() ?? '';
   const claude = info?.claudeVersion.trim() ?? '';
-  return `agent ${agent === '' ? '未知' : agent} · claude ${claude === '' ? '未知' : claude}`;
+  const others = (info?.engines ?? [])
+    .filter((engine) => engine.id !== CLAUDE_ENGINE_ID)
+    .map((engine) => ` · ${engine.displayName.toLowerCase()} ${engine.version ?? '未知'}`);
+  return `agent ${agent === '' ? '未知' : agent} · claude ${claude === '' ? '未知' : claude}${others.join('')}`;
 }
 
 /** 平台行：「macOS 15.6」；缺 info 时为空串（调用方不渲染） */

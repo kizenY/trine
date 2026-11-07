@@ -2,13 +2,13 @@
  * Codex 引擎（multi-engine，DECISIONS D20）：经 app-server 列会话、读历史、读限额，建和管理
  * thread；活跃会话见 session.ts。列会话、读历史不加载 thread，不占活跃名额。
  */
-import type { EngineModel, EngineRateWindow, EngineSummary, HistoryItem, PermissionMode, SessionMeta } from '@trine/core';
+import type { EngineModel, EngineRateWindow, EngineSummary, HistoryItem, PermissionMode, SessionMeta, SlashCommand } from '@trine/core';
 import type { CreateSessionArgs } from '../../bridge/manager.ts';
 import { AppServerClient, AppServerError, type AppServerClientOptions, type SpawnAppServer } from './app-server.ts';
 import { codexItemToHistory } from './history.ts';
 import { CODEX_MODES, isCodexMode, legacyFromMode, threadModeParams, DEFAULT_CODEX_MODE } from './modes.ts';
 import { CODEX_DEFAULT_MODEL, CODEX_ENGINE_ID } from './ids.ts';
-import { CodexSession, type CodexSessionClient, type CodexSessionEvents } from './session.ts';
+import { CodexSession, type CodexSessionClient, type CodexSessionEvents, type CodexSkill } from './session.ts';
 
 export { CODEX_ENGINE_ID };
 
@@ -99,8 +99,51 @@ export function rateWindows(response: unknown): EngineRateWindow[] {
   return out.slice(0, 16);
 }
 
+/** model/list 的元素 → 目录条目；id 缺失或隐藏的模型不要 */
+export function modelFromList(model: unknown): EngineModel | undefined {
+  if (!isRecord(model) || model['hidden'] === true) return undefined;
+  const id = str(model['id']);
+  if (id === undefined) return undefined;
+  const efforts = Array.isArray(model['supportedReasoningEfforts'])
+    ? model['supportedReasoningEfforts']
+        .map((e: unknown) => (isRecord(e) ? str(e['reasoningEffort']) : undefined))
+        .filter((e): e is string => e !== undefined && e.length <= 32)
+        .slice(0, 16)
+    : [];
+  const defaultEffort = str(model['defaultReasoningEffort']);
+  return {
+    id: id.slice(0, 128),
+    label: (str(model['displayName']) ?? id).slice(0, 128),
+    ...(efforts.length === 0 ? {} : { efforts }),
+    ...(defaultEffort === undefined || defaultEffort.length > 32 ? {} : { defaultEffort }),
+    ...(model['isDefault'] === true ? { isDefault: true } : {}),
+  };
+}
+
+/** skills/list → 启用的 skill；一个目录一组，这里只问了一个目录 */
+export function skillsFromList(response: unknown): CodexSkill[] {
+  const entries = isRecord(response) && Array.isArray(response['data']) ? response['data'] : [];
+  const out: CodexSkill[] = [];
+  for (const entry of entries) {
+    if (!isRecord(entry) || !Array.isArray(entry['skills'])) continue;
+    for (const skill of entry['skills']) {
+      if (!isRecord(skill) || skill['enabled'] === false) continue;
+      const name = str(skill['name']);
+      const path = str(skill['path']);
+      if (name === undefined || path === undefined) continue;
+      out.push({
+        name,
+        path,
+        description: str(skill['shortDescription']) ?? str(skill['description']) ?? '',
+        scope: str(skill['scope']) ?? '',
+      });
+    }
+  }
+  return out;
+}
+
 export type CodexClient = Pick<AppServerClient, 'call' | 'userAgent' | 'dispose'> &
-  Partial<Pick<AppServerClient, 'hold' | 'release'>>;
+  Partial<Pick<AppServerClient, 'hold' | 'release' | 'recycle'>>;
 
 export interface CodexEngineOptions {
   /** 给了 client 就用它（只测目录时）；否则按 spawn 建一个，并接上通知与审批 */
@@ -130,6 +173,8 @@ export class CodexEngine implements CodexSessionClient {
   #windows: EngineRateWindow[] = [];
   #rateAt = 0;
   #version: string | undefined;
+  /** 更新后探测到的版本：跑着的 app-server 可能还是旧的，界面要显示磁盘上已装好的 */
+  #installedVersion: string | undefined;
 
   constructor(options: CodexEngineOptions) {
     this.#now = options.now ?? Date.now;
@@ -161,10 +206,10 @@ export class CodexEngine implements CodexSessionClient {
     return {
       id: CODEX_ENGINE_ID,
       displayName: 'Codex',
-      ...(this.#version === undefined ? {} : { version: this.#version }),
+      ...((this.#installedVersion ?? this.#version) === undefined ? {} : { version: (this.#installedVersion ?? this.#version)! }),
       available: this.#unavailableReason === undefined,
       ...(this.#unavailableReason === undefined ? {} : { unavailableReason: this.#unavailableReason.slice(0, 300) }),
-      capabilities: { interactive: true, attachments: true, mutations: true },
+      capabilities: { interactive: true, rewind: ['conversation'], attachments: true, mutations: true, effort: true },
       ...(this.#models.length === 0 ? {} : { models: this.#models }),
       modes: CODEX_MODES,
       ...(this.#windows.length === 0 ? {} : { rateLimits: { windows: this.#windows, updatedAt: this.#rateAt } }),
@@ -207,6 +252,44 @@ export class CodexEngine implements CodexSessionClient {
     return { threadId, model, engineMode: mode, permissionMode: legacyFromMode(mode) };
   }
 
+  /** 这个目录下启用的 skill */
+  async skills(cwd: string): Promise<CodexSkill[]> {
+    return skillsFromList(await this.#client.call('skills/list', { cwds: [cwd] }));
+  }
+
+  /** 斜杠菜单：压缩 + skills。读不到 skills 也要有压缩 */
+  async slashCommands(cwd: string): Promise<SlashCommand[]> {
+    const skills = await this.skills(cwd).catch((err: unknown) => {
+      this.#log(`[codex] 读 skills 失败：${err instanceof Error ? err.message : String(err)}`);
+      return [];
+    });
+    return [
+      { name: 'compact', description: '压缩对话上下文', source: 'user' },
+      ...skills
+        .filter((s) => s.name !== 'compact')
+        .map((s): SlashCommand => ({
+          name: s.name,
+          ...(s.description === '' ? {} : { description: s.description }),
+          source: 'skill',
+        })),
+    ];
+  }
+
+  effortsOf(model: string): { efforts: readonly string[]; defaultEffort?: string | undefined } | undefined {
+    const entry =
+      model === CODEX_DEFAULT_MODEL || model === ''
+        ? this.#models.find((m) => m.isDefault === true)
+        : this.#models.find((m) => m.id === model);
+    return entry === undefined ? undefined : { efforts: entry.efforts ?? [], defaultEffort: entry.defaultEffort };
+  }
+
+  /** `codex update` 跑完：记下装好的版本；没有活跃会话就换掉 app-server，下次调用起新版 */
+  noteUpdated(version: string): void {
+    if (/^\d/.test(version)) this.#installedVersion = version.slice(0, 64);
+    this.#client.recycle?.();
+    this.#onChange();
+  }
+
   createSession(args: CreateSessionArgs): CodexSession {
     return new CodexSession({
       sessionId: args.sessionId,
@@ -214,6 +297,7 @@ export class CodexEngine implements CodexSessionClient {
       model: args.model,
       permissionMode: args.permissionMode,
       engineMode: args.engineMode,
+      effort: args.effort,
       resume: args.resume === true,
       client: this,
       emit: args.emit,
@@ -389,6 +473,10 @@ export class CodexEngine implements CodexSessionClient {
     return turns.flatMap((turn: unknown) => (isRecord(turn) && Array.isArray(turn['items']) ? turn['items'] : []));
   }
 
+  readItems(threadId: string): Promise<unknown[]> {
+    return this.#readPaginatedItems(threadId);
+  }
+
   async #readPaginatedItems(sessionId: string): Promise<unknown[]> {
     const out: unknown[] = [];
     let cursor: string | undefined;
@@ -402,7 +490,7 @@ export class CodexEngine implements CodexSessionClient {
       for (const entry of result['data']) {
         if (!isRecord(entry) || !isRecord(entry['item'])) continue;
         // 时间戳在外层，条目本身可能不带
-        out.push({ startedAtMs: entry['startedAtMs'], ...entry['item'] });
+        out.push({ startedAtMs: entry['startedAtMs'], turnId: entry['turnId'], ...entry['item'] });
       }
       cursor = str(result['nextCursor']);
       if (cursor === undefined) break;
@@ -428,13 +516,13 @@ export class CodexEngine implements CodexSessionClient {
       this.#unavailableReason = !signedIn && needsAuth ? 'Codex 未登录：在这台机器上运行 codex login' : undefined;
       const match = /\/(\d+\.\d+\.\d+[^\s]*)/.exec(this.#client.userAgent ?? '');
       if (match !== null) this.#version = match[1]!.slice(0, 64);
+      if (this.#version === this.#installedVersion) this.#installedVersion = undefined;
       const models = await this.#client.call('model/list', { limit: 64 }).catch(() => undefined);
       const data = isRecord(models) && Array.isArray(models['data']) ? models['data'] : [];
       const list: EngineModel[] = [];
-      for (const model of data) {
-        if (!isRecord(model) || model['hidden'] === true) continue;
-        const id = str(model['id']);
-        if (id !== undefined) list.push({ id: id.slice(0, 128), label: (str(model['displayName']) ?? id).slice(0, 128) });
+      for (const raw of data) {
+        const model = modelFromList(raw);
+        if (model !== undefined) list.push(model);
       }
       if (list.length > 0) this.#models = list.slice(0, 64);
       if (this.#unavailableReason === undefined) {

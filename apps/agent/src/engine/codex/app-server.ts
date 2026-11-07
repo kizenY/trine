@@ -155,6 +155,11 @@ export class AppServerClient {
     if (this.#holds === 0 && this.#inFlight === 0) this.#armIdle();
   }
 
+  /** 换掉进程（Codex 更新后）：下次调用起新版。有 thread 或请求在用时不动，等它们用完自然退出 */
+  recycle(): void {
+    if (this.#holds === 0 && this.#inFlight === 0) this.#stop(new AppServerError('app-server 更新后重启'));
+  }
+
   dispose(): void {
     this.#disposed = true;
     this.#stop(new AppServerError('app-server 客户端已关闭'));

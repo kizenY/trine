@@ -1,6 +1,6 @@
 /**
  * 机器详情（原型「机器」屏的展开态，方案 §5「机器」）：
- * 信息 → 改名 → Claude（更新，agent >= 0.4.0）→ 会话 → 高级（重置游标）→ 从本设备移除。
+ * 信息 → 改名 → 引擎（版本、限额、更新；只有 Claude 时只显示它的更新，agent >= 0.4.0）→ 会话 → 高级（重置游标）→ 从本设备移除。
  *
  * 三个动作的语义边界要写在界面上，否则用户会误解：
  * - **改名**走 `machine.rename`，是 agent 端的名字，其它设备也会变（乐观更新）；
@@ -19,7 +19,8 @@ import { AppHead } from '@/components/shell/AppHead.tsx';
 import { StatusDot } from '@/components/shell/StatusDot.tsx';
 import { ConfirmDialog } from '@/components/machines/ConfirmDialog.tsx';
 import { AgentRestartSection } from '@/components/machines/AgentRestartSection.tsx';
-import { ClaudeUpdateSection } from '@/components/machines/ClaudeUpdateSection.tsx';
+import { EngineCards } from '@/components/machines/EngineCards.tsx';
+import { EngineUpdateSection } from '@/components/machines/EngineUpdateSection.tsx';
 import { claudeLatestView, claudeUpdateHint, supportsClaudeUpdate } from '@/components/machines/claude-update.ts';
 import { supportsAgentRestart } from '@/components/machines/agent-restart.ts';
 import {
@@ -119,27 +120,6 @@ export function MachineDetailView(): React.JSX.Element {
               </span>
             )}
           </dd>
-          {hasMultipleEngines(machine.info) && (
-            <>
-              <dt className="text-text-3">引擎</dt>
-              <dd className="flex flex-col gap-0.5 text-xs" data-testid="detail-engines">
-                {enginesOf(machine.info).map((engine) => (
-                  <span key={engine.id} data-engine={engine.id}>
-                    <span className="font-mono">
-                      {engine.displayName}
-                      {engine.version === undefined ? '' : ` ${engine.version}`}
-                    </span>
-                    {engine.unavailableReason !== undefined && (
-                      <span className="text-amber"> · {engine.unavailableReason}</span>
-                    )}
-                    {engine.available && engine.capabilities.interactive !== true && (
-                      <span className="text-text-3"> · 目前只能查看</span>
-                    )}
-                  </span>
-                ))}
-              </dd>
-            </>
-          )}
           <dt className="text-text-3">会话</dt>
           <dd>
             {totalCount} 个
@@ -148,9 +128,9 @@ export function MachineDetailView(): React.JSX.Element {
           </dd>
           {live !== '' && (
             <>
-              <dt className="text-text-3">子进程</dt>
+              <dt className="text-text-3">活跃会话</dt>
               <dd className="tabular" data-testid="detail-live">
-                {live.replace('子进程 ', '')}
+                {live.replace('活跃会话 ', '')}
               </dd>
             </>
           )}
@@ -218,13 +198,28 @@ export function MachineDetailView(): React.JSX.Element {
           </div>
         </section>
 
-        {client && supportsClaudeUpdate(machine.info) && (
+        {hasMultipleEngines(machine.info) && (
           <>
             <Separator />
-            <ClaudeUpdateSection
+            <EngineCards
+              engines={enginesOf(machine.info)}
+              machineId={machine.machineId}
               machineName={machine.name}
               online={machine.online}
-              claudeVersion={machine.info?.claudeVersion}
+              info={machine.info}
+              client={client}
+              now={now}
+            />
+          </>
+        )}
+
+        {client && !hasMultipleEngines(machine.info) && supportsClaudeUpdate(machine.info) && (
+          <>
+            <Separator />
+            <EngineUpdateSection
+              machineName={machine.name}
+              online={machine.online}
+              version={machine.info?.claudeVersion}
               update={() => client.updateClaude(machine.machineId)}
               latest={claudeLatestView(machine.info)}
               check={() => client.checkClaude(machine.machineId)}

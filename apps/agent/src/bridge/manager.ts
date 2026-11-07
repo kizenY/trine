@@ -168,6 +168,7 @@ export interface CreateSessionArgs {
   /** 引擎；省略 = Claude Code */
   engine?: string;
   engineMode?: string;
+  effort?: string;
   emit: (body: EventBody) => void;
   resume?: boolean;
   /** 透传给 SDK 的 pathToClaudeCodeExecutable；不给 = SDK 内置 */
@@ -318,6 +319,7 @@ export class SessionManager {
     /** 引擎；省略 = Claude Code */
     engine?: string | undefined;
     engineMode?: string | undefined;
+    effort?: string | undefined;
   }): AcquireResult {
     const existing = this.#sessions.get(args.sessionId);
     if (existing !== undefined) {
@@ -340,6 +342,7 @@ export class SessionManager {
       permissionMode: args.permissionMode,
       ...(args.engine === undefined ? {} : { engine: args.engine }),
       ...(args.engineMode === undefined ? {} : { engineMode: args.engineMode }),
+      ...(args.effort === undefined ? {} : { effort: args.effort }),
       emit: (body) => {
         scoped.emit(body);
       },
@@ -380,6 +383,7 @@ export class SessionManager {
       costUsd: 0,
       ...(args.engine === undefined ? {} : { engine: args.engine }),
       ...(args.engineMode === undefined ? {} : { engineMode: args.engineMode }),
+      ...(args.effort === undefined ? {} : { effort: args.effort }),
       // 与 #fromInfo 同口径：没有更新的摘要时用首条输入，下面广播的 updated 不会把摘要清空
       ...((previous?.lastEvent ?? seed?.firstPrompt) === undefined
         ? {}
@@ -837,7 +841,7 @@ export class SessionManager {
     const previous = this.#meta.get(sid);
     // waitingFor / bgRunning 是运行时字段：以本次 runtime 为准，离开等待态 / 后台任务
     // 归零时要从缓存里去掉（否则列表会一直挂着「后台 1」）
-    const { waitingFor: _stale, bgRunning: _staleBg, engineMode: _staleMode, ...kept } = previous ?? { title: '' };
+    const { waitingFor: _stale, bgRunning: _staleBg, engineMode: _staleMode, effort: _staleEffort, ...kept } = previous ?? { title: '' };
     const needsTitle = kept.title === '' && runtime.firstPrompt !== undefined;
     const merged: SessionMeta = {
       ...kept,
@@ -853,6 +857,7 @@ export class SessionManager {
       // context 只在取到时覆盖；没带就保留缓存里的上一次值
       ...(runtime.context === undefined ? {} : { context: runtime.context }),
       ...(runtime.engineMode === undefined ? {} : { engineMode: runtime.engineMode }),
+      ...(runtime.effort === undefined ? {} : { effort: runtime.effort }),
       ...(needsTitle ? { title: runtime.firstPrompt!, firstPrompt: runtime.firstPrompt!, lastEvent: runtime.firstPrompt! } : {}),
     };
     this.#meta.set(sid, merged);

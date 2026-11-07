@@ -4,7 +4,8 @@
  * 「引擎」指真正跑模型的编码 agent（Claude Code、Codex）；agent 在 trine 里已指机器上的
  * 守护进程。router、manager 只依赖这里的接口，不依赖某个引擎的 SDK。
  */
-import type { PermissionMode, SessionState, BgTask, ContextUsage } from '@trine/core';
+import type { PermissionMode, RewindMode, SessionState, BgTask, ContextUsage } from '@trine/core';
+import type { RewindDone, RewindFailure, RewindPreview } from '../app/rewind.ts';
 import type { PreparedInput } from '../bridge/attachments.ts';
 import type { PendingPermissionSnapshot, PermissionVerdict } from '../bridge/permission.ts';
 import type {
@@ -24,6 +25,8 @@ export interface EngineSession {
   readonly hasProcess: boolean;
   readonly bgRunningCount: number;
   readonly permissionMode: PermissionMode;
+  /** 用户选的推理强度；不支持的引擎不实现 */
+  readonly effort?: string | undefined;
   readonly permissions: { snapshot(): readonly PendingPermissionSnapshot[] };
 
   meta(): SessionRuntimeMeta;
@@ -35,6 +38,8 @@ export interface EngineSession {
   /** engineMode：非 Claude 引擎自己的权限模式（SessionMeta.engineMode），有就以它为准 */
   setPermissionMode(mode: PermissionMode, engineMode?: string): Promise<void>;
   setModel(model: string): Promise<void>;
+  /** 改推理强度，省略 = 回到模型的默认强度；不支持的引擎不实现 */
+  setEffort?(effort: string | undefined): Promise<void>;
   stopBgTask(taskId: string): Promise<StopBgTaskResult>;
   close(reason?: string, drainTimeoutMs?: number): Promise<void>;
   /** 订阅限额（账号级，有活跃进程时顺带取）；不支持的引擎不实现 */
@@ -45,7 +50,7 @@ export interface EngineSession {
   refreshContextNow?(): Promise<ContextUsage>;
 }
 
-/** 回退需要的额外操作（目前只有 Claude：文件检查点 + 对话截断） */
+/** 回退需要的额外操作，靠文件检查点 + 转录截断实现（Claude） */
 export type RewindableSession = EngineSession &
   Pick<
     ClaudeSession,
@@ -60,4 +65,14 @@ export type RewindableSession = EngineSession &
 
 export function isRewindable(session: EngineSession): session is RewindableSession {
   return typeof (session as Partial<RewindableSession>).rewindBlocker === 'function';
+}
+
+/** 引擎自己就能回退对话，定位和执行都由它做（Codex 的 thread/revert） */
+export interface ThreadRewindSession extends EngineSession {
+  previewThreadRewind(targetMessageId: string): Promise<RewindPreview | RewindFailure>;
+  rewindThread(targetMessageId: string, mode: RewindMode): Promise<RewindDone | RewindFailure>;
+}
+
+export function isThreadRewindable(session: EngineSession): session is ThreadRewindSession {
+  return typeof (session as Partial<ThreadRewindSession>).rewindThread === 'function';
 }

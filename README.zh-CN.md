@@ -20,8 +20,9 @@
 - 显示各机器上会话所用的 Claude Code 版本，并可远程更新（`claude update`）。agent 启动后不久及每 6 小时向 Claude Code 自更新所用的发布渠道（`autoUpdatesChannel`，默认 `latest`）检查一次最新版本，有新版本时机器卡上会提示；机器详情页的「检查更新」立即检查。设置了 `DISABLE_AUTOUPDATER` 或 `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC` 时不自动检查。检查需要 agent ≥ 0.19.0。
 - 更新 agent 的工作区后可以安全重启：在机器详情页操作，或运行 `trine-agent restart`（在 trine 会话里也可以）。先预检新代码，等没有会话在忙再退出，由服务管理器拉起。用其他方式重启 agent 会结束所有运行中的会话，包括执行命令的那个。需要 agent ≥ 0.18.0，且由 systemd 等服务管理器托管，见[安全重启 agent](docs/AGENT-ENROLLMENT.zh-CN.md#安全重启-agent升级后换上新代码)。
 - 机器上有已登录的 `codex` CLI 时可同时使用 Codex：新建和续接会话（包括 CLI、VS Code 里开的）、流式回复、审批、停止、排队、切换模型和权限模式、图片和文件附件、重命名和删除。
-  新建会话时选引擎，列表可按引擎筛选。Codex 新会话默认完全访问，可在设置里改。回退、计划模式、后台任务和费用目前只有 Claude 支持。
+  新建会话时选引擎，列表可按引擎筛选。Codex 新会话默认完全访问，可在设置里改。计划模式、后台任务、费用和回退时还原文件目前只有 Claude 支持。
   `TRINE_ENGINES=claude` 可关闭 Codex，`TRINE_CODEX_BIN` 可指定可执行文件。需要 agent 0.21.0 或更高版本。
+- agent 0.22.0 起，Codex 会话还能回退对话（不还原文件，对话框会写明）、用 `/compact` 压缩、从 `/` 菜单运行 skill、选择推理强度；子 agent 的操作显示为工具卡。机器页每个引擎一张卡，可查看 Codex 版本并更新（`codex update`）。agent 启动后不久及每 6 小时向 GitHub 查询一次 Codex 最新版本。
 - 默认隐藏临时会话（工作目录在系统临时目录下，或 `claude -p` 等非交互运行），列表筛选里可以重新显示。
 - 配对码/二维码与人工校验码确认，浏览器到 agent 的应用消息端到端加密。
 - 可选 Bark 通知，仅包含通用事件类型和机器标识/别名。

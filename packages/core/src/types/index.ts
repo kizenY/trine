@@ -75,6 +75,9 @@ export const EngineIdSchema = z.string().min(1).max(64);
 /** 引擎自己的权限模式 id，含义由该引擎解释（见 SessionMeta.engineMode） */
 export const EngineModeSchema = z.string().min(1).max(64);
 
+/** 推理强度 id，取值由引擎和模型决定（Codex 实测有 max、ultra），不能当封闭枚举 */
+export const EngineEffortSchema = z.string().min(1).max(32);
+
 /** 会话列表条目 / 会话元数据快照 */
 export const SessionMetaSchema = z.object({
   sessionId: z.string().min(1),
@@ -144,6 +147,8 @@ export const SessionMetaSchema = z.object({
    * client 看的近似值；Claude 会话不带，`permissionMode` 就是真值。
    */
   engineMode: EngineModeSchema.optional(),
+  /** 推理强度（agent ≥ 0.22.0）；省略 = 跟随引擎自己的配置 */
+  effort: EngineEffortSchema.optional(),
 });
 export type SessionMeta = z.infer<typeof SessionMetaSchema>;
 
@@ -418,6 +423,10 @@ export const EngineCapabilitiesSchema = z.object({
   mutations: z.boolean().optional(),
   /** 能手动刷新 context 用量 */
   contextRefresh: z.boolean().optional(),
+  /** 能选推理强度（session.setEffort，选项在 EngineModel.efforts） */
+  effort: z.boolean().optional(),
+  /** 能从机器页更新引擎（machine.engine.update.request、machine.engine.check.request） */
+  update: z.boolean().optional(),
 });
 export type EngineCapabilities = z.infer<typeof EngineCapabilitiesSchema>;
 
@@ -437,6 +446,11 @@ export type EngineMode = z.infer<typeof EngineModeOptionSchema>;
 export const EngineModelSchema = z.object({
   id: z.string().min(1).max(128),
   label: z.string().min(1).max(128),
+  /** 这个模型支持的推理强度；省略 = 不能选 */
+  efforts: z.array(EngineEffortSchema).max(16).optional(),
+  defaultEffort: EngineEffortSchema.optional(),
+  /** 不指定模型时用的就是它 */
+  isDefault: z.boolean().optional(),
 });
 export type EngineModel = z.infer<typeof EngineModelSchema>;
 
@@ -470,6 +484,15 @@ export const EngineSummarySchema = z.object({
   /** 账号限额。Claude 的仍在 MachineInfo.rateLimits，这里不重复 */
   rateLimits: z
     .object({ windows: z.array(EngineRateWindowSchema).max(16), updatedAt: TimestampSchema })
+    .optional(),
+  /** 发布源上的最新版本；capabilities.update 为真才有。Claude 的在 MachineInfo.claudeLatest */
+  latest: z
+    .object({
+      version: z.string().max(64).optional(),
+      checkedAt: TimestampSchema.optional(),
+      /** 最近一次检查失败的原因 */
+      error: z.string().max(300).optional(),
+    })
     .optional(),
 });
 export type EngineSummary = z.infer<typeof EngineSummarySchema>;

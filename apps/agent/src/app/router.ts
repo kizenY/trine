@@ -104,6 +104,7 @@ import type {
   MachineInfo,
   PermissionMode,
   McpServerStatus,
+  RewindMode,
   SlashCommand,
 } from '@trine/core';
 import { CLAUDE_ENGINE_ID } from '@trine/core';
@@ -126,7 +127,7 @@ import {
   type SessionManager,
   type SessionSeed,
 } from '../bridge/manager.ts';
-import { isRewindable, type EngineSession } from '../engine/types.ts';
+import { isRewindable, isThreadRewindable, type EngineSession } from '../engine/types.ts';
 import type { EventBody, EventBodyOf } from '../bridge/types.ts';
 import { LinkLimitError, type SessionLinksStore } from '../ext/links-store.ts';
 import type { SessionRecordsStore } from '../ext/records-store.ts';
@@ -135,6 +136,7 @@ import type { Recipient } from '../net/recipients.ts';
 import type { MachineStatsWatcher } from './machine-stats.ts';
 import type { CwdStore } from './cwd-store.ts';
 import type { ClaudeUpdateOutcome } from './claude-cli.ts';
+import type { EngineCheckOutcome } from '../engine/codex/update.ts';
 import type { ClaudeCheckOutcome } from './claude-latest.ts';
 import type { RestartOutcome } from './restart.ts';
 import type { PlanUsageRefreshOutcome } from './plan-usage.ts';
@@ -168,6 +170,8 @@ const MACHINE_LEVEL_TYPES = new Set<ClientToAgentEvent['type']>([
   'machine.unpair',
   'machine.claude.update.request',
   'machine.claude.check.request',
+  'machine.engine.update.request',
+  'machine.engine.check.request',
   'machine.usage.request',
   'machine.agent.restart.request',
   'machine.stats.request',
@@ -245,6 +249,8 @@ export class CapabilitiesCache {
 export interface RouterCodexEngine {
   owns(sessionId: string): Promise<boolean>;
   history(sessionId: string): Promise<HistoryItem[]>;
+  /** 斜杠菜单的内容；不抛，读不到 skills 时也有引擎自带的命令 */
+  slashCommands?(cwd: string): Promise<SlashCommand[]>;
   startThread(args: { cwd: string; model: string; engineMode?: string | undefined }): Promise<{
     threadId: string;
     model: string;
@@ -277,6 +283,10 @@ export interface RouterDeps {
    * 不抛。不给 = 不支持（测试）。
    */
   checkClaude?: () => Promise<ClaudeCheckOutcome>;
+  /** 更新其他引擎（单飞、超时，同 updateClaude）；这台机器不能更新它时回 undefined */
+  updateEngine?: (engine: string) => Promise<ClaudeUpdateOutcome | undefined>;
+  /** 查其他引擎的最新版本（查完先广播 machine.info）；不能查时回 undefined */
+  checkEngine?: (engine: string) => Promise<EngineCheckOutcome | undefined>;
   /**
    * 手动刷新订阅限额用量（app 的 PlanUsageTracker：单飞、超时；拿到后先广播
    * machine.info）。不抛——失败以 outcome 表达。不给 = 不支持（测试）。
@@ -669,7 +679,18 @@ export class Router {
       }
       case 'session.setModel':
         await session.setModel(event.model);
-        this.#deps.state.updateSession(sessionId, { model: event.model });
+        // 换模型可能把强度调回新模型的默认值，要一起记下
+        this.#deps.state.updateSession(sessionId, {
+          model: event.model,
+          ...(session.setEffort === undefined ? {} : { effort: session.effort }),
+        });
+        return;
+      case 'session.setEffort':
+        // 不支持的引擎（旧标签页发来的）不理；能力在 agent 端强制
+        if (session.setEffort !== undefined) {
+          await session.setEffort(event.effort);
+          this.#deps.state.updateSession(sessionId, { effort: session.effort });
+        }
         return;
       case 'session.setPermissionMode':
         await session.setPermissionMode(event.mode, event.engineMode);
@@ -989,8 +1010,20 @@ export class Router {
       this.#log(`[router] ${event.type} 失败 session=${sessionId}: ${message}`);
       return { ok: false as const, error: { code: 'io' as const, message: `agent 处理失败：${message}`.slice(0, 300) } };
     };
+    // 引擎自己能回退（Codex）：定位和执行都交给它
+    const engine = isThreadRewindable(session)
+      ? {
+          preview: () => session.previewThreadRewind(event.targetMessageId),
+          execute: (mode: RewindMode) => session.rewindThread(event.targetMessageId, mode),
+        }
+      : isRewindable(session)
+        ? {
+            preview: () => previewRewind(deps, session, event.targetMessageId),
+            execute: (mode: RewindMode) => executeRewind(deps, session, event.targetMessageId, mode),
+          }
+        : undefined;
     // 能力在 agent 端强制：旧标签页可能对不支持回退的引擎发请求
-    if (!isRewindable(session)) {
+    if (engine === undefined) {
       const error = { code: 'unavailable' as const, message: '这个引擎不支持回退' };
       reply(
         event.type === 'session.rewind.preview'
@@ -1000,11 +1033,11 @@ export class Router {
       return;
     }
     if (event.type === 'session.rewind.preview') {
-      const result = await previewRewind(deps, session, event.targetMessageId).catch(failed);
+      const result = await engine.preview().catch(failed);
       reply({ type: 'session.rewind.preview.response', reqId: event.reqId, ...result });
       return;
     }
-    const result = await executeRewind(deps, session, event.targetMessageId, event.mode).catch(failed);
+    const result = await engine.execute(event.mode).catch(failed);
     if (!result.ok) {
       reply({ type: 'session.rewind.response', reqId: event.reqId, ok: false, error: result.error });
       return;
@@ -1048,15 +1081,18 @@ export class Router {
    * 探测失败 → 空数组（见文件头），source 统一 'project'（与 translate.ts 一致）。
    */
   async #commands(sessionId: string, reqId: string, sender: Recipient): Promise<void> {
-    // Codex 没有列举斜杠命令的接口；探测会起 claude，也不该拿 Claude 的命令充数
-    if (await this.#isCodexSession(sessionId)) {
-      this.#deps.emitter.emit({ type: 'session.commands.response', reqId, slashCommands: [] }, sessionId, {
+    // 先问归属：外部 Codex 会话的 cwd 要查过才在 manager 里
+    const isCodex = await this.#isCodexSession(sessionId);
+    const known = this.#deps.state.sessionParams(sessionId)?.cwd ?? this.#deps.manager.metaOf(sessionId)?.cwd;
+    const cwd = known === undefined || known === '' ? this.#deps.cwdStore.snapshot().defaultCwd : known;
+    // Codex 的清单来自它自己（skills + 压缩）；探测会起 claude，也不该拿 Claude 的命令充数
+    if (isCodex) {
+      const slashCommands = (await this.#deps.codexEngine?.slashCommands?.(cwd)) ?? [];
+      this.#deps.emitter.emit({ type: 'session.commands.response', reqId, slashCommands }, sessionId, {
         to: sender.deviceId,
       });
       return;
     }
-    const known = this.#deps.state.sessionParams(sessionId)?.cwd ?? this.#deps.manager.metaOf(sessionId)?.cwd;
-    const cwd = known === undefined || known === '' ? this.#deps.cwdStore.snapshot().defaultCwd : known;
     let slashCommands: SlashCommand[] = [];
     const probe = this.#deps.commandsProbe;
     if (probe !== undefined) {
@@ -1148,6 +1184,11 @@ export class Router {
       state.updateSession(sessionId, { cwd });
       const changed = manager.metaOf(sessionId);
       if (changed !== undefined) this.#emitMachine({ type: 'session.updated', session: changed });
+      // skills 随目录变；client 有清单就不再拉，所以主动推新的
+      if (await this.#isCodexSession(sessionId)) {
+        const slashCommands = (await this.#deps.codexEngine?.slashCommands?.(cwd)) ?? [];
+        this.#emitSession(sessionId, { type: 'session.capabilities', slashCommands, models: [], mcpServers: [] });
+      }
       return;
     }
     // 有转录才 resume；一条消息都没发过的新会话就以新建方式重开（会多广播一次
@@ -1390,7 +1431,7 @@ export class Router {
           sessionId =
             codex === undefined
               ? await this.#createSession(event.cwd, event.model, event.permissionMode)
-              : await this.#createCodexSession(codex, event.cwd, event.model, event.engineMode);
+              : await this.#createCodexSession(codex, event.cwd, event.model, event.engineMode, event.effort);
         } catch (err) {
           if (err instanceof ConcurrencyLimitError) {
             this.#emitMachine({ type: 'error.fatal', kind: 'config', message: err.message });
@@ -1460,6 +1501,20 @@ export class Router {
         void task.finally(() => this.#background.delete(task));
         return;
       }
+      case 'machine.engine.update.request': {
+        // 不 await：同 machine.claude.update.request
+        const task = this.#runEngineUpdate(event.reqId, event.engine);
+        this.#background.add(task);
+        void task.finally(() => this.#background.delete(task));
+        return;
+      }
+      case 'machine.engine.check.request': {
+        // 不 await：要等网络
+        const task = this.#runEngineCheck(event.reqId, event.engine);
+        this.#background.add(task);
+        void task.finally(() => this.#background.delete(task));
+        return;
+      }
       case 'machine.usage.request': {
         // 不 await：同 machine.claude.update.request
         const task = this.#runUsageRefresh(event.reqId);
@@ -1519,6 +1574,7 @@ export class Router {
     cwd: string,
     model: string,
     engineMode: string | undefined,
+    effort: string | undefined,
   ): Promise<string> {
     await this.#deps.manager.makeRoom();
     const started = await codex.startThread({ cwd, model, engineMode });
@@ -1528,6 +1584,7 @@ export class Router {
       permissionMode: started.permissionMode,
       engine: CODEX_ENGINE_ID,
       engineMode: started.engineMode,
+      ...(effort === undefined ? {} : { effort }),
       started: false,
     };
     this.#deps.manager.acquire({
@@ -1537,6 +1594,7 @@ export class Router {
       permissionMode: params.permissionMode,
       engine: CODEX_ENGINE_ID,
       engineMode: started.engineMode,
+      ...(effort === undefined ? {} : { effort }),
     });
     this.#deps.state.rememberSession(started.threadId, params);
     return started.threadId;
@@ -1777,6 +1835,64 @@ export class Router {
       currentVersion: this.#deps.machineInfo().claudeVersion,
       ...(outcome.ok
         ? { latest: { version: outcome.version, channel: outcome.channel } }
+        : { error: { code: 'failed', message: outcome.message.slice(0, 300) } }),
+    });
+  }
+
+  /** 更新其他引擎并回机器级应答；这台机器不能更新它时如实回 not_found */
+  async #runEngineUpdate(reqId: string, engine: string): Promise<void> {
+    let outcome: ClaudeUpdateOutcome;
+    try {
+      const run = this.#deps.updateEngine;
+      outcome =
+        (await run?.(engine)) ?? {
+          ok: false,
+          fromVersion: '',
+          toVersion: '',
+          output: '',
+          outputTruncated: false,
+          error: { code: 'not_found', message: `这台机器不能更新引擎 ${engine}`.slice(0, 300) },
+        };
+    } catch (err) {
+      outcome = {
+        ok: false,
+        fromVersion: '',
+        toVersion: '',
+        output: '',
+        outputTruncated: false,
+        error: { code: 'failed', message: `agent 更新 ${engine} 出错：${(err as Error).message}`.slice(0, 300) },
+      };
+    }
+    this.#emitMachine({
+      type: 'machine.engine.update.response',
+      reqId,
+      engine,
+      ok: outcome.ok,
+      fromVersion: outcome.fromVersion,
+      toVersion: outcome.toVersion,
+      output: outcome.output,
+      ...(outcome.outputTruncated ? { outputTruncated: true } : {}),
+      ...(outcome.error === undefined ? {} : { error: outcome.error }),
+    });
+  }
+
+  /** 查其他引擎的最新版本并回机器级应答（新结果已随 machine.info 广播） */
+  async #runEngineCheck(reqId: string, engine: string): Promise<void> {
+    let outcome: EngineCheckOutcome;
+    try {
+      outcome = (await this.#deps.checkEngine?.(engine)) ?? { ok: false, message: `这台机器不能检查引擎 ${engine} 的版本` };
+    } catch (err) {
+      outcome = { ok: false, message: `agent 检查 ${engine} 最新版本出错：${(err as Error).message}` };
+    }
+    const current = this.#deps.machineInfo().engines?.find((e) => e.id === engine)?.version;
+    this.#emitMachine({
+      type: 'machine.engine.check.response',
+      reqId,
+      engine,
+      ok: outcome.ok,
+      ...(current === undefined ? {} : { currentVersion: current }),
+      ...(outcome.ok
+        ? { latest: { version: outcome.version } }
         : { error: { code: 'failed', message: outcome.message.slice(0, 300) } }),
     });
   }

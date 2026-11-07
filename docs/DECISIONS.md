@@ -184,6 +184,12 @@ agent 端同样校验，因为已打开的旧标签页可能发来任何请求�
 排队的消息才能撤回。thread id 只能由 Codex 生成，所以新建要先 `thread/start`。归档、置顶是 trine 自己的标记，判断标记是否过期时要同时问
 Codex，否则 Codex 会话的标记过 30 天会被当成失效清掉。
 
+**Codex 补齐能力（agent 0.22.0）。** 回退复用 `session.rewind`，但定位和执行都交给引擎（`thread/revert`），因为 Codex 没有 Claude 那样的转录链；
+只回对话，不还原文件，对话框写明。压缩和 skill 不加帧：Claude 的斜杠命令本来就是文本，Codex 也走这条路，由引擎把 `/compact`、`/name` 转成对应接口，
+旧标签页不用改。推理强度不用枚举：实测取值随模型变（有 `max`、`ultra`），按模型目录校验。`turn/start` 的 `effort` 对后续轮次一直生效，不传撤销不了，
+所以「默认」要写成模型默认值。最新版本查 GitHub release：Codex 自己的 `version.json` 只在运行 TUI 时刷新，可能过期。子 agent 的 item 只显示成卡片，
+不展开子 thread；这部分按协议类型实现，没有实测触发过。子 thread 的审批不会转到浏览器。
+
 同一个 thread 同时只能有一个进程写（Codex 回 `already has an active writer`），与 D3「同一会话只有一个活跃控制进程」一致：在 CLI 里正开着的 thread，trine 续接或删除会失败并显示原因，不强占。
 
 **权限。** 审批一律显式路由给用户（`approvalsReviewer: user`），否则会继承配置里的自动审核，绕过浏览器。续接外部 thread 时不传权限覆盖，

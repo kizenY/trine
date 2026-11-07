@@ -311,7 +311,8 @@ export function ChatView(): React.JSX.Element {
   const engineCaps = capabilitiesOf(machine?.info, meta);
   /** 非 Claude 会话在头部标出引擎，且不显示 Claude 的权限模式 */
   const engineTagText = meta?.engine === undefined ? undefined : (sessionEngineTag(machine?.info, meta) ?? meta.engine);
-  const engineModeText = engineModeLabel(engineOf(machine?.info, meta), meta?.engineMode);
+  const sessionEngine = engineOf(machine?.info, meta);
+  const engineModeText = engineModeLabel(sessionEngine, meta?.engineMode);
   const attachDisabledReason = !agentSupportsAttachments(machine?.info?.agentVersion)
     ? machine?.info === undefined
       ? '还不知道这台 agent 的版本，暂时不能添加附件'
@@ -532,7 +533,12 @@ export function ChatView(): React.JSX.Element {
             },
             {
               label: 'agent',
-              value: `${res.agentVersion} · claude ${res.claudeVersion} · ${machine?.name ?? machineId}`,
+              // Claude 版本和这个会话无关时不显示；status 应答里只有 Claude 的版本
+              value: `${res.agentVersion} · ${
+                sessionEngine === undefined || sessionEngine.id === CLAUDE_ENGINE_ID
+                  ? `claude ${res.claudeVersion}`
+                  : `${sessionEngine.displayName} ${sessionEngine.version ?? '未知版本'}`
+              } · ${machine?.name ?? machineId}`,
             },
           ],
         });
@@ -554,7 +560,7 @@ export function ChatView(): React.JSX.Element {
       .catch((err: unknown) => {
         setInfoCard({ kind: 'error', message: err instanceof Error ? err.message : String(err) });
       });
-  }, [client, machineId, sessionId]);
+  }, [client, machineId, sessionId, sessionEngine, engineModeText, engineCaps.cost, machine?.name]);
 
   const settingsActions: SessionSettingsActions = useMemo(
     () => ({
@@ -566,6 +572,8 @@ export function ChatView(): React.JSX.Element {
           mode,
           ...(engineMode === undefined ? {} : { engineMode }),
         }),
+      setEffort: (effort) =>
+        client?.send(machineId, { type: 'session.setEffort', sessionId, ...(effort === undefined ? {} : { effort }) }),
       setCwd: (cwd) => client?.send(machineId, { type: 'session.setCwd', sessionId, cwd }),
       addCwd: (path) => client?.send(machineId, { type: 'cwd.add', path }),
       removeCwd: (path) => client?.send(machineId, { type: 'cwd.remove', path }),
@@ -681,7 +689,7 @@ export function ChatView(): React.JSX.Element {
               {meta === undefined
                 ? '会话设置 ▾'
                 : engineTagText !== undefined
-                  ? `${cwdTail(meta.cwd)} · ${engineTagText} · ${meta.model === '' || meta.model === 'default' ? '默认模型' : shortModel(meta.model)}${engineModeText === undefined ? '' : ` · ${engineModeText}`}${engineCaps.interactive === true ? ' ▾' : ''}`
+                  ? `${cwdTail(meta.cwd)} · ${engineTagText} · ${meta.model === '' || meta.model === 'default' ? '默认模型' : shortModel(meta.model)}${meta.effort === undefined ? '' : ` · ${meta.effort}`}${engineModeText === undefined ? '' : ` · ${engineModeText}`}${engineCaps.interactive === true ? ' ▾' : ''}`
                   : `${cwdTail(meta.cwd)} · ${shortModel(meta.model)} · ${meta.permissionMode} ▾`}
             </button>
             <SessionUsage
@@ -786,7 +794,11 @@ export function ChatView(): React.JSX.Element {
           offlineHint={offline ? composerOfflineHint(machine) : null}
           sources={{
             slashCommands: caps?.slashCommands ?? [],
-            ...(onRename === undefined ? { unavailable: ['rename'] as const } : {}),
+            unavailable: [
+              ...(onRename === undefined ? (['rename'] as const) : []),
+              // 只有 Claude 上报 MCP 状态，其他引擎这里会是一张误导人的空表
+              ...(sessionEngine === undefined || sessionEngine.id === CLAUDE_ENGINE_ID ? [] : (['mcp'] as const)),
+            ],
           }}
           snippets={prefs.promptSnippets}
           onManageSnippets={() => navigate('/settings')}
@@ -859,6 +871,7 @@ export function ChatView(): React.JSX.Element {
         messageText={rewindTarget?.text ?? ''}
         loadPreview={loadRewindPreview}
         onConfirm={confirmRewind}
+        supportedModes={engineCaps.rewind}
       />
 
       <SessionSettingsSheet

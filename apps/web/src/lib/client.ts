@@ -235,6 +235,10 @@ export type ClaudeCheckResult = Extract<AgentToClientEvent, { type: 'machine.cla
 /** `machine.claude.update.response`（ok 为 false 也照常返回，由调用方展示原因） */
 export type ClaudeUpdateResult = Extract<AgentToClientEvent, { type: 'machine.claude.update.response' }>;
 
+/** 其他引擎的更新、检查应答；ok 为 false 也照常返回 */
+export type EngineUpdateResult = Extract<AgentToClientEvent, { type: 'machine.engine.update.response' }>;
+export type EngineCheckResult = Extract<AgentToClientEvent, { type: 'machine.engine.check.response' }>;
+
 /** 配对流程（pairing.ts）成功后交给 client 的结果 */
 export interface PairingResult {
   serverUrl: string;
@@ -1285,6 +1289,7 @@ export class TrineClient {
       permissionMode: SessionMeta['permissionMode'];
       engine?: string;
       engineMode?: string;
+      effort?: string;
     },
   ): Promise<SessionMeta> {
     const res = await this.request(machineId, { type: 'session.create', ...args });
@@ -1814,6 +1819,40 @@ export class TrineClient {
       throw err;
     }
     if (res.type !== 'machine.claude.check.response') throw new Error(`意外的应答 ${res.type}`);
+    return res;
+  }
+
+  /** 更新其他引擎（capabilities.update 为真才支持）；失败处理同 updateClaude */
+  async updateEngine(machineId: string, engine: string): Promise<EngineUpdateResult> {
+    let res: AgentToClientEvent;
+    try {
+      res = await this.request<Extract<OutboundBody, { type: 'machine.engine.update.request' }>>(
+        machineId,
+        { type: 'machine.engine.update.request', engine },
+        { timeoutMs: CLAUDE_UPDATE_TIMEOUT_MS },
+      );
+    } catch (err) {
+      if (err instanceof RequestTimeoutError) throw new RequestTimeoutError(err.requestType, err.timeoutMs, MUTATE_TIMEOUT_HINT);
+      throw err;
+    }
+    if (res.type !== 'machine.engine.update.response') throw new Error(`意外的应答 ${res.type}`);
+    return res;
+  }
+
+  /** 立即查其他引擎的最新版本；失败处理同 checkClaude */
+  async checkEngine(machineId: string, engine: string): Promise<EngineCheckResult> {
+    let res: AgentToClientEvent;
+    try {
+      res = await this.request<Extract<OutboundBody, { type: 'machine.engine.check.request' }>>(
+        machineId,
+        { type: 'machine.engine.check.request', engine },
+        { timeoutMs: CLAUDE_CHECK_TIMEOUT_MS },
+      );
+    } catch (err) {
+      if (err instanceof RequestTimeoutError) throw new RequestTimeoutError(err.requestType, err.timeoutMs, MUTATE_TIMEOUT_HINT);
+      throw err;
+    }
+    if (res.type !== 'machine.engine.check.response') throw new Error(`意外的应答 ${res.type}`);
     return res;
   }
 

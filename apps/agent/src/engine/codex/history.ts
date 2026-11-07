@@ -33,18 +33,24 @@ function preview(text: string | undefined): { outputPreview?: string } {
 function statusOf(raw: unknown, ok = true): { status?: ToolResultStatus } {
   if (raw === 'completed') return { status: ok ? 'ok' : 'error' };
   if (raw === 'failed' || raw === 'declined') return { status: 'error' };
+  if (raw === 'interrupted') return { status: 'warn' };
   return {};
 }
 
 function userText(content: unknown): string {
   if (!Array.isArray(content)) return '';
   const parts: string[] = [];
+  const text = content.filter(isRecord).map((p) => (p['type'] === 'text' ? (str(p['text']) ?? '') : '')).join('\n');
   for (const part of content) {
     if (!isRecord(part)) continue;
     const type = part['type'];
     if (type === 'text') parts.push(str(part['text']) ?? '');
     else if (type === 'image' || type === 'localImage') parts.push('[图片]');
-    else if (type === 'skill' || type === 'mention') parts.push(`$${str(part['name']) ?? ''}`);
+    else if (type === 'skill' || type === 'mention') {
+      // 文本里通常已经写了 `$name`（实测 skill 就是这样），不重复
+      const token = `$${str(part['name']) ?? ''}`;
+      if (!text.includes(token)) parts.push(token);
+    }
   }
   return parts.join('\n');
 }
@@ -155,6 +161,63 @@ function mcpItem(item: Rec, id: string, ts: number): HistoryItem {
   };
 }
 
+const COLLAB_ACTION: Record<string, string> = {
+  sendInput: '发消息给子 agent',
+  sendMessage: '发消息给子 agent',
+  followupTask: '追加任务给子 agent',
+  resumeAgent: '恢复子 agent',
+  wait: '等待子 agent',
+  closeAgent: '关闭子 agent',
+  interruptAgent: '中断子 agent',
+  listAgents: '列出子 agent',
+};
+
+/** 派生、等待子 agent 等操作：一张卡，不展开子 thread 的过程（没有实测过，字段都按可缺处理） */
+function collabItem(item: Rec, id: string, ts: number): HistoryItem {
+  const tool = str(item['tool']) ?? '';
+  const prompt = str(item['prompt']);
+  const action = tool === 'spawnAgent' ? '派生子 agent' : (COLLAB_ACTION[tool] ?? (tool === '' ? '子 agent' : tool));
+  const states = isRecord(item['agentsStates']) ? Object.values(item['agentsStates']).filter(isRecord) : [];
+  const counts = new Map<string, number>();
+  for (const state of states) {
+    const status = str(state['status']);
+    if (status !== undefined) counts.set(status, (counts.get(status) ?? 0) + 1);
+  }
+  const messages = states.map((s) => str(s['message'])).filter((m): m is string => m !== undefined && m !== '');
+  const failed = (counts.get('errored') ?? 0) + (counts.get('notFound') ?? 0) > 0;
+  return {
+    kind: 'tool',
+    id,
+    // 不用 Agent：那是 Claude 的子 agent 卡，会去拉 Codex 没有的子过程
+    toolName: 'SubAgent',
+    argSummary: toSingleLine(tool === 'spawnAgent' && prompt !== undefined ? prompt : prompt === undefined ? action : `${action}：${prompt}`),
+    ...statusOf(item['status'], !failed),
+    ...(counts.size === 0 ? {} : { resultSummary: [...counts].map(([status, n]) => `${status} ${n}`).join(' · ') }),
+    ...preview(messages.length > 0 ? messages.join('\n') : undefined),
+    ts,
+  };
+}
+
+const ACTIVITY_LABEL: Record<string, string> = {
+  started: '子 agent 已启动',
+  interacted: '子 agent 有新动作',
+  interrupted: '子 agent 已中断',
+  completed: '子 agent 已完成',
+};
+
+function subAgentActivityItem(item: Rec, id: string, ts: number): HistoryItem {
+  const kind = str(item['kind']) ?? '';
+  const path = str(item['agentPath']);
+  return {
+    kind: 'tool',
+    id,
+    toolName: 'SubAgent',
+    argSummary: toSingleLine([ACTIVITY_LABEL[kind] ?? `子 agent：${kind}`, path].filter((p) => p !== undefined).join(' · ')),
+    status: kind === 'interrupted' ? 'warn' : 'ok',
+    ts,
+  };
+}
+
 /** 一个 thread item 转成历史条目；不需要展示或认不出的返回 undefined */
 export function codexItemToHistory(item: unknown, fallbackTs: number): HistoryItem | undefined {
   if (!isRecord(item)) return undefined;
@@ -183,6 +246,13 @@ export function codexItemToHistory(item: unknown, fallbackTs: number): HistoryIt
         status: 'ok',
         ts,
       };
+    case 'collabAgentToolCall':
+      return collabItem(item, id, ts);
+    case 'subAgentActivity':
+      return subAgentActivityItem(item, id, ts);
+    case 'contextCompaction':
+      // 手动 /compact 和自动压缩都会有；实时和历史都显示成同一张卡
+      return { kind: 'tool', id, toolName: 'Compact', argSummary: '压缩对话上下文', status: 'ok', ts };
     default:
       return undefined;
   }

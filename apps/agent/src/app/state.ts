@@ -55,6 +55,8 @@ export const SessionParamsSchema = z.object({
   engine: z.string().min(1).optional(),
   /** 非 Claude 引擎的权限模式；permissionMode 是它的近似值 */
   engineMode: z.string().min(1).optional(),
+  /** 推理强度；省略 = 跟随引擎自己的配置 */
+  effort: z.string().min(1).optional(),
 });
 export type SessionParams = z.infer<typeof SessionParamsSchema>;
 export type RewindPoint = z.infer<typeof RewindPointSchema>;
@@ -214,7 +216,8 @@ export class AgentState {
       previous.permissionMode === params.permissionMode &&
       previous.started === params.started &&
       previous.engine === params.engine &&
-      previous.engineMode === params.engineMode
+      previous.engineMode === params.engineMode &&
+      previous.effort === params.effort
     ) {
       return;
     }

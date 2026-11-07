@@ -6,9 +6,9 @@
  * 只能等（6 分钟的）超时——所以 `agentVersion >= 0.4.0` 才给入口，版本号解析
  * 不了或还没收到 machine.info 一律当不支持。
  */
-import type { MachineInfo } from '@trine/core';
+import type { EngineSummary, MachineInfo } from '@trine/core';
 import { compareVersions } from '@/components/list/session-actions.ts';
-import type { ClaudeCheckResult, ClaudeUpdateResult } from '@/lib/client.ts';
+import type { ClaudeUpdateResult } from '@/lib/client.ts';
 
 /** 首个支持 machine.claude.update.request 的 agent 版本 */
 export const CLAUDE_UPDATE_MIN_AGENT = '0.4.0';
@@ -38,7 +38,13 @@ export interface ClaudeUpdateSummary {
 /** 运行中的会话不会被重启——结果里必须讲明，否则用户会以为当前会话已是新版 */
 export const RUNNING_SESSIONS_NOTE = '运行中的会话仍是旧版本，新开（或空闲回收后重新打开）的会话才会用上新版。';
 
-export function summarizeClaudeUpdate(res: ClaudeUpdateResult): ClaudeUpdateSummary {
+/** Codex 所有活跃会话共用一个 app-server 进程，要它们都结束才换 */
+export const CODEX_RUNNING_NOTE = '有活跃会话时 Codex 进程不会重启，会话都结束后才用上新版。';
+
+/** 更新应答中各引擎共有的部分 */
+export type UpdateResult = Pick<ClaudeUpdateResult, 'ok' | 'fromVersion' | 'toVersion' | 'output' | 'outputTruncated' | 'error'>;
+
+export function summarizeClaudeUpdate(res: UpdateResult, engineName = 'Claude', runningNote = RUNNING_SESSIONS_NOTE): ClaudeUpdateSummary {
   const from = shortClaudeVersion(res.fromVersion);
   const to = shortClaudeVersion(res.toVersion);
   const output = res.output;
@@ -48,9 +54,9 @@ export function summarizeClaudeUpdate(res: ClaudeUpdateResult): ClaudeUpdateSumm
     return { tone: 'error', title: `更新失败：${message}`, output, outputTruncated };
   }
   if (res.fromVersion === res.toVersion) {
-    return { tone: 'info', title: `Claude 已是最新（${to}）`, output, outputTruncated };
+    return { tone: 'info', title: `${engineName} 已是最新（${to}）`, output, outputTruncated };
   }
-  return { tone: 'success', title: `Claude 已更新：${from} → ${to}`, detail: RUNNING_SESSIONS_NOTE, output, outputTruncated };
+  return { tone: 'success', title: `${engineName} 已更新：${from} → ${to}`, detail: runningNote, output, outputTruncated };
 }
 
 /** 请求本身失败（离线 / 未配对 / 等不到应答） */
@@ -68,7 +74,8 @@ export interface ClaudeLatestView {
   current: string | null;
   /** 发布源上的最新版本；还没查到为 null */
   latest: string | null;
-  channel: 'latest' | 'stable';
+  /** Claude 才有渠道 */
+  channel?: 'latest' | 'stable';
   checkedAt: number | null;
   /** 最近一次检查失败的原因 */
   error: string | null;
@@ -101,6 +108,21 @@ export function claudeLatestView(
   };
 }
 
+/** 引擎目录里的版本信息 → 同一个视图；引擎不能更新时为 null */
+export function engineLatestView(engine: Pick<EngineSummary, 'version' | 'latest' | 'capabilities'>): ClaudeLatestView | null {
+  if (engine.capabilities.update !== true) return null;
+  const current = claudeVersionNumber(engine.version);
+  const version = engine.latest?.version ?? null;
+  const cmp = current === null || version === null ? null : compareVersions(current, version);
+  return {
+    current,
+    latest: version,
+    checkedAt: engine.latest?.checkedAt ?? null,
+    error: engine.latest?.error ?? null,
+    updateAvailable: cmp === null ? null : cmp < 0,
+  };
+}
+
 /** 有新版本时给机器卡的提示（如 `claude 可更新 → 2.1.308`）；否则空串 */
 export function claudeUpdateHint(info: Pick<MachineInfo, 'claudeVersion' | 'claudeLatest'> | null | undefined): string {
   const view = claudeLatestView(info);
@@ -108,13 +130,20 @@ export function claudeUpdateHint(info: Pick<MachineInfo, 'claudeVersion' | 'clau
 }
 
 /** 手动检查的结论（toast 用） */
-export function summarizeClaudeCheck(res: ClaudeCheckResult): { tone: 'success' | 'info' | 'error'; title: string } {
+export interface CheckResult {
+  ok: boolean;
+  currentVersion?: string | undefined;
+  latest?: { version: string } | undefined;
+  error?: { code?: string; message: string } | undefined;
+}
+
+export function summarizeClaudeCheck(res: CheckResult, engineName = 'Claude'): { tone: 'success' | 'info' | 'error'; title: string } {
   if (!res.ok || res.latest === undefined) {
     return { tone: 'error', title: res.error?.message ?? '检查失败：agent 未给出原因' };
   }
   const current = claudeVersionNumber(res.currentVersion);
   const cmp = current === null ? null : compareVersions(current, res.latest.version);
-  if (cmp !== null && cmp < 0) return { tone: 'success', title: `Claude 有新版本：${current} → ${res.latest.version}` };
-  if (cmp === null) return { tone: 'info', title: `Claude 最新版本是 ${res.latest.version}` };
-  return { tone: 'info', title: `Claude 已是最新（${current}）` };
+  if (cmp !== null && cmp < 0) return { tone: 'success', title: `${engineName} 有新版本：${current} → ${res.latest.version}` };
+  if (cmp === null) return { tone: 'info', title: `${engineName} 最新版本是 ${res.latest.version}` };
+  return { tone: 'info', title: `${engineName} 已是最新（${current}）` };
 }

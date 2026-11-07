@@ -39,6 +39,9 @@ is not a substitute for those controls, backups or TLS.
   access, which means no approval prompts and no sandbox; a default can be changed in Settings, and
   approvals in the other modes always go to the browser, never to an automatic reviewer configured
   for Codex. Set `TRINE_ENGINES=claude` to turn this off.
+- With Codex enabled, the agent asks `api.github.com` for the latest Codex release shortly after start
+  and every 6 hours, and any paired device can run `codex update` on the machine, the same exposure
+  as `claude update`. The request carries no session data.
 - The agent keeps plaintext copies of received attachments under `<home>/uploads`
   (deleted with the session) and lets Claude read that session's folder without an
   approval prompt. Any paired controller can place files there.
