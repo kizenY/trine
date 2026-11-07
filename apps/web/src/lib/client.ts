@@ -212,7 +212,8 @@ export const CLAUDE_UPDATE_TIMEOUT_MS = 6 * 60_000;
 export const AGENT_RESTART_TIMEOUT_MS = 7 * 60_000;
 
 /** 检查 claude 最新版本的等待上限：agent 侧请求发布源 15 秒超时，留余量 */
-export const CLAUDE_CHECK_TIMEOUT_MS = 30_000;
+// 包管理器安装时 agent 要先刷新 brew 索引（最长各 60 秒）
+export const CLAUDE_CHECK_TIMEOUT_MS = 130_000;
 
 /** 手动刷新限额用量的等待上限：agent 可能要临时起一个 claude 进程（agent 侧 30s 超时） */
 export const USAGE_REFRESH_TIMEOUT_MS = 45_000;

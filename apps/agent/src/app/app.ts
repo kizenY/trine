@@ -61,6 +61,7 @@ import {
   type SpawnFn,
 } from './claude-cli.ts';
 import { ClaudeLatestChecker } from './claude-latest.ts';
+import { detectPackageInstall, updatePlan } from './package-install.ts';
 import { claudeEngineSummary } from '../engine/claude.ts';
 import { spawnCodexAppServer, type SpawnAppServer } from '../engine/codex/app-server.ts';
 import { CODEX_ENGINE_ID, CodexEngine } from '../engine/codex/engine.ts';
@@ -468,8 +469,14 @@ export class AgentApp {
       now,
       log,
     });
+    const packageTools = deps.spawnFn === undefined ? {} : { spawn: deps.spawnFn };
+    const detectClaudeInstall = () => detectPackageInstall(claude.path, packageTools);
     app.#updater = new ClaudeUpdater({
       executable: claude.path,
+      plan: async () => {
+        const install = await detectClaudeInstall();
+        return install === undefined ? undefined : updatePlan(install);
+      },
       currentVersion: () => app.claudeVersion,
       onVersion: (version) => {
         app.claudeVersion = version;
@@ -480,6 +487,7 @@ export class AgentApp {
       log,
     });
     app.#claudeLatest = new ClaudeLatestChecker({
+      detectInstall: detectClaudeInstall,
       onChange: () => app.#emitMachine({ type: 'machine.info', info: app.machineInfo() }),
       ...(deps.claudeLatest?.fetchImpl === undefined ? {} : { fetchImpl: deps.claudeLatest.fetchImpl }),
       ...(deps.claudeLatest?.configDir === undefined ? {} : { configDir: deps.claudeLatest.configDir }),
@@ -487,14 +495,20 @@ export class AgentApp {
       log,
     });
 
+    void app.#claudeLatest.loadInstall();
     const codexPath = config.codexEnabled === true ? (Bun.which(config.codexBin ?? 'codex') ?? undefined) : undefined;
     if (codex !== undefined && codexPath !== undefined && deps.spawnCodexAppServer === undefined) {
       const spawn = deps.spawnFn;
       const emitInfo = () => app.#emitMachine({ type: 'machine.info', info: app.machineInfo() });
+      const detectCodexInstall = () => detectPackageInstall(codexPath, packageTools);
       app.#codexUpdate = {
         updater: new ClaudeUpdater({
           executable: codexPath,
           label: 'codex',
+          plan: async () => {
+            const install = await detectCodexInstall();
+            return install === undefined ? undefined : updatePlan(install);
+          },
           currentVersion: () => codex.summary().version ?? 'unknown',
           detectVersion: async () =>
             codexVersionNumber(await detectClaudeVersion(codexPath, spawn === undefined ? {} : { spawn })),
@@ -502,8 +516,9 @@ export class AgentApp {
           ...(spawn === undefined ? {} : { spawn }),
           log,
         }),
-        latest: new CodexLatestChecker({ onChange: emitInfo, now, log }),
+        latest: new CodexLatestChecker({ onChange: emitInfo, now, log, detectInstall: detectCodexInstall }),
       };
+      void app.#codexUpdate.latest.loadInstall();
     }
 
     // ---- 自重启（见 restart.ts）----
@@ -694,10 +709,12 @@ export class AgentApp {
   #codexSummary(codex: CodexEngine): EngineSummary {
     const summary = codex.summary();
     if (this.#codexUpdate === undefined) return summary;
+    const { install, ...latest } = this.#codexUpdate.latest.current;
     return {
       ...summary,
       capabilities: { ...summary.capabilities, update: true },
-      latest: this.#codexUpdate.latest.current,
+      latest,
+      ...(install === undefined ? {} : { install }),
     };
   }
 

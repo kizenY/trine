@@ -381,6 +381,14 @@ export type MachineRestartInfo = z.infer<typeof MachineRestartInfoSchema>;
  * （`downloads.claude.ai/claude-code-releases/<channel>`）查到的版本，与 claudeVersion 比较
  * 即知有没有新版本。启动后与每 6 小时自动查一次，也可手动 `machine.claude.check.request`。
  */
+export const EngineInstallSchema = z.object({
+  /** 包管理器（brew、apt）；开放字符串，client 不认识就原样显示 */
+  manager: z.string().min(1).max(32),
+  /** 机器上实际会跑的更新命令，给人看 */
+  command: z.string().min(1).max(300),
+});
+export type EngineInstall = z.infer<typeof EngineInstallSchema>;
+
 export const MachineClaudeLatestSchema = z.object({
   /** 查询的渠道：claude settings 的 `autoUpdatesChannel`，默认 latest */
   channel: z.enum(['latest', 'stable']),
@@ -390,6 +398,8 @@ export const MachineClaudeLatestSchema = z.object({
   checkedAt: TimestampSchema.optional(),
   /** 最近一次查询失败的原因（给人看）；之后查成功就清掉 */
   error: z.string().max(300).optional(),
+  /** 由包管理器安装时才有（agent ≥ 0.23.0）：更新走它，version 也是它能装上的版本 */
+  install: EngineInstallSchema.optional(),
 });
 export type MachineClaudeLatest = z.infer<typeof MachineClaudeLatestSchema>;
 
@@ -494,6 +504,8 @@ export const EngineSummarySchema = z.object({
       error: z.string().max(300).optional(),
     })
     .optional(),
+  /** 由包管理器安装时才有（agent ≥ 0.23.0）：更新走它，latest 也是它能装上的版本 */
+  install: EngineInstallSchema.optional(),
 });
 export type EngineSummary = z.infer<typeof EngineSummarySchema>;
 

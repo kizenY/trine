@@ -65,6 +65,10 @@ the agent runs on your own computer.
   the list can filter by it. New Codex sessions default to full access; change it in Settings. Plan
   mode, background tasks, cost and restoring files on rewind are Claude-only for now. Set `TRINE_ENGINES=claude` to turn
   Codex off, `TRINE_CODEX_BIN` to choose the executable. Requires agent 0.21.0 or later.
+- With agent 0.23.0 or later, updates and version checks follow how the engine was installed: Homebrew
+  (cask or formula) and apt use the package manager, and the machine page shows the exact command. The
+  latest version is what that package manager can install. apt needs passwordless `sudo` for the agent's
+  user; otherwise the error tells you the command to run on the machine.
 - With agent 0.22.0 or later, Codex sessions can also rewind the conversation (files are not
   restored, and the dialog says so), compact with `/compact`, run skills from the `/` menu and choose a
   reasoning effort. Sub-agent activity shows as tool cards. The machine page has a card per engine, with

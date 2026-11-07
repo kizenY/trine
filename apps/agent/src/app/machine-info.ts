@@ -64,7 +64,9 @@ import type {
 // - 0.22.0 起引擎能力多了 effort / update，Codex 支持回退对话、推理强度（session.create 的 effort、
 //   session.setEffort，SessionMeta 带 effort）、压缩和 skills（session.commands.response）；
 //   支持 machine.engine.update.request / machine.engine.check.request
-export const AGENT_VERSION = '0.22.0';
+// - 0.23.0 起引擎由 Homebrew、apt 安装时更新和版本检查走包管理器；MachineInfo.claudeLatest、
+//   EngineSummary 带 install（实际的更新命令）
+export const AGENT_VERSION = '0.23.0';
 
 export function buildMachineInfo(input: {
   name: string;

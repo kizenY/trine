@@ -207,3 +207,30 @@ describe('EngineUpdateSection', () => {
     expect($('claude-update')!.textContent).toBe('更新 Claude');
   });
 });
+
+describe('包管理器安装', () => {
+  test('显示实际会跑的命令和安装方式；确认框里也是它', () => {
+    render({
+      update: () => new Promise(() => {}),
+      latest: {
+        current: '2.1.251',
+        latest: '2.1.300',
+        channel: 'latest',
+        checkedAt: null,
+        error: null,
+        updateAvailable: true,
+        install: { manager: 'apt', command: 'sudo -n apt-get update && sudo -n apt-get install --only-upgrade -y claude-code' },
+      },
+    });
+    expect($('claude-update-command')?.textContent).toBe('sudo -n apt-get update && sudo -n apt-get install --only-upgrade -y claude-code');
+    expect($('claude-latest')?.textContent).toContain('apt 安装');
+    click($('claude-update')!);
+    expect($('confirm-claude-update')?.textContent).toContain('apt-get install --only-upgrade');
+  });
+
+  test('原生安装仍是 claude update', () => {
+    render({ update: () => new Promise(() => {}), latest: null });
+    expect($('claude-update-command')?.textContent).toBe('claude update');
+  });
+});
+

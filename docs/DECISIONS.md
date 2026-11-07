@@ -190,6 +190,9 @@ Codex，否则 Codex 会话的标记过 30 天会被当成失效清掉。
 所以「默认」要写成模型默认值。最新版本查 GitHub release：Codex 自己的 `version.json` 只在运行 TUI 时刷新，可能过期。子 agent 的 item 只显示成卡片，
 不展开子 thread；这部分按协议类型实现，没有实测触发过。子 thread 的审批不会转到浏览器。
 
+**包管理器安装（agent 0.23.0）。** `claude update` 遇到 Homebrew、apt 只打印提示，退出码还是 0，不能靠它。所以 agent 按可执行文件的真实路径和 `dpkg-query` 识别安装方式，
+更新和版本检查都走包管理器：能装上什么版本由 cask 和 apt 源决定，按发布源比较会一直提示「有新版本」。apt 用 `sudo -n`，不等密码，也不做提权配置；没有免密 sudo 时把命令告诉用户。
+
 同一个 thread 同时只能有一个进程写（Codex 回 `already has an active writer`），与 D3「同一会话只有一个活跃控制进程」一致：在 CLI 里正开着的 thread，trine 续接或删除会失败并显示原因，不强占。
 
 **权限。** 审批一律显式路由给用户（`approvalsReviewer: user`），否则会继承配置里的自动审核，绕过浏览器。续接外部 thread 时不传权限覆盖，

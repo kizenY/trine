@@ -17,12 +17,16 @@
  *   `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC`）时不自动查，与 claude 的选择一致。
  * - 手动：`machine.claude.check.request` → `check()`。
  *
+ * 由 Homebrew、apt 安装时不查这里，改问包管理器（见 package-install.ts）：cask 和 apt 源各有渠道，
+ * 能装上的版本由它们决定。
+ *
  * 单飞：进行中再来的请求共用同一次查询的结果。代理变量由 Bun 的 fetch 自己读环境变量。
  */
 import { readFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import type { MachineClaudeLatest } from '@trine/core';
+import { installSummary, latestFromManager, type ManagerLatest, type PackageInstall } from './package-install.ts';
 
 export const CLAUDE_RELEASES_BASE = 'https://downloads.claude.ai/claude-code-releases';
 /** 自动检查的间隔 */
@@ -84,6 +88,10 @@ export interface ClaudeLatestCheckerOptions {
   /** 状态变了（查到新结果 / 失败原因变了）：app 广播 machine.info */
   onChange?: () => void;
   fetchImpl?: typeof fetch;
+  /** 识别安装方式；不给 = 总是查发布源 */
+  detectInstall?: () => Promise<PackageInstall | undefined>;
+  /** 问包管理器的最新版本（测试注入） */
+  managerLatest?: (install: PackageInstall) => Promise<ManagerLatest>;
   /** claude 配置目录（读渠道）；默认 claudeConfigDir() */
   configDir?: string;
   env?: Readonly<Record<string, string | undefined>>;
@@ -109,6 +117,14 @@ export class ClaudeLatestChecker {
   /** 当前状态（放进 machine.info.claudeLatest） */
   get current(): MachineClaudeLatest {
     return this.#state;
+  }
+
+  /** 启动时调一次：不等第一次检查，界面就能显示实际的更新命令 */
+  async loadInstall(): Promise<void> {
+    const install = installSummary(await this.#opts.detectInstall?.().catch(() => undefined));
+    if (install === undefined || this.#disposed) return;
+    this.#state = { ...this.#state, install };
+    this.#opts.onChange?.();
   }
 
   /** 查一次；进行中则共用。不抛 */
@@ -144,15 +160,25 @@ export class ClaudeLatestChecker {
   }
 
   async #run(): Promise<ClaudeCheckOutcome> {
-    const channel = await readUpdateChannel(this.#opts.configDir ?? claudeConfigDir(this.#opts.env));
+    let channel = await readUpdateChannel(this.#opts.configDir ?? claudeConfigDir(this.#opts.env));
+    const packageInstall = await this.#opts.detectInstall?.().catch(() => undefined);
+    const install = installSummary(packageInstall);
+    const withInstall = install === undefined ? {} : { install };
     let outcome: ClaudeCheckOutcome;
     try {
-      const version = await fetchLatestClaudeVersion(
-        channel,
-        this.#opts.fetchImpl === undefined ? {} : { fetchImpl: this.#opts.fetchImpl },
-      );
+      let version: string;
+      if (packageInstall === undefined) {
+        version = await fetchLatestClaudeVersion(
+          channel,
+          this.#opts.fetchImpl === undefined ? {} : { fetchImpl: this.#opts.fetchImpl },
+        );
+      } else {
+        const latest = await (this.#opts.managerLatest ?? latestFromManager)(packageInstall);
+        version = latest.version;
+        channel = latest.channel ?? channel;
+      }
       outcome = { ok: true, version, channel };
-      this.#state = { channel, version, checkedAt: this.#now() };
+      this.#state = { channel, version, checkedAt: this.#now(), ...withInstall };
     } catch (err) {
       const message = `检查 claude 最新版本失败：${err instanceof Error ? err.message : String(err)}`.slice(0, 300);
       outcome = { ok: false, message };
@@ -163,6 +189,7 @@ export class ClaudeLatestChecker {
         ...(keep.version === undefined ? {} : { version: keep.version }),
         ...(keep.checkedAt === undefined ? {} : { checkedAt: keep.checkedAt }),
         error: message,
+        ...withInstall,
       };
       this.#log(`[claude] ${message}`);
     }

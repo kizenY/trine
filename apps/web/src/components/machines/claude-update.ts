@@ -6,7 +6,7 @@
  * 只能等（6 分钟的）超时——所以 `agentVersion >= 0.4.0` 才给入口，版本号解析
  * 不了或还没收到 machine.info 一律当不支持。
  */
-import type { EngineSummary, MachineInfo } from '@trine/core';
+import type { EngineInstall, EngineSummary, MachineInfo } from '@trine/core';
 import { compareVersions } from '@/components/list/session-actions.ts';
 import type { ClaudeUpdateResult } from '@/lib/client.ts';
 
@@ -76,6 +76,8 @@ export interface ClaudeLatestView {
   latest: string | null;
   /** Claude 才有渠道 */
   channel?: 'latest' | 'stable';
+  /** 由包管理器安装时才有 */
+  install?: EngineInstall;
   checkedAt: number | null;
   /** 最近一次检查失败的原因 */
   error: string | null;
@@ -105,11 +107,19 @@ export function claudeLatestView(
     checkedAt: latest.checkedAt ?? null,
     error: latest.error ?? null,
     updateAvailable: cmp === null ? null : cmp < 0,
+    ...(latest.install === undefined ? {} : { install: latest.install }),
   };
 }
 
+const MANAGER_LABEL: Record<string, string> = { brew: 'Homebrew', apt: 'apt' };
+
+/** 包管理器的显示名；不认识的原样显示 */
+export function managerLabel(manager: string): string {
+  return MANAGER_LABEL[manager] ?? manager;
+}
+
 /** 引擎目录里的版本信息 → 同一个视图；引擎不能更新时为 null */
-export function engineLatestView(engine: Pick<EngineSummary, 'version' | 'latest' | 'capabilities'>): ClaudeLatestView | null {
+export function engineLatestView(engine: Pick<EngineSummary, 'version' | 'latest' | 'capabilities' | 'install'>): ClaudeLatestView | null {
   if (engine.capabilities.update !== true) return null;
   const current = claudeVersionNumber(engine.version);
   const version = engine.latest?.version ?? null;
@@ -120,6 +130,7 @@ export function engineLatestView(engine: Pick<EngineSummary, 'version' | 'latest
     checkedAt: engine.latest?.checkedAt ?? null,
     error: engine.latest?.error ?? null,
     updateAvailable: cmp === null ? null : cmp < 0,
+    ...(engine.install === undefined ? {} : { install: engine.install }),
   };
 }
 

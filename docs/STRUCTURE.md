@@ -32,6 +32,7 @@ docs/          功能范围、架构决策与协议说明
 - `core/crypto`：crypto_box、附件 secretstream、Ed25519、配对材料与 SAS；不依赖 UI。
 - `core/net`：认证客户端、relay blob 客户端与地址推导。
 - `agent/app`：配置、生命周期、命令路由、状态、回退编排、CLI 更新与订阅限额用量（`plan-usage.ts`）、机器资源采样与订阅（`machine-stats.ts`）。
+- `agent/app/package-install.ts`：识别引擎由 Homebrew、apt 安装，给出更新命令和可安装的最新版本。
 - `agent/engine`：引擎抽象（`EngineSession` 接口、引擎描述），router 和 manager 只依赖接口，见 DECISIONS D20；`engine/codex` 是 Codex 引擎（app-server 客户端、会话目录、历史映射、版本检查）。
 - `agent/bridge`：Claude 引擎的实现——SDK 会话、工具权限、事件翻译、历史与子代理历史、附件落盘（`attachments.ts`）、用量解析（`usage.ts`）。
 - `agent/net`：设备身份、收件人列表、加密信封、配对与 WS 客户端。

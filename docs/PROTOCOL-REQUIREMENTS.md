@@ -308,6 +308,7 @@ agent 侧所有产出 SessionMeta 的出口（list、session.created、session.u
 - 回退（agent ≥ 0.22.0）：`capabilities.rewind` 列出支持的模式，Codex 只有 `conversation`，`code`、`both` 回 `unavailable`。Codex 第一条消息也能回退；一轮中追加的消息回 `invalid`，因为撤掉的是整轮；旧格式 thread 回 `unavailable`。预览的 `files` 恒为不可用。
 - 压缩和 skill 不加帧：`session.commands.response` 给出清单（`compact` + 启用的 skill），client 照常把 `/name …` 当文本发送，Codex 引擎在 agent 端转成压缩或 skill 调用。不是 skill 的文本原样发给模型。
 - `session.setEffort`、`session.create.effort`、`SessionMeta.effort`（agent ≥ 0.22.0，`capabilities.effort`）：推理强度，开放字符串，选项在 `EngineModel.efforts`。模型不支持的值不采用。`session.setEffort` 省略 `effort` = 回到模型默认值。
+- `MachineClaudeLatest.install`、`EngineSummary.install`（agent ≥ 0.23.0）：引擎由包管理器安装时才有，`manager` 是开放字符串，`command` 是实际执行的命令，只用于显示。这时最新版本来自包管理器；Claude 的 `channel` 优先取 cask 名或 apt 源地址。
 - `machine.engine.update.request`、`machine.engine.check.request` 及其应答（agent ≥ 0.22.0，`capabilities.update`）：语义同 `machine.claude.*`，多一个 `engine`。最新版本在 `EngineSummary.latest`，先随 `machine.info` 广播再回应答。
 - `EngineSummary.rateLimits.windows`：引擎的限额窗口，数量和时长因账号而异（实测有只给周窗口的账号），不能假设是 5 小时 + 7 天。Claude 的限额仍在 `MachineInfo.rateLimits`。
 

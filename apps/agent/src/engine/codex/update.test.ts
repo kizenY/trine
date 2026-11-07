@@ -37,4 +37,20 @@ describe('Codex 最新版本', () => {
     expect(checker.current).toEqual({ version: '0.3.0', checkedAt: 42 });
     expect(changes).toBe(3);
   });
+
+  test('包管理器安装：问包管理器，不查 GitHub', async () => {
+    let fetched = 0;
+    const checker = new CodexLatestChecker({
+      fetchImpl: (async () => {
+        fetched += 1;
+        return new Response('{}');
+      }) as unknown as typeof fetch,
+      detectInstall: async () => ({ manager: 'brew', brew: '/opt/homebrew/bin/brew', token: 'codex', kind: 'cask' }),
+      managerLatest: async () => ({ version: '0.166.0' }),
+      now: () => 42,
+    });
+    expect(await checker.check()).toEqual({ ok: true, version: '0.166.0' });
+    expect(fetched).toBe(0);
+    expect(checker.current).toEqual({ version: '0.166.0', checkedAt: 42, install: { manager: 'brew', command: 'brew upgrade --cask codex' } });
+  });
 });

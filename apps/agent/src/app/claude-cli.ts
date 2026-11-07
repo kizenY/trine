@@ -183,6 +183,8 @@ export interface ClaudeUpdaterOptions {
   executable: string | undefined;
   /** 文案和日志里的名字；默认 claude */
   label?: string;
+  /** 包管理器安装时的更新计划（见 package-install.ts）；给 undefined = 引擎自己的 `<executable> update` */
+  plan?: () => Promise<{ commands: string[][]; display: string; explainFailure?: (output: string) => string | undefined } | undefined>;
   /** agent 当前记着的版本（busy / not_found 时原样回报，探测失败时兜底） */
   currentVersion: () => string;
   /** 更新跑完（无论成败）后重新探测到的版本；app 据此刷新 claudeVersion 并广播 machine.info */
@@ -243,7 +245,9 @@ export class ClaudeUpdater {
     try {
       const fromVersion = await this.#detect(current);
       this.#log(`[${this.#label}] 开始更新 ${executable}（当前 ${fromVersion}）`);
-      const run = await this.#exec(executable);
+      const plan = await this.#opts.plan?.();
+      const display = plan?.display ?? `${this.#label} update`;
+      const run = await this.#execAll(plan?.commands ?? [[executable, 'update']]);
       const toVersion = await this.#detect('unknown');
       if (!this.#disposed) this.#opts.onVersion?.(toVersion);
       const { text, truncated } = tailOutput(run.raw);
@@ -253,15 +257,22 @@ export class ClaudeUpdater {
         case 'exit':
           return run.code === 0
             ? { ok: true, ...base }
-            : { ok: false, ...base, error: { code: 'failed', message: `${this.#label} update 退出码 ${run.code}` } };
+            : {
+                ok: false,
+                ...base,
+                error: {
+                  code: 'failed',
+                  message: (plan?.explainFailure?.(text) ?? `${display} 退出码 ${run.code}`).slice(0, 300),
+                },
+              };
         case 'timeout':
           return {
             ok: false,
             ...base,
-            error: { code: 'timeout', message: `${this.#label} update 超过 ${Math.round(this.#timeoutMs / 1000)}s 未结束，已终止` },
+            error: { code: 'timeout', message: `${display} 超过 ${Math.round(this.#timeoutMs / 1000)}s 未结束，已终止` },
           };
         case 'spawn_error':
-          return { ok: false, ...base, error: { code: 'failed', message: `无法启动 ${this.#label} update：${run.message}` } };
+          return { ok: false, ...base, error: { code: 'failed', message: `无法启动 ${display}：${run.message}` } };
       }
     } finally {
       this.#running = false;
@@ -302,14 +313,31 @@ export class ClaudeUpdater {
     return v === 'unknown' ? fallback : v;
   }
 
-  async #exec(executable: string): Promise<CapturedRun> {
-    return runCaptured(this.#spawn, [executable, 'update'], {
-      env: this.#opts.env ?? process.env,
-      timeoutMs: this.#timeoutMs,
-      onSpawn: (proc) => {
-        this.#current = proc;
-      },
-    });
+  /** 依次执行，某一步不成功就停；输出拼在一起，返回最后执行的那步的结果 */
+  async #execAll(commands: string[][]): Promise<CapturedRun> {
+    let raw = '';
+    let rawTruncated = false;
+    let last: CapturedRun = { kind: 'exit', code: 0, raw: '', rawTruncated: false };
+    // 超时算整个流程的：网页按这个上限等
+    const deadline = Date.now() + this.#timeoutMs;
+    for (const command of commands) {
+      const timeoutMs = deadline - Date.now();
+      if (timeoutMs <= 0) {
+        last = { kind: 'timeout', raw: '', rawTruncated: false };
+        break;
+      }
+      last = await runCaptured(this.#spawn, command, {
+        env: this.#opts.env ?? process.env,
+        timeoutMs,
+        onSpawn: (proc) => {
+          this.#current = proc;
+        },
+      });
+      raw += last.raw;
+      rawTruncated ||= last.rawTruncated;
+      if (last.kind !== 'exit' || last.code !== 0) break;
+    }
+    return { ...last, raw, rawTruncated };
   }
 }
 

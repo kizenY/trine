@@ -39,6 +39,11 @@ is not a substitute for those controls, backups or TLS.
   access, which means no approval prompts and no sandbox; a default can be changed in Settings, and
   approvals in the other modes always go to the browser, never to an automatic reviewer configured
   for Codex. Set `TRINE_ENGINES=claude` to turn this off.
+- When an engine was installed with apt, a paired device can make the agent run `sudo -n apt-get update`
+  and `sudo -n apt-get install --only-upgrade -y <package>`. The commands are fixed and the package name
+  comes from `dpkg-query`, not from the client. This only works if you gave the agent's user passwordless
+  `sudo`, and such a user's sessions can already run anything as root. To limit it, allow only these
+  two commands in sudoers. Homebrew runs as the agent's user.
 - With Codex enabled, the agent asks `api.github.com` for the latest Codex release shortly after start
   and every 6 hours, and any paired device can run `codex update` on the machine, the same exposure
   as `claude update`. The request carries no session data.

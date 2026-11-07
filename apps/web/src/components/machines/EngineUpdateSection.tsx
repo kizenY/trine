@@ -12,6 +12,7 @@ import { toast } from 'sonner';
 import { Button } from '@/components/ui/button.tsx';
 import { ConfirmDialog } from '@/components/machines/ConfirmDialog.tsx';
 import {
+  managerLabel,
   RUNNING_SESSIONS_NOTE,
   shortClaudeVersion,
   summarizeClaudeCheck,
@@ -104,14 +105,16 @@ export function EngineUpdateSection({
   };
 
   const updateAvailable = latest?.updateAvailable === true;
+  // 包管理器安装时显示实际会跑的命令；旧 agent 没有这个字段
+  const runCommand = latest?.install?.command ?? command;
   const current = version === undefined || version.trim() === '' ? '未知' : shortClaudeVersion(version);
 
   return (
     <section className="flex flex-col gap-2" data-testid={`${idPrefix}-update-section`}>
       {showTitle && <h2 className="font-medium">{engineName}</h2>}
       <p className="text-text-3 text-xs">
-        在这台机器上执行 <code className="font-mono">{command}</code>，把远程会话使用的 {command.split(' ')[0]}{' '}
-        更新到最新版。{runningNote}
+        在这台机器上执行 <code className="font-mono" data-testid={`${idPrefix}-update-command`}>{runCommand}</code>，把远程会话使用的{' '}
+        {idPrefix} 更新到最新版。{runningNote}
       </p>
       {latest !== null && (
         <div className="flex flex-col gap-0.5 text-xs" data-testid={`${idPrefix}-latest`}>
@@ -132,6 +135,7 @@ export function EngineUpdateSection({
           </p>
           <p className="text-text-3">
             {[
+              ...(latest.install === undefined ? [] : [`${managerLabel(latest.install.manager)} 安装`]),
               ...(latest.channel === undefined ? [] : [`${latest.channel} 渠道`]),
               ...(latest.checkedAt === null ? [] : [`${formatRelativeTime(latest.checkedAt, now)}检查`]),
               'agent 每 6 小时自动检查',
@@ -225,7 +229,7 @@ export function EngineUpdateSection({
           <>
             <p>
               当前版本：<span className="font-mono">{current}</span>。agent 会在这台机器上执行{' '}
-              <code className="font-mono">{command}</code>，最长 5 分钟。
+              <code className="font-mono">{runCommand}</code>，最长 5 分钟。
             </p>
             <p>{runningNote}</p>
           </>
