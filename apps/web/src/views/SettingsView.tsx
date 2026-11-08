@@ -10,13 +10,13 @@
  * - **忘记服务端并清除身份**：连 deviceId 与密钥一起删。这是换设备身份，
  *   agent 侧的旧登记作废，必须在 agent 上重新出配对码。
  *
- * prompt 片段、knownModels 与新会话默认模型 / 权限模式存本地 prefs（决策：
+ * prompt 片段、knownModels 与新会话默认模型 / 权限模式 / effort 存本地 prefs（决策：
  * 片段存 client 本地；常用目录才存 agent 端）。默认值只决定新建会话 sheet 的
  * 预选；会话建好后各自的模型 / 权限由 agent 记住，改默认值不影响已有会话。
  */
 import { useEffect, useState } from 'react';
-import { CLAUDE_ENGINE_ID, type EngineSummary } from '@trine/core';
-import { creatableEngines, ENGINE_DEFAULT_MODEL } from '@/lib/engine-model.ts';
+import { CLAUDE_EFFORT_LEVELS, CLAUDE_ENGINE_ID, type EngineSummary } from '@trine/core';
+import { creatableEngines, effortOptions, ENGINE_DEFAULT_MODEL } from '@/lib/engine-model.ts';
 import { NavLink, useNavigate } from 'react-router';
 import { ArrowUpIcon, CopyIcon, PencilIcon, PlusIcon, XIcon } from 'lucide-react';
 import { toast } from 'sonner';
@@ -401,13 +401,15 @@ const COMPRESS_OPTIONS: { value: number; label: string }[] = [
 /** 附件：每条消息的个数 / 合计上限，图片压缩阈值 */
 function AttachmentSettings(): React.JSX.Element {
   const client = useClient();
+  const serverUrl = useTrine((s) => s.serverUrl);
   const maxCount = useTrine((s) => s.prefs.attachMaxCount);
   const maxTotalMb = useTrine((s) => s.prefs.attachMaxTotalMb);
   const compressMb = useTrine((s) => s.prefs.imageCompressMb);
   const [relayMax, setRelayMax] = useState<number | null>(null);
   useEffect(() => {
+    if (client === null || serverUrl === null) return;
     let alive = true;
-    client?.blobConfig().then(
+    client.blobConfig().then(
       (c) => {
         if (alive) setRelayMax(c.maxBytes);
       },
@@ -416,7 +418,7 @@ function AttachmentSettings(): React.JSX.Element {
     return () => {
       alive = false;
     };
-  }, [client]);
+  }, [client, serverUrl]);
 
   return (
     <section className="flex flex-col gap-2" data-testid="attachment-settings">
@@ -511,88 +513,120 @@ function NumberSetting({
   );
 }
 
-/** 新会话默认值：新建会话 sheet 预选的模型与权限模式 */
-/**
- * 引擎相关的新会话默认：默认引擎，以及带自己目录的引擎（Codex）的默认模型、权限模式。
- * Claude 的默认值在 SessionDefaults。只有一个引擎时不显示，界面不变。
- */
-function EngineDefaults(): React.JSX.Element | null {
+/** 按引擎分组的新会话默认值；Claude 保留原模型 / 权限偏好字段以兼容旧设置。 */
+function EngineDefaults(): React.JSX.Element {
   const client = useClient();
   const machines = useTrine((s) => s.machines);
   const defaultEngine = useTrine((s) => s.prefs.defaultEngine);
   const engineDefaults = useTrine((s) => s.prefs.engineDefaults);
-  const [pending, setPending] = useState<string | null>(null);
+  const [pendingByEngine, setPendingByEngine] = useState<Record<string, string | null>>({});
   const engines = new Map<string, EngineSummary>();
   for (const m of Object.values(machines)) {
     for (const e of creatableEngines(m.info)) if (!engines.has(e.id)) engines.set(e.id, e);
   }
-  if (engines.size < 2) return null;
   const save = (id: string, next: { model?: string; mode?: string }): void => {
     client?.updatePrefs({ engineDefaults: { ...engineDefaults, [id]: { ...engineDefaults[id], ...next } } });
   };
   return (
-    <section className="flex flex-col gap-3" data-testid="engine-defaults">
-      <div className="flex flex-col gap-1.5">
-        <h3 className="text-text-3 text-xs">默认引擎</h3>
-        <div className="flex flex-wrap gap-1.5">
-          {[...engines.values()].map((e) => (
-            <Chip
-              key={e.id}
-              data-testid="default-engine-chip"
-              data-engine={e.id}
-              selected={(defaultEngine ?? CLAUDE_ENGINE_ID) === e.id}
-              onClick={() => client?.updatePrefs({ defaultEngine: e.id })}
-            >
-              {e.displayName}
-            </Chip>
-          ))}
+    <div className="@container flex flex-col gap-4" data-testid="engine-defaults">
+      {engines.size > 1 && (
+        <div className="flex flex-col gap-1.5">
+          <h3 className="text-text-3 text-xs">默认引擎</h3>
+          <div className="flex flex-wrap gap-1.5">
+            {[...engines.values()].map((e) => (
+              <Chip
+                key={e.id}
+                data-testid="default-engine-chip"
+                data-engine={e.id}
+                selected={(defaultEngine ?? CLAUDE_ENGINE_ID) === e.id}
+                onClick={() => client?.updatePrefs({ defaultEngine: e.id })}
+              >
+                {e.displayName}
+              </Chip>
+            ))}
+          </div>
         </div>
+      )}
+      <div className="grid items-start gap-4 @min-[600px]:grid-cols-2">
+        <div className="bg-surface-2/50 min-w-0 rounded-xl border border-border p-4">
+          <SessionDefaults />
+        </div>
+        {[...engines.values()]
+          .filter((e) => e.modes !== undefined)
+          .map((e) => {
+            const modes = e.modes ?? [];
+            const model = engineDefaults[e.id]?.model ?? ENGINE_DEFAULT_MODEL;
+            const pending = pendingByEngine[e.id] ?? null;
+            const state = { value: initialEngineMode(modes, engineDefaults[e.id]?.mode), pending };
+            const warning = engineModeWarning(state, modes);
+            return (
+              <section key={e.id} className="bg-surface-2/50 flex min-w-0 flex-col gap-2 rounded-xl border border-border p-4" data-engine={e.id}>
+                <h3 className="mb-1 font-medium">{e.displayName}</h3>
+                <div className="text-text-3 text-xs">模型</div>
+                <div className="flex flex-wrap gap-1.5">
+                  <Chip selected={model === ENGINE_DEFAULT_MODEL} onClick={() => save(e.id, { model: ENGINE_DEFAULT_MODEL })}>
+                    跟随配置
+                  </Chip>
+                  {e.models?.map((m) => (
+                    <Chip key={m.id} selected={model === m.id} className="font-mono" onClick={() => save(e.id, { model: m.id })}>
+                      {m.label}
+                    </Chip>
+                  ))}
+                </div>
+                <DefaultEffortSetting engineId={e.id} levels={effortOptions(e, model)?.efforts} />
+                <div className="text-text-3 mt-1 text-xs">权限模式</div>
+                <div className="flex flex-wrap gap-1.5">
+                  {modes.map((mode) => (
+                    <Chip
+                      key={mode.id}
+                      data-testid="engine-default-mode"
+                      data-mode={mode.id}
+                      title={mode.description}
+                      selected={state.value === mode.id}
+                      className={cn(pending === mode.id && 'border-red bg-red-soft text-red font-medium')}
+                      onClick={() => {
+                        const next = clickEngineMode(state, mode.id, modes);
+                        setPendingByEngine((previous) => ({ ...previous, [e.id]: next.pending }));
+                        if (next.pending === null && next.value !== undefined) save(e.id, { mode: next.value });
+                      }}
+                    >
+                      {mode.label}
+                    </Chip>
+                  ))}
+                </div>
+                {warning !== '' && <p className="text-red text-[11.5px]">{warning}</p>}
+              </section>
+            );
+          })}
       </div>
-      {[...engines.values()]
-        .filter((e) => e.modes !== undefined)
-        .map((e) => {
-          const modes = e.modes ?? [];
-          const model = engineDefaults[e.id]?.model ?? ENGINE_DEFAULT_MODEL;
-          const state = { value: initialEngineMode(modes, engineDefaults[e.id]?.mode), pending };
-          const warning = engineModeWarning(state, modes);
-          return (
-            <div key={e.id} className="flex flex-col gap-1.5" data-engine={e.id}>
-              <h3 className="text-text-3 text-xs">{e.displayName} 默认模型</h3>
-              <div className="flex flex-wrap gap-1.5">
-                <Chip selected={model === ENGINE_DEFAULT_MODEL} onClick={() => save(e.id, { model: ENGINE_DEFAULT_MODEL })}>
-                  跟随配置
-                </Chip>
-                {e.models?.map((m) => (
-                  <Chip key={m.id} selected={model === m.id} className="font-mono" onClick={() => save(e.id, { model: m.id })}>
-                    {m.label}
-                  </Chip>
-                ))}
-              </div>
-              <h3 className="text-text-3 mt-1 text-xs">{e.displayName} 默认权限模式</h3>
-              <div className="flex flex-wrap gap-1.5">
-                {modes.map((mode) => (
-                  <Chip
-                    key={mode.id}
-                    data-testid="engine-default-mode"
-                    data-mode={mode.id}
-                    title={mode.description}
-                    selected={state.value === mode.id}
-                    className={cn(pending === mode.id && 'border-red bg-red-soft text-red font-medium')}
-                    onClick={() => {
-                      const next = clickEngineMode(state, mode.id, modes);
-                      setPending(next.pending);
-                      if (next.pending === null && next.value !== undefined) save(e.id, { mode: next.value });
-                    }}
-                  >
-                    {mode.label}
-                  </Chip>
-                ))}
-              </div>
-              {warning !== '' && <p className="text-red text-[11.5px]">{warning}</p>}
-            </div>
-          );
-        })}
-    </section>
+    </div>
+  );
+}
+
+function DefaultEffortSetting({ engineId, levels }: {
+  engineId: string;
+  levels: readonly string[] | undefined;
+}): React.JSX.Element | null {
+  const client = useClient();
+  const defaults = useTrine((s) => s.prefs.engineDefaults);
+  if (levels === undefined || levels.length === 0) return null;
+  const saved = defaults[engineId]?.effort;
+  const selected = saved !== undefined && levels.includes(saved) ? saved : undefined;
+  const save = (effort: string | undefined): void => {
+    const { effort: _previous, ...rest } = defaults[engineId] ?? {};
+    client?.updatePrefs({ engineDefaults: { ...defaults, [engineId]: { ...rest, ...(effort === undefined ? {} : { effort }) } } });
+  };
+  return (
+    <div className="mt-1 flex flex-col gap-1.5" data-testid="default-effort" data-engine={engineId}>
+      <div className="text-text-3 text-xs">推理强度 · effort</div>
+      <div className="flex flex-wrap gap-1.5">
+        <Chip selected={selected === undefined} onClick={() => save(undefined)}>跟随配置</Chip>
+        {levels.map((level) => (
+          <Chip key={level} selected={selected === level} onClick={() => save(level)} className="font-mono">{level}</Chip>
+        ))}
+      </div>
+      <p className="text-text-3 text-xs leading-relaxed">强度越高，通常耗时和用量越多。实际支持范围由模型决定。</p>
+    </div>
   );
 }
 
@@ -615,8 +649,7 @@ function SessionDefaults(): React.JSX.Element {
 
   return (
     <section className="flex flex-col gap-2" data-testid="session-defaults">
-      <h2 className="font-medium">新会话默认值</h2>
-      <p className="text-text-3 text-xs">新建会话时预选的模型与权限模式。已有会话各自记住自己的设置，不受影响。</p>
+      <h3 className="mb-1 font-medium">Claude Code</h3>
       <div className="text-text-3 text-[11px] tracking-[0.05em] uppercase">模型</div>
       <div className="flex flex-wrap gap-1.5">
         {chips.map((m) => (
@@ -647,6 +680,7 @@ function SessionDefaults(): React.JSX.Element {
           使用
         </Button>
       </div>
+      <DefaultEffortSetting engineId={CLAUDE_ENGINE_ID} levels={CLAUDE_EFFORT_LEVELS} />
       <div className="text-text-3 mt-1 text-[11px] tracking-[0.05em] uppercase">权限模式</div>
       <div className="flex flex-wrap gap-1.5">
         {PERMISSION_MODE_OPTIONS.map((opt) => {
@@ -679,6 +713,31 @@ function SessionDefaults(): React.JSX.Element {
   );
 }
 
+const SETTINGS_SECTIONS = [
+  ['sessions', '会话默认值'],
+  ['appearance-input', '外观与输入'],
+  ['attachments-extensions', '附件与扩展'],
+  ['devices', '设备与连接'],
+  ['maintenance', '维护与重置'],
+] as const;
+
+function SettingsSection({ id, title, description, children }: {
+  id: string;
+  title: string;
+  description: string;
+  children: React.ReactNode;
+}): React.JSX.Element {
+  return (
+    <section id={id} aria-labelledby={`${id}-title`} className="border-border bg-surface min-w-0 scroll-mt-20 overflow-hidden rounded-2xl border @min-[800px]/settings:scroll-mt-6">
+      <div className="border-border flex flex-col gap-1.5 border-b px-4 py-4 sm:px-5">
+        <h2 id={`${id}-title`} className="font-semibold">{title}</h2>
+        <p className="text-text-3 text-xs leading-relaxed">{description}</p>
+      </div>
+      <div className="flex flex-col gap-5 p-4 sm:p-5">{children}</div>
+    </section>
+  );
+}
+
 export function SettingsView(): React.JSX.Element {
   const client = useClient();
   const navigate = useNavigate();
@@ -696,129 +755,149 @@ export function SettingsView(): React.JSX.Element {
   return (
     <>
       <AppHead back="/" title="设置" />
-      <div className="flex min-h-0 flex-1 flex-col gap-5 overflow-y-auto px-4 py-4 text-sm">
-        <section className="flex flex-col gap-2">
-          <h2 className="font-medium">主题</h2>
-          <ThemeSwitcher />
-        </section>
-
-        <Separator />
-        <SendKeySetting />
-
-        <Separator />
-        <MachineStatsSetting />
-
-        <Separator />
-        <PromptSnippets />
-
-        <Separator />
-        <KnownModels />
-
-        <Separator />
-        <SessionDefaults />
-        <EngineDefaults />
-
-        <Separator />
-        <AttachmentSettings />
-
-        <ExtensionsSettingsBlock />
-
-        <Separator />
-
-        <section className="flex flex-col gap-2">
-          <h2 className="font-medium">本设备</h2>
-          <dl className="grid grid-cols-[auto_1fr] gap-x-4 gap-y-1.5">
-            <dt className="text-text-3">设备 id</dt>
-            <dd className="font-mono text-xs break-all" data-testid="device-id">
-              {client?.deviceId ?? '—'}
-            </dd>
-            <dt className="text-text-3">公钥指纹</dt>
-            <dd className="font-mono text-xs break-all">{fingerprint}</dd>
-            <dt className="text-text-3">服务端</dt>
-            <dd className="font-mono text-xs break-all">{serverUrl ?? '（未配对）'}</dd>
-            <dt className="text-text-3">连接</dt>
-            <dd>
-              {connection.status}
-              {connection.lastCloseCode !== null && ` · 上次关闭码 ${connection.lastCloseCode}`}
-            </dd>
-            <dt className="text-text-3">标签页</dt>
-            <dd className="text-xs">
-              {leader.state} · {leader.mode === 'locks' ? 'Web Locks' : '心跳选举（无 Web Locks）'}
-            </dd>
-            <dt className="text-text-3">构建</dt>
-            <dd className="font-mono text-xs">
-              {import.meta.env.MODE}
-              {import.meta.env.DEV ? ' · dev server' : ''}
-            </dd>
-          </dl>
-        </section>
-
-        <Separator />
-
-        <section className="flex flex-col gap-2">
-          <div className="flex items-center justify-between">
-            <h2 className="font-medium">机器</h2>
-            <Button size="sm" variant="ghost" asChild>
-              <NavLink to="/machines">全部 →</NavLink>
-            </Button>
-          </div>
-          <ul className="flex flex-col gap-1">
-            {Object.values(machines).map((m) => (
-              <li key={m.machineId}>
-                <NavLink
-                  to={`/machines/${m.machineId}`}
-                  className="border-border hover:border-border-strong flex items-center gap-2 rounded-lg border px-3 py-2 transition-colors"
-                >
-                  <StatusDot tone={machineTone(m.online)} />
-                  <span className="font-mono">{m.name}</span>
-                </NavLink>
-              </li>
+      <div className="@container/settings min-h-0 flex-1 overflow-y-auto px-4 pb-10 text-sm sm:px-6" data-testid="settings-scroll">
+        <div className="mx-auto grid w-full max-w-5xl gap-5 @min-[800px]/settings:grid-cols-[136px_minmax(0,1fr)] @min-[800px]/settings:gap-7">
+          <nav aria-label="设置分区" className="bg-background sticky top-0 z-10 -mx-4 flex gap-1 overflow-x-auto border-b border-border px-4 py-3 @min-[800px]/settings:mx-0 @min-[800px]/settings:mt-6 @min-[800px]/settings:flex-col @min-[800px]/settings:self-start @min-[800px]/settings:rounded-xl @min-[800px]/settings:border @min-[800px]/settings:p-2">
+            {SETTINGS_SECTIONS.map(([id, label]) => (
+              <a key={id} href={`#${id}`} className="text-text-2 hover:bg-surface-2 hover:text-text focus-visible:ring-brand shrink-0 rounded-lg px-3 py-2 text-xs font-medium outline-none focus-visible:ring-2">
+                {label}
+              </a>
             ))}
-            {Object.keys(machines).length === 0 && (
-              <li className="text-text-3 text-xs">还没有配对任何机器。</li>
-            )}
-          </ul>
-        </section>
+          </nav>
+          <div className="flex min-w-0 flex-col gap-6 @min-[800px]/settings:pt-6">
+            <div className="flex items-start justify-between gap-3">
+              <div>
+                <h1 className="text-lg font-semibold tracking-tight">偏好设置</h1>
+                <p className="text-text-3 mt-1 text-xs leading-relaxed">按你的习惯开始每一次会话。</p>
+              </div>
+              <span className="text-text-3 bg-surface-2 shrink-0 rounded-full px-2.5 py-1 text-[11px]">更改自动保存</span>
+            </div>
 
-        <Separator />
+            <SettingsSection id="sessions" title="新会话默认值" description="按引擎预选模型、推理强度和权限。只保存在本浏览器，已有会话沿用自己的设置。">
+              <EngineDefaults />
+              <details className="border-border border-t pt-4">
+                <summary className="text-text-2 cursor-pointer text-xs font-medium">管理 Claude 模型列表</summary>
+                <div className="pt-3"><KnownModels /></div>
+              </details>
+            </SettingsSection>
 
-        <section className="border-red/40 flex flex-col gap-3 rounded-[14px] border p-3">
-          <div className="flex flex-col gap-1.5">
-            <h2 className="text-red font-medium">重置本地状态</h2>
-            <p className="text-text-3 text-xs">
-              清除服务端记录、全部机器与时间线、游标；<strong>保留设备身份</strong>
-              （deviceId 与密钥），所以 agent 侧的登记仍然有效——重新扫一次码就能把机器加回来。
-              适用于：服务端库被删 / agent 重装后「回复全部不显示」。
-            </p>
-            <Button
-              variant="destructive"
-              className="w-fit"
-              data-testid="reset-local"
-              onClick={() => setConfirmReset(true)}
-            >
-              重置本地状态…
-            </Button>
+            <SettingsSection id="appearance-input" title="外观与输入" description="主题、发送方式，以及随手可用的常用提示词。">
+              <div className="grid gap-5 sm:grid-cols-2">
+                <section className="flex flex-col gap-2">
+                  <h2 className="font-medium">主题</h2>
+                  <ThemeSwitcher />
+                </section>
+                <SendKeySetting />
+              </div>
+              <Separator />
+              <PromptSnippets />
+            </SettingsSection>
+
+            <SettingsSection id="attachments-extensions" title="附件与扩展" description="调整文件发送限制，管理已配对机器提供的扩展。">
+              <AttachmentSettings />
+              <ExtensionsSettingsBlock />
+            </SettingsSection>
+
+            <SettingsSection id="devices" title="设备与连接" description="机器资源刷新、配对设备和当前连接信息。">
+              <MachineStatsSetting />
+              <Separator />
+              <section className="flex flex-col gap-2">
+                <h2 className="font-medium">本设备</h2>
+                <dl className="grid grid-cols-[auto_1fr] gap-x-4 gap-y-1.5">
+                  <dt className="text-text-3">设备 id</dt>
+                  <dd className="font-mono text-xs break-all" data-testid="device-id">
+                    {client?.deviceId ?? '—'}
+                  </dd>
+                  <dt className="text-text-3">公钥指纹</dt>
+                  <dd className="font-mono text-xs break-all">{fingerprint}</dd>
+                  <dt className="text-text-3">服务端</dt>
+                  <dd className="font-mono text-xs break-all">{serverUrl ?? '（未配对）'}</dd>
+                  <dt className="text-text-3">连接</dt>
+                  <dd>
+                    {connection.status}
+                    {connection.lastCloseCode !== null && ` · 上次关闭码 ${connection.lastCloseCode}`}
+                  </dd>
+                  <dt className="text-text-3">标签页</dt>
+                  <dd className="text-xs">
+                    {leader.state} · {leader.mode === 'locks' ? 'Web Locks' : '心跳选举（无 Web Locks）'}
+                  </dd>
+                  <dt className="text-text-3">构建</dt>
+                  <dd className="font-mono text-xs">
+                    {import.meta.env.MODE}
+                    {import.meta.env.DEV ? ' · dev server' : ''}
+                  </dd>
+                </dl>
+              </section>
+
+              <Separator />
+
+              <section className="flex flex-col gap-2">
+                <div className="flex items-center justify-between">
+                  <h2 className="font-medium">机器</h2>
+                  <Button size="sm" variant="ghost" asChild>
+                    <NavLink to="/machines">全部 →</NavLink>
+                  </Button>
+                </div>
+                <ul className="flex flex-col gap-1">
+                  {Object.values(machines).map((m) => (
+                    <li key={m.machineId}>
+                      <NavLink
+                        to={`/machines/${m.machineId}`}
+                        className="border-border hover:border-border-strong flex items-center gap-2 rounded-lg border px-3 py-2 transition-colors"
+                      >
+                        <StatusDot tone={machineTone(m.online)} />
+                        <span className="font-mono">{m.name}</span>
+                      </NavLink>
+                    </li>
+                  ))}
+                  {Object.keys(machines).length === 0 && (
+                    <li className="text-text-3 text-xs">还没有配对任何机器。</li>
+                  )}
+                </ul>
+              </section>
+            </SettingsSection>
+
+            <SettingsSection id="maintenance" title="维护与重置" description="连接异常时的恢复工具。操作前请确认需要清除的内容。">
+              <section className="border-red/40 flex flex-col gap-5 rounded-xl border p-4">
+                <div className="flex flex-col gap-1.5">
+                  <h2 className="text-red font-medium">重置本地状态</h2>
+                  <p className="text-text-3 text-xs">
+                    清除服务端记录、全部机器与时间线、游标；<strong>保留设备身份</strong>
+                    （deviceId 与密钥），所以 agent 侧的登记仍然有效——重新扫一次码就能把机器加回来。
+                    适用于：服务端库被删 / agent 重装后「回复全部不显示」。
+                  </p>
+                  <Button
+                    variant="destructive"
+                    className="w-fit"
+                    data-testid="reset-local"
+                    onClick={() => setConfirmReset(true)}
+                  >
+                    重置本地状态…
+                  </Button>
+                </div>
+
+                <Separator />
+
+                <div className="flex flex-col gap-1.5">
+                  <h2 className="text-red font-medium">忘记服务端并清除身份</h2>
+                  <p className="text-text-3 text-xs">
+                    连 deviceId 与密钥一起删除，等于换一台新设备。
+                    <strong>agent 侧的旧登记随之作废</strong>，必须在每台机器上重新出配对码。
+                    只有在身份损坏或要把本浏览器彻底清干净时才用。
+                  </p>
+                  <Button
+                    variant="destructive"
+                    className="w-fit"
+                    data-testid="wipe-identity"
+                    onClick={() => setConfirmWipe(true)}
+                  >
+                    清除身份…
+                  </Button>
+                </div>
+              </section>
+            </SettingsSection>
           </div>
-
-          <Separator />
-
-          <div className="flex flex-col gap-1.5">
-            <h2 className="text-red font-medium">忘记服务端并清除身份</h2>
-            <p className="text-text-3 text-xs">
-              连 deviceId 与密钥一起删除，等于换一台新设备。
-              <strong>agent 侧的旧登记随之作废</strong>，必须在每台机器上重新出配对码。
-              只有在身份损坏或要把本浏览器彻底清干净时才用。
-            </p>
-            <Button
-              variant="destructive"
-              className="w-fit"
-              data-testid="wipe-identity"
-              onClick={() => setConfirmWipe(true)}
-            >
-              清除身份…
-            </Button>
-          </div>
-        </section>
+        </div>
       </div>
 
       <ConfirmDialog

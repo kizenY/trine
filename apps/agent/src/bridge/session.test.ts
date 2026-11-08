@@ -177,6 +177,56 @@ async function waitFor(predicate: () => boolean, timeoutMs = 1_000): Promise<voi
   }
 }
 
+describe('ClaudeSession · effort', () => {
+  test('默认不覆盖配置；设置强度不启动子进程，起进程时透传', async () => {
+    const { session, calls } = makeSession([[resultMessage()]]);
+    session.send('m1', 'hello');
+    await waitFor(() => session.state === 'idle' && calls.length === 1);
+    expect(calls[0]!.options).not.toHaveProperty('effort');
+    await session.close();
+
+    const selected = makeSession([[resultMessage()]], { effort: 'high' });
+    expect(selected.session.meta().effort).toBe('high');
+    await selected.session.setEffort('xhigh');
+    expect(selected.calls).toHaveLength(0);
+    selected.session.send('m1', 'hello');
+    await waitFor(() => selected.calls.length === 1);
+    expect(selected.calls[0]!.options?.effort).toBe('xhigh');
+    await selected.session.close();
+  });
+
+  test('运行中改强度只更新 flag 层，拒绝时保留原值，清除传 null', async () => {
+    const flags: unknown[] = [];
+    let reject = false;
+    const { session, calls } = makeSession([[resultMessage()]], { effort: 'high' }, {
+      applyFlagSettings: async (settings: unknown) => {
+        flags.push(settings);
+        if (reject) throw new Error('rejected');
+      },
+    });
+    session.send('m1', 'hello');
+    await waitFor(() => calls.length === 1);
+    await session.setEffort('max');
+    expect(session.meta().effort).toBe('max');
+    reject = true;
+    await expect(session.setEffort('low')).rejects.toThrow('rejected');
+    expect(session.effort).toBe('max');
+    reject = false;
+    await session.setEffort(undefined);
+    expect(flags).toEqual([{ effortLevel: 'max' }, { effortLevel: 'low' }, { effortLevel: null }]);
+    expect(session.meta()).not.toHaveProperty('effort');
+    expect(calls).toHaveLength(1);
+    await session.close();
+  });
+
+  test('不接受其他引擎的强度值', async () => {
+    const { session } = makeSession([], { effort: 'medium' });
+    await expect(session.setEffort('ultra')).rejects.toThrow('Claude 不支持');
+    expect(session.effort).toBe('medium');
+    await session.close();
+  });
+});
+
 describe('ClaudeSession · SDK 配置对齐（硬约束）', () => {
   test('显式传 systemPrompt preset 与 settingSources', async () => {
     const { session, calls } = makeSession([[assistantMessage('hi'), resultMessage()]]);

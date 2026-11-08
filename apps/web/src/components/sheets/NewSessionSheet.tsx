@@ -22,7 +22,7 @@ import { useEffect, useMemo, useState } from 'react';
 import { useNavigate } from 'react-router';
 import { toast } from 'sonner';
 import { CLAUDE_ENGINE_ID, type PermissionMode } from '@trine/core';
-import { creatableEngines, effortOptions, ENGINE_DEFAULT_MODEL } from '@/lib/engine-model.ts';
+import { creatableEngines, effortOptions, preferredEffort, ENGINE_DEFAULT_MODEL } from '@/lib/engine-model.ts';
 import { Button } from '@/components/ui/button.tsx';
 import { Input } from '@/components/ui/input.tsx';
 import { Textarea } from '@/components/ui/textarea.tsx';
@@ -179,10 +179,13 @@ export function NewSessionSheet({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open, engineKey]);
 
-  // 换了模型或引擎：之前选的强度新模型不一定有，回到默认
+  // 每次打开、换机器 / 引擎 / 模型，都按该引擎保存的默认强度预选；旧 agent 不发。
   useEffect(() => {
-    setEffort(undefined);
-  }, [engineKey, model]);
+    if (!open) return;
+    setEffort(preferredEffort(engine, model, engineDefault?.effort));
+    // machine.info 刷新不能冲掉本次选择
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open, machineId, engineKey, model]);
   const efforts = effortOptions(engine, model);
 
   const engineModels = engine?.models;
@@ -211,7 +214,7 @@ export function NewSessionSheet({
         permissionMode: modeState.value,
         ...(engine === undefined || engine.id === CLAUDE_ENGINE_ID ? {} : { engine: engine.id }),
         ...(engineMode.value === undefined || !usesCatalog ? {} : { engineMode: engineMode.value }),
-        ...(effort === undefined || efforts === undefined ? {} : { effort }),
+        ...(effort === undefined || efforts?.efforts.includes(effort) !== true ? {} : { effort }),
       });
       const from = startAvailable ? start : null;
       if (from?.link !== undefined) await linkNewSession(meta.sessionId, from);

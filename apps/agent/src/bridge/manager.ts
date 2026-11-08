@@ -129,7 +129,7 @@ export interface SessionManagerOptions {
    * 内存缓存又随重启清空——不查这里，重启后列表里的会话全显示成「默认模型 /
    * default」，与下次 resume 实际用的参数对不上。
    */
-  rememberedParams?: (sessionId: string) => { model: string; permissionMode: PermissionMode } | undefined;
+  rememberedParams?: (sessionId: string) => { model: string; permissionMode: PermissionMode; effort?: string } | undefined;
   /**
    * 一轮跑完（running / waiting_permission → 其他状态）时回调。router 在这里
    * 补写 pendingTitle：首条消息的 jsonl 要等子进程处理后才落盘，input.send
@@ -784,6 +784,7 @@ export class SessionManager {
       cwd: info.cwd ?? cached?.cwd ?? '',
       model: cached?.model ?? remembered?.model ?? '',
       permissionMode: cached?.permissionMode ?? remembered?.permissionMode ?? 'default',
+      ...((cached?.effort ?? remembered?.effort) === undefined ? {} : { effort: (cached?.effort ?? remembered?.effort)! }),
       costUsd: live?.costUsd ?? cached?.costUsd ?? 0,
       // 缓存里的 waitingFor 由 #onMeta 随每次状态迁移 / 挂起项变化刷新，与 live 同步
       ...waitingForOf({ state, waitingFor: cached?.waitingFor }),

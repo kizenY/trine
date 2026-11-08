@@ -1200,6 +1200,7 @@ export class Router {
       cwd,
       model: meta.model,
       permissionMode: meta.permissionMode,
+      ...(session.effort === undefined ? {} : { effort: session.effort }),
       started,
     };
     const rewindPoint = isRewindable(session) ? session.pendingRewind : undefined;
@@ -1345,6 +1346,7 @@ export class Router {
         permissionMode: meta.permissionMode,
         ...(meta.engine === undefined ? {} : { engine: meta.engine }),
         ...(meta.engineMode === undefined ? {} : { engineMode: meta.engineMode }),
+        ...(meta.effort === undefined ? {} : { effort: meta.effort }),
       };
     }
     const listed = await this.#listAll();
@@ -1430,7 +1432,7 @@ export class Router {
         try {
           sessionId =
             codex === undefined
-              ? await this.#createSession(event.cwd, event.model, event.permissionMode)
+              ? await this.#createSession(event.cwd, event.model, event.permissionMode, event.effort)
               : await this.#createCodexSession(codex, event.cwd, event.model, event.engineMode, event.effort);
         } catch (err) {
           if (err instanceof ConcurrencyLimitError) {
@@ -1553,17 +1555,18 @@ export class Router {
   }
 
   /** 新建会话（session.create 与扩展的 session.create 效果共用）；满额抛 ConcurrencyLimitError */
-  async #createSession(cwd: string, model: string, permissionMode: PermissionMode): Promise<string> {
+  async #createSession(cwd: string, model: string, permissionMode: PermissionMode, effort?: string): Promise<string> {
     const sessionId = randomUUID();
     const params: SessionParams = {
       cwd,
       model,
       permissionMode,
+      ...(effort === undefined ? {} : { effort }),
       // 还没发过消息、SDK 侧无转录：之后若要重开必须以新建方式
       started: false,
     };
     await this.#deps.manager.makeRoom();
-    this.#deps.manager.acquire({ sessionId, cwd, model, permissionMode });
+    this.#deps.manager.acquire({ sessionId, ...params });
     this.#deps.state.rememberSession(sessionId, params);
     return sessionId;
   }

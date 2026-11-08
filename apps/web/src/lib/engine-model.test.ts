@@ -4,6 +4,7 @@ import {
   capabilitiesOf,
   creatableEngines,
   effortOptions,
+  preferredEffort,
   engineFilterOptions,
   engineModeLabel,
   engineOf,
@@ -125,6 +126,16 @@ describe('effortOptions', () => {
   test('按模型给选项；默认模型取 isDefault', () => {
     expect(effortOptions(engine, 'a')).toEqual({ efforts: ['low', 'ultra'], defaultEffort: 'low' });
     expect(effortOptions(engine, 'default')?.efforts).toEqual(['low', 'ultra']);
+  });
+  test('无模型目录的引擎使用统一选项；保存的默认值仍检查能力和模型', () => {
+    const claude: EngineSummary = { id: 'claude', displayName: 'Claude', available: true, capabilities: { effort: true }, efforts: ['low', 'medium', 'high', 'xhigh', 'max'] };
+    expect(effortOptions(claude, 'opus[1m]')?.efforts).toContain('max');
+    expect(preferredEffort(claude, 'custom-model', 'max')).toBe('max');
+    expect(preferredEffort({ ...claude, capabilities: {} }, 'opus', 'max')).toBeUndefined();
+    const codex: EngineSummary = { ...engine, id: 'codex', displayName: 'Codex', available: true };
+    expect(preferredEffort(codex, 'a', 'ultra')).toBe('ultra');
+    expect(preferredEffort(codex, 'a', 'high')).toBeUndefined();
+    expect(preferredEffort(codex, 'b', 'ultra')).toBeUndefined();
   });
   test('引擎不支持、模型没有强度、手填的模型：都不显示', () => {
     expect(effortOptions({ ...engine, capabilities: {} }, 'a')).toBeUndefined();

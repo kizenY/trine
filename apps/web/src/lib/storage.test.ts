@@ -112,6 +112,18 @@ describe('storage · peer 落盘取 max', () => {
     expect(loadPrefs(kv)).toMatchObject({ defaultModel: 'sonnet[1m]', defaultPermissionMode: 'plan' });
   });
 
+  test('各引擎 effort 默认值独立持久化；旧配置和坏值不影响模型 / 权限', () => {
+    const kv = new MemoryKv();
+    const base = loadPrefs(kv);
+    expect(base.engineDefaults).toEqual({});
+    savePrefs(kv, { ...base, engineDefaults: { claude: { effort: 'max' }, codex: { model: 'example-model', mode: 'read-only', effort: 'ultra' } } });
+    expect(loadPrefs(kv).engineDefaults).toEqual({ claude: { effort: 'max' }, codex: { model: 'example-model', mode: 'read-only', effort: 'ultra' } });
+    kv.set('trine.prefs', JSON.stringify({ ...base, engineDefaults: { codex: { model: 'example-model', mode: 'read-only', effort: 42 } } }));
+    const defaults = loadPrefs(kv).engineDefaults;
+    expect(defaults.codex).toMatchObject({ model: 'example-model', mode: 'read-only' });
+    expect(defaults.codex?.effort).toBeUndefined();
+  });
+
   test('sendKey：老 prefs 缺字段 / 坏值落默认 enter，合法值保留', () => {
     const kv = new MemoryKv();
     const base = { v: 1, theme: 'system', promptSnippets: [], knownModels: [], knownModelsSeed: KNOWN_MODELS_SEED };

@@ -37,6 +37,7 @@ import {
   ATTACHMENTS_DEFAULT_MAX_TOTAL_BYTES,
   ATTACHMENTS_MAX_COUNT,
   MachineInfoSchema,
+  EngineEffortSchema,
   PermissionModeSchema,
   SessionMetaSchema,
   type MachineInfo,
@@ -151,11 +152,15 @@ export const PrefsSchema = z.object({
   /** 新建会话预选的引擎；省略 = Claude Code，或机器上第一个能用的 */
   defaultEngine: z.string().min(1).optional().catch(undefined),
   /**
-   * 非 Claude 引擎的新会话默认（Claude 的是上面两项）。model 省略 = 跟随引擎自己的配置，
-   * mode 省略 = 目录标的默认
+   * 各引擎的新会话默认（Claude 的模型 / 权限仍用上面两项）。model 省略 = 跟随配置，
+   * mode 省略 = 目录标的默认，effort 省略 = 跟随引擎配置。
    */
   engineDefaults: z
-    .record(z.string(), z.object({ model: z.string().min(1).optional(), mode: z.string().min(1).optional() }))
+    .record(z.string(), z.object({
+      model: z.string().min(1).optional(),
+      mode: z.string().min(1).optional(),
+      effort: EngineEffortSchema.optional().catch(undefined),
+    }))
     .catch({}),
   /**
    * PC 上的发送键（见 components/composer/composer-keys.ts）：`enter` = Enter 发送、

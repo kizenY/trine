@@ -890,6 +890,23 @@ describe('Router · 路由表（机器级）', () => {
     expect(h.state.sessionParams(sid)).toEqual({ cwd: '/a', model: 'm', permissionMode: 'plan', started: false });
   });
 
+  test('Claude effort 在创建、切目录和回收后恢复时保留', async () => {
+    const h = await makeHarness();
+    await h.router.handle({ type: 'session.create', ...c2a(), reqId: 'q', cwd: '/example', model: 'opus', permissionMode: 'default', effort: 'max' }, phone);
+    const sid = h.created[0]!.sessionId;
+    expect(h.created[0]!.args.effort).toBe('max');
+    expect(h.state.sessionParams(sid)?.effort).toBe('max');
+    expect(h.byType('session.create.response')[0]).toMatchObject({ session: { effort: 'max' } });
+    // 假会话只在本用例模拟 effort（其余用例仍能测不支持 setEffort 的引擎）。
+    Object.defineProperty(h.created[0]!, 'effort', { value: 'max' });
+    await h.router.handle({ type: 'session.setCwd', ...c2a(sid), cwd: '/example-next' }, phone);
+    expect(h.created[1]!.args.effort).toBe('max');
+    expect(h.state.sessionParams(sid)?.effort).toBe('max');
+    await h.manager.release(sid, 'idle');
+    await h.router.handle({ type: 'session.status.request', ...c2a(sid), reqId: 'status' }, phone);
+    expect(h.created[2]!.args.effort).toBe('max');
+  });
+
   test('session.create 满额且都在忙 → 机器级 fatal(config)，无 response', async () => {
     const h = await makeHarness({ maxConcurrent: 1 });
     const create = (reqId: string) =>

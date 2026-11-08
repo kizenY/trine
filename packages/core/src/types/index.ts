@@ -65,6 +65,8 @@ export type ContextUsage = z.infer<typeof ContextUsageSchema>;
 
 /** Claude Code 的引擎 id；`SessionMeta.engine` 省略时就是它 */
 export const CLAUDE_ENGINE_ID = 'claude';
+/** Claude SDK 接受的具名强度；模型支持范围与降档由 Claude Code 处理。 */
+export const CLAUDE_EFFORT_LEVELS = ['low', 'medium', 'high', 'xhigh', 'max'] as const;
 
 /**
  * 引擎 id（multi-engine，DECISIONS D20）。「引擎」是真正跑模型的编码 agent（Claude Code、
@@ -433,7 +435,7 @@ export const EngineCapabilitiesSchema = z.object({
   mutations: z.boolean().optional(),
   /** 能手动刷新 context 用量 */
   contextRefresh: z.boolean().optional(),
-  /** 能选推理强度（session.setEffort，选项在 EngineModel.efforts） */
+  /** 能选推理强度（session.setEffort，选项在 EngineModel / EngineSummary.efforts） */
   effort: z.boolean().optional(),
   /** 能从机器页更新引擎（machine.engine.update.request、machine.engine.check.request） */
   update: z.boolean().optional(),
@@ -489,6 +491,8 @@ export const EngineSummarySchema = z.object({
   capabilities: EngineCapabilitiesSchema,
   /** 模型目录；省略 = 由 client 自己的已知模型列表决定（Claude） */
   models: z.array(EngineModelSchema).max(64).optional(),
+  /** 没有模型目录时可选的强度（Claude）；具体模型的支持范围由引擎处理 */
+  efforts: z.array(EngineEffortSchema).max(16).optional(),
   /** 权限模式目录；省略 = 协议的四档 PermissionMode（Claude） */
   modes: z.array(EngineModeOptionSchema).max(16).optional(),
   /** 账号限额。Claude 的仍在 MachineInfo.rateLimits，这里不重复 */

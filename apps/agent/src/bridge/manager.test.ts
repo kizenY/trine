@@ -474,11 +474,11 @@ describe('SessionManager · 列表', () => {
         { sessionId: 'unknown', summary: '', lastModified: 1, cwd: '/repo' },
       ] as Awaited<ReturnType<typeof listSessions>>,
       rememberedParams: (sid) =>
-        sid === 'known' ? { model: 'opus[1m]', permissionMode: 'bypassPermissions' } : undefined,
+        sid === 'known' ? { model: 'opus[1m]', permissionMode: 'bypassPermissions', effort: 'xhigh' } : undefined,
     });
 
     const list = await manager.list();
-    expect(list[0]).toMatchObject({ sessionId: 'known', model: 'opus[1m]', permissionMode: 'bypassPermissions' });
+    expect(list[0]).toMatchObject({ sessionId: 'known', model: 'opus[1m]', permissionMode: 'bypassPermissions', effort: 'xhigh' });
     // 本地没记录的不猜：模型留空（router resume 时补默认），权限保守取 default
     expect(list[1]).toMatchObject({ sessionId: 'unknown', model: '', permissionMode: 'default' });
   });

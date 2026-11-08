@@ -199,6 +199,16 @@ session defaults (initially `opus[1m]` and `bypassPermissions`); each session ke
 model and permission mode afterwards. Change the default permission mode if you do not
 want new sessions to skip tool approval.
 
+Claude sessions also support choosing an effort (`low`, `medium`, `high`, `xhigh`,
+`max`) when creating a session or in session settings; changes apply to the next turn.
+Claude Code handles the selected model's supported range. Settings → New session defaults
+saves a separate effort preference for Claude and Codex on this browser. “Follow configuration”
+leaves the engine's own setting in charge. Models that do not support the saved Codex effort
+fall back to their defaults, and older agents without the effort capability receive no override.
+These defaults only preselect new sessions; existing sessions keep their own settings.
+The Settings page groups session defaults, appearance and input, attachments and extensions,
+devices and connections, and maintenance, with navigation for desktop and mobile.
+
 In the message box, the Return key on touch devices (phones, tablets) always inserts a
 new line; tap the send button to send. With a physical keyboard, Settings → Send key
 chooses between Enter to send (Shift+Enter for a new line, the default) and Cmd/Ctrl+Enter

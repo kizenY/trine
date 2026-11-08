@@ -114,6 +114,7 @@
  * 回显判断「撤回来不及了」。没执行就离开队列的（撤回 / 停止）发 `input.cancelled`。
  */
 import type { EngineSession } from '../engine/types.ts';
+import { claudeEffort } from '../engine/claude.ts';
 import { randomUUID } from 'node:crypto';
 import {
   query,
@@ -183,6 +184,7 @@ export interface ClaudeSessionOptions {
   cwd: string;
   model: string;
   permissionMode: PermissionMode;
+  effort?: string;
   /** 事件出口（会话层已绑定 sessionId scope） */
   emit: (body: EventBody) => void;
   /** 是否 resume 已有会话 */
@@ -286,6 +288,7 @@ export class ClaudeSession implements EngineSession {
   #cwd: string;
   #model: string;
   #permissionMode: PermissionMode;
+  #effort: Options['effort'];
 
   readonly #emit: (body: EventBody) => void;
   readonly #now: () => number;
@@ -385,6 +388,7 @@ export class ClaudeSession implements EngineSession {
     this.#cwd = options.cwd;
     this.#model = options.model;
     this.#permissionMode = options.permissionMode;
+    this.#effort = claudeEffort(options.effort);
     this.#emit = options.emit;
     this.#now = options.now ?? (() => Date.now());
     this.#queryFn = options.queryFn ?? query;
@@ -456,6 +460,10 @@ export class ClaudeSession implements EngineSession {
 
   get permissionMode(): PermissionMode {
     return this.#permissionMode;
+  }
+
+  get effort(): string | undefined {
+    return this.#effort;
   }
 
   /** 正在运行的后台任务数（空闲回收不得回收有后台任务在跑的会话——回收会杀掉子进程） */
@@ -610,6 +618,7 @@ export class ClaudeSession implements EngineSession {
       cwd: this.#cwd,
       model: this.#model,
       permissionMode: this.#permissionMode,
+      ...(this.#effort === undefined ? {} : { effort: this.#effort }),
       ...(waitingFor === undefined ? {} : { waitingFor }),
       bgRunning: this.#bgTasks.runningCount,
       ...(this.#context === undefined ? {} : { context: this.#context }),
@@ -799,6 +808,15 @@ export class ClaudeSession implements EngineSession {
     this.#model = model;
     this.#touch();
     await this.#query?.setModel(model);
+    this.#onMeta?.(this.meta());
+  }
+
+  /** 只改本会话的 flag 层；不写 Claude 的用户 / 项目设置，下一轮生效。 */
+  async setEffort(value: string | undefined): Promise<void> {
+    const effort = claudeEffort(value);
+    this.#touch();
+    await this.#query?.applyFlagSettings({ effortLevel: effort ?? null });
+    this.#effort = effort;
     this.#onMeta?.(this.meta());
   }
 
@@ -1050,6 +1068,7 @@ export class ClaudeSession implements EngineSession {
       cwd: this.#cwd,
       model: this.#model,
       permissionMode: this.#permissionMode,
+      ...(this.#effort === undefined ? {} : { effort: this.#effort }),
       // 只是「允许」运行中切到 bypassPermissions（对应 CLI
       // --allow-dangerously-skip-permissions），不会主动启用它；不设的话
       // setPermissionMode('bypassPermissions') 会被 CLI 拒绝
