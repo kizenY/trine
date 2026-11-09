@@ -406,9 +406,25 @@ export const MachineClaudeLatestSchema = z.object({
 export type MachineClaudeLatest = z.infer<typeof MachineClaudeLatestSchema>;
 
 /** 文件查看能力（fs.list / fs.read，见 protocol §1.10） */
+/** 会话 cwd 之外的可浏览根目录：`env` = TRINE_FILES_ALLOW（只能在机器上改），`trusted` = 信任目录（可远程增删） */
+export const FilesRootSchema = z.object({
+  path: z.string().min(1).max(4096),
+  source: z.enum(['env', 'trusted']),
+  /** 加入时间（trusted 才有） */
+  addedAt: z.number().int().nonnegative().optional(),
+});
+export type FilesRoot = z.infer<typeof FilesRootSchema>;
+
 export const MachineFilesInfoSchema = z.object({
   /** 单个文件可预览的字节上限 */
   maxBytes: z.number().int().positive(),
+  /**
+   * 会话 cwd 之外的可浏览目录（trusted-browse-dirs，agent ≥ 0.22.0）。缺失 = 旧 agent，
+   * client 隐藏信任目录的管理与「位置」菜单；空数组 = 支持但还没配置。
+   */
+  roots: z.array(FilesRootSchema).max(128).optional(),
+  /** agent 用户的 home（同上版本起）；client 据此对「信任 home 或其上级」加强提示 */
+  home: z.string().max(4096).optional(),
 });
 export type MachineFilesInfo = z.infer<typeof MachineFilesInfoSchema>;
 

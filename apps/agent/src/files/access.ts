@@ -3,7 +3,7 @@
  *
  * ## 范围
  *
- * 根目录 = 会话 cwd + `TRINE_FILES_ALLOW` 白名单。请求路径（绝对 / `~` / 相对 cwd）先做
+ * 根目录 = 会话 cwd + `TRINE_FILES_ALLOW` 白名单 + 信任目录（`files.json`，可远程增删，见 trust-store.ts）。请求路径（绝对 / `~` / 相对 cwd）先做
  * **字面**判断：不在任何根之内直接 `denied`，不碰文件系统——否则 not_found 与 denied 的
  * 区别就泄露了范围外文件存不存在。字面通过后再 `realpath`，按真实路径**再判一次**：
  * 指向范围外的符号链接（`ln -s ~/.ssh keys`）在这里被挡下。
@@ -13,22 +13,34 @@
  * ## 密钥类文件
  *
  * 不可配置覆盖，按真实路径的**每一段**匹配（见 `isSensitivePath`）。trine 自己的 home
- * （身份私钥、名册）整个拒绝，即使它就在会话 cwd 里。
+ * （身份私钥、名册）整个拒绝，即使它就在会话 cwd 里。`/proc`、`/sys`、`/dev` 也整个拒绝：
+ * `/proc/<pid>/environ` 是同用户可读的进程环境变量（token 常在里面），会话 cwd 设成 `/` 时
+ * 原本能读到。
  */
 import { realpath } from 'node:fs/promises';
 import { basename, dirname, isAbsolute, join, resolve, sep } from 'node:path';
-import type { FsErrorCode } from '@trine/core';
+import type { FsDeniedReason, FsErrorCode } from '@trine/core';
 
-const OUT_OF_SCOPE = '不在可查看的范围内（会话目录或 TRINE_FILES_ALLOW）';
+const OUT_OF_SCOPE = '不在可浏览的范围内（会话目录或信任目录）';
 const SENSITIVE = '密钥类文件不提供查看';
 
 export class FileAccessError extends Error {
   readonly code: FsErrorCode;
-  constructor(code: FsErrorCode, message: string) {
+  readonly reason: FsDeniedReason | undefined;
+  constructor(code: FsErrorCode, message: string, reason?: FsDeniedReason) {
     super(message);
     this.name = 'FileAccessError';
     this.code = code;
+    this.reason = reason;
   }
+}
+
+function outOfScope(): FileAccessError {
+  return new FileAccessError('denied', OUT_OF_SCOPE, 'out_of_scope');
+}
+
+function sensitive(): FileAccessError {
+  return new FileAccessError('denied', SENSITIVE, 'sensitive');
 }
 
 /** 目录段：这些目录里的东西一律不给看 */
@@ -38,6 +50,8 @@ const ENV_TEMPLATES = new Set(['.env.example', '.env.sample', '.env.template', '
 const SENSITIVE_NAMES = new Set(['.netrc', '.npmrc', '.pypirc', '.pgpass', '.git-credentials']);
 const SENSITIVE_EXT = /\.(pem|key|p12|pfx|jks|keystore)$/i;
 const SSH_KEY = /^id_(rsa|dsa|ecdsa|ed25519)(_sk)?$/;
+/** 系统伪文件系统：进程环境变量、设备节点，整个不给看 */
+const SYSTEM_DIRS = ['/proc', '/sys', '/dev'];
 
 /** 文件名本身是否密钥类 */
 export function isSensitiveName(name: string): boolean {
@@ -72,19 +86,43 @@ export interface Resolved {
 
 export class FileAccess {
   readonly #allow: readonly string[];
+  readonly #trusted: () => readonly string[];
   readonly #osHome: string;
   readonly #protected: readonly string[];
   #protectedReal: string[] | undefined;
 
-  constructor(options: { allow: readonly string[]; osHome: string; trineHome: string }) {
+  constructor(options: {
+    allow: readonly string[];
+    /** 信任目录（每次请求现取：增删立即生效） */
+    trusted?: () => readonly string[];
+    osHome: string;
+    trineHome: string;
+  }) {
     this.#allow = options.allow.map((p) => resolve(p));
+    this.#trusted = options.trusted ?? (() => []);
     this.#osHome = options.osHome;
     this.#protected = [resolve(options.trineHome)];
   }
 
+  /** TRINE_FILES_ALLOW 的目录（resolve 过） */
+  get allow(): readonly string[] {
+    return this.#allow;
+  }
+
+  /** 请求路径转绝对路径：`~` 展开，相对路径相对 base（没有 base 返回 undefined） */
+  absolute(input: string, base: string | undefined): string | undefined {
+    if (input === '~' || input.startsWith('~/')) return join(this.#osHome, input.slice(1));
+    if (isAbsolute(input)) return resolve(input);
+    return base === undefined ? undefined : resolve(base, input);
+  }
+
+  get osHome(): string {
+    return this.#osHome;
+  }
+
   /** 会话的根目录集合：cwd 在前（相对路径相对它），不存在的跳过 */
   async roots(cwd: string | undefined): Promise<Root[]> {
-    const candidates = [...(cwd === undefined || cwd === '' ? [] : [resolve(cwd)]), ...this.#allow];
+    const candidates = [...(cwd === undefined || cwd === '' ? [] : [resolve(cwd)]), ...this.#allow, ...this.#trusted().map((p) => resolve(p))];
     const out: Root[] = [];
     for (const path of new Set(candidates)) {
       const real = await realpath(path).catch(() => undefined);
@@ -93,8 +131,9 @@ export class FileAccess {
     return out;
   }
 
-  /** 真实路径是否密钥类：任一段命中目录黑名单、末段命中文件名黑名单，或在 trine home 里 */
+  /** 真实路径是否密钥类：任一段命中目录黑名单、末段命中文件名黑名单，或在 trine home / 系统伪文件系统里 */
   async isSensitivePath(real: string): Promise<boolean> {
+    if (SYSTEM_DIRS.some((d) => isWithin(real, d))) return true;
     // 目录段不分大小写：macOS 默认文件系统里 `.SSH` 就是 `.ssh`
     const parts = real.split(sep);
     if (parts.some((p) => SENSITIVE_DIRS.has(p.toLowerCase()))) return true;
@@ -112,17 +151,13 @@ export class FileAccess {
    * 否则经由指向范围外的符号链接（`out/x`）就能探测范围外文件存不存在。
    */
   async resolve(input: string | undefined, roots: readonly Root[]): Promise<Resolved> {
-    if (roots.length === 0) throw new FileAccessError('denied', '这个会话没有可查看的目录');
-    let path: string;
-    if (input === undefined) path = roots[0]!.path;
-    else if (input === '~' || input.startsWith('~/')) path = join(this.#osHome, input.slice(1));
-    else if (isAbsolute(input)) path = resolve(input);
-    else path = resolve(roots[0]!.path, input);
+    if (roots.length === 0) throw new FileAccessError('denied', '这个会话没有可查看的目录', 'out_of_scope');
+    const path = input === undefined ? roots[0]!.path : this.absolute(input, roots[0]!.path)!;
 
     if (path.includes('\0')) throw new FileAccessError('denied', '路径不合法');
     const lexical = roots.find((r) => isWithin(path, r.path) || isWithin(path, r.real));
-    if (lexical === undefined) throw new FileAccessError('denied', OUT_OF_SCOPE);
-    if (await this.isSensitivePath(path)) throw new FileAccessError('denied', SENSITIVE);
+    if (lexical === undefined) throw outOfScope();
+    if (await this.isSensitivePath(path)) throw sensitive();
 
     let real: string;
     try {
@@ -138,8 +173,8 @@ export class FileAccess {
     }
     // 字面上命中的根优先（同一路径可能同时落在 cwd 与白名单里）
     const root = isWithin(real, lexical.real) ? lexical : roots.find((r) => isWithin(real, r.real));
-    if (root === undefined) throw new FileAccessError('denied', OUT_OF_SCOPE);
-    if (await this.isSensitivePath(real)) throw new FileAccessError('denied', SENSITIVE);
+    if (root === undefined) throw outOfScope();
+    if (await this.isSensitivePath(real)) throw sensitive();
     return { path, real, root };
   }
 
@@ -149,13 +184,11 @@ export class FileAccess {
     for (;;) {
       const real = await realpath(cur).catch(() => undefined);
       if (real !== undefined) {
-        if (!roots.some((r) => isWithin(real, r.real)) || (await this.isSensitivePath(real))) {
-          throw new FileAccessError('denied', OUT_OF_SCOPE);
-        }
+        if (!roots.some((r) => isWithin(real, r.real)) || (await this.isSensitivePath(real))) throw outOfScope();
         return;
       }
       const up = dirname(cur);
-      if (up === cur) throw new FileAccessError('denied', OUT_OF_SCOPE);
+      if (up === cur) throw outOfScope();
       cur = up;
     }
   }

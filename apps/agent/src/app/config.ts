@@ -60,6 +60,7 @@ export function agentPaths(home: string): {
   recipients: string;
   state: string;
   cwd: string;
+  filesTrust: string;
   sessions: string;
   uploads: string;
   extensions: string;
@@ -72,6 +73,8 @@ export function agentPaths(home: string): {
     recipients: join(home, 'recipients.json'),
     state: join(home, 'state.json'),
     cwd: join(home, 'cwd.json'),
+    /** 信任目录（文件浏览，见 files/trust-store.ts） */
+    filesTrust: join(home, 'files.json'),
     sessions: join(home, 'sessions.json'),
     /** 用户消息附件（见 bridge/attachments.ts） */
     uploads: join(home, 'uploads'),
