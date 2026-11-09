@@ -172,7 +172,7 @@ function PanelHeader({
 function ErrorBox({ message, onRetry }: { message: string; onRetry: () => void }): React.JSX.Element {
   return (
     <div data-testid="file-error" className="flex flex-col items-center gap-3 p-10 text-center text-[13px]">
-      <div className="text-danger">{message}</div>
+      <div className="text-red">{message}</div>
       <Button size="sm" variant="outline" onClick={onRetry}>
         重试
       </Button>
