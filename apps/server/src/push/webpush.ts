@@ -101,7 +101,7 @@ export interface WebPushDeps {
 
 export type DeliverOutcome =
   | { kind: 'sent' }
-  | { kind: 'skipped'; reason: 'no_subscription' | 'device_online' | 'deduped' | 'disabled' }
+  | { kind: 'skipped'; reason: 'no_subscription' | 'device_online' | 'muted' | 'deduped' | 'disabled' }
   | { kind: 'failed'; status?: number };
 
 export class WebPushService {
@@ -171,6 +171,12 @@ export class WebPushService {
     this.#log(`[webpush] 设备已退订 ${deviceId}`);
   }
 
+  /** 全量覆盖该设备的会话静音名单（push.mute；轮询会话防骚扰） */
+  setMutes(deviceId: string, sessionIds: readonly string[]): void {
+    this.#store.setPushMutes(deviceId, sessionIds, this.#now());
+    this.#log(`[webpush] 设备静音名单更新 ${deviceId}（${sessionIds.length} 个会话）`);
+  }
+
   /**
    * 一条 a2c relay 帧带 pushHint 时，向**那一帧的收件设备**投一次通知。
    * 同步返回判定结果，真正的 HTTP fire-and-forget——绝不阻塞中转主链路。
@@ -190,6 +196,12 @@ export class WebPushService {
       // 在线设备不推也**不记去抖**（与 dispatcher 同款细节：否则人一下线，
       // 本该推的第一条会被抑制期的记录压掉）
       return { kind: 'skipped', reason: 'device_online' };
+    }
+
+    // 会话级静音（push.mute）：机器级事件没有 sessionId，不受静音影响
+    if (event.sessionId !== undefined
+      && this.#store.isPushMuted(event.recipientDeviceId, event.sessionId)) {
+      return { kind: 'skipped', reason: 'muted' };
     }
 
     const key = [

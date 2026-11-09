@@ -773,6 +773,24 @@ export class Store {
       .run(deviceId).changes > 0;
   }
 
+  /** 全量覆盖一台设备的静音名单（客户端本地列表即真相，重连重报即收敛） */
+  setPushMutes(deviceId: string, sessionIds: readonly string[], now = Date.now()): void {
+    this.db.transaction(() => {
+      this.db.query('DELETE FROM push_mutes WHERE device_id = ?').run(deviceId);
+      const insert = this.db.query(
+        'INSERT OR IGNORE INTO push_mutes (device_id, session_id, updated_at) VALUES (?, ?, ?)',
+      );
+      for (const sessionId of sessionIds) insert.run(deviceId, sessionId, now);
+    })();
+  }
+
+  isPushMuted(deviceId: string, sessionId: string): boolean {
+    const row = this.db
+      .query('SELECT 1 FROM push_mutes WHERE device_id = ? AND session_id = ?')
+      .get(deviceId, sessionId);
+    return row !== null && row !== undefined;
+  }
+
   getPushSubscription(deviceId: string): {
     deviceId: string;
     endpoint: string;

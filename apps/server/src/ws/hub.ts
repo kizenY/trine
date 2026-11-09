@@ -165,6 +165,7 @@ export class RelayHub<T extends Sendable = Sendable> {
         return this.handleRecall(conn, frame);
       case 'push.subscribe':
       case 'push.unsubscribe':
+      case 'push.mute':
         return this.handlePushSubs(conn, frame);
       case 'pair.begin':
       case 'pair.confirm':
@@ -184,13 +185,13 @@ export class RelayHub<T extends Sendable = Sendable> {
   }
 
   /**
-   * push.subscribe / push.unsubscribe：client 上报/撤销 Web Push 订阅。
-   * deviceId 一律取连接身份（token 换回的），帧上没有自报字段可骗。
+   * push.subscribe / push.unsubscribe / push.mute：client 的 Web Push 订阅与
+   * 会话静音名单。deviceId 一律取连接身份（token 换回的），帧上没有自报字段可骗。
    * 仅 client 角色可发——agent 机器没有「收通知的浏览器」。
    */
   private handlePushSubs(
     conn: Conn<T>,
-    frame: Extract<TransportFrame, { type: 'push.subscribe' | 'push.unsubscribe' }>,
+    frame: Extract<TransportFrame, { type: 'push.subscribe' | 'push.unsubscribe' | 'push.mute' }>,
   ): HandleOutcome {
     if (conn.role !== 'client') {
       return { kind: 'rejected', reason: 'push_sub_from_agent' };
@@ -206,11 +207,14 @@ export class RelayHub<T extends Sendable = Sendable> {
     if (frame.type === 'push.subscribe') {
       webpush.subscribe(conn.deviceId, frame);
       this.send(conn, encodeTransportFrame({ type: 'push.subscribed', ok: true }));
+    } else if (frame.type === 'push.mute') {
+      // 静音名单无回执：全量覆盖幂等，客户端重连重报即收敛
+      webpush.setMutes(conn.deviceId, frame.sessionIds);
     } else {
       webpush.unsubscribe(conn.deviceId);
       this.send(conn, encodeTransportFrame({ type: 'push.subscribed', ok: true }));
     }
-    return { kind: 'ignored', reason: `push_${frame.type === 'push.subscribe' ? 'subscribe' : 'unsubscribe'}` };
+    return { kind: 'ignored', reason: `push_${frame.type}` };
   }
 
   // -------------------------------------------------------------------------

@@ -213,6 +213,15 @@ const MIGRATIONS: string[] = [
     private_key TEXT NOT NULL,
     created_at  INTEGER NOT NULL
   );`,
+  // v6: 每设备的会话推送静音名单（push.mute 全量覆盖式更新）。
+  // sessionId 是 transport 明文路由字段，存它不破零知识（见 transport.ts 注释）。
+  `
+  CREATE TABLE push_mutes (
+    device_id   TEXT NOT NULL,
+    session_id  TEXT NOT NULL,
+    updated_at  INTEGER NOT NULL,
+    PRIMARY KEY (device_id, session_id)
+  );`,
 ];
 
 /** 当前 schema 版本 = 迁移条数 */

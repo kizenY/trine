@@ -21,6 +21,45 @@ import type { TrineClient } from './client.ts';
 
 const SW_URL = '/sw.js';
 const ENABLED_KEY = 'trine.push.enabled';
+/** 会话静音名单（sessionId 数组）：本地列表即真相，改完全量重报给 relay */
+const MUTES_KEY = 'trine.push.mutes';
+
+// ---------------------------------------------------------------------------
+// 会话级静音（push.mute）：总开关（订阅）之上的细粒度过滤。
+// 名单是**本设备**的（推送本来就是按设备订阅的），存 localStorage，
+// 变更即全量重发；断线时下一次 boot/重连的 syncPushMutes 会补上。
+// ---------------------------------------------------------------------------
+
+export function getPushMutes(): string[] {
+  try {
+    const raw = JSON.parse(localStorage.getItem(MUTES_KEY) ?? '[]');
+    return Array.isArray(raw) ? raw.filter((x): x is string => typeof x === 'string') : [];
+  } catch {
+    return [];
+  }
+}
+
+/** 改一个会话的静音态并立即全量上报；返回新名单 */
+export function setPushMute(
+  client: TrineClient | null,
+  sessionId: string,
+  muted: boolean,
+): string[] {
+  const current = new Set(getPushMutes());
+  if (muted) current.add(sessionId);
+  else current.delete(sessionId);
+  const list = [...current];
+  try {
+    localStorage.setItem(MUTES_KEY, JSON.stringify(list));
+  } catch { /* 隐私模式：本次会话内仍生效 */ }
+  client?.sendPushMutes(list);
+  return list;
+}
+
+/** 启动 / 重连后的名单同步：不管订阅开关状态都报（静音独立于订阅存在） */
+export function syncPushMutes(client: TrineClient): void {
+  client.sendPushMutes(getPushMutes());
+}
 
 /** base64url → Uint8Array（applicationServerKey 要 BufferSource） */
 function urlBase64ToBytes(b64: string): Uint8Array<ArrayBuffer> {
@@ -138,8 +177,9 @@ export async function disablePush(client: TrineClient | null): Promise<void> {
   } catch { /* 同上 */ }
 }
 
-/** 启动时的再上报：开关开着就把当前订阅重报一遍（幂等,收敛两端漂移） */
+/** 启动时的再上报：静音名单总是报；开关开着再把当前订阅重报一遍（幂等,收敛两端漂移） */
 export async function resyncPushOnBoot(client: TrineClient): Promise<void> {
+  syncPushMutes(client);
   if (!pushSupported() || !pushWanted() || Notification.permission !== 'granted') return;
   try {
     const reg = await ensureSW();

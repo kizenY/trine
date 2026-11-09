@@ -904,6 +904,14 @@ export class TrineClient {
   }
 
   /**
+   * Web Push：全量覆盖本设备的会话静音名单（轮询会话防骚扰）。
+   * 无回执：幂等覆盖，重连重报即收敛（lib/push.ts 的 boot 同步）。
+   */
+  sendPushMutes(sessionIds: readonly string[]): boolean {
+    return this.#connection?.send({ type: 'push.mute', sessionIds: [...sessionIds] }) ?? false;
+  }
+
+  /**
    * 撤回 agent 端排队中的消息（`input.recall`）。
    *
    * 条目先进「撤回中…」：成功的回执是 `input.cancelled(recalled)`（条目删除，`edit` 的

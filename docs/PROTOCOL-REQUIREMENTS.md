@@ -252,6 +252,7 @@ PWA 装成 APP 后的系统级推送。帧都在 transport 层（不是 E2E 密�
 - `push.config { vapidPublicKey }`（server → client，连接建立即发）— VAPID 公钥首启自动生成落库；没启用 Web Push 的部署不发，client 据此隐藏通知开关
 - `push.subscribe { endpoint, keys: { p256dh, auth } }`（client → server）→ `push.subscribed { ok, error? }` — deviceId 取连接身份；一台设备一条订阅，覆盖式存储；404/410 投递失败时服务端自动清订阅
 - `push.unsubscribe { endpoint }`（client → server）→ 同款回执
+- `push.mute { sessionIds[] }`（client → server，无回执）— **全量覆盖**该设备的会话静音名单（轮询制会话的 run.done 防骚扰）；名单是本设备私有的（推送本就按设备订阅），客户端本地列表即真相，重连重报即收敛。静音只挡带 sessionId 的会话级事件，机器级事件不受影响
 - 点击通知的深链：payload 带 `machineId`/`sessionId`（密文内），SW 导航到 `/s/:machineId/:sessionId`
 - 互操作：旧 client 收到 `push.config` 会在 connection 层被 schema 拒掉整帧——**server 与 web 必须同版本部署**；旧 server 收到 `push.subscribe` 只会拒这一帧，连接不断
 

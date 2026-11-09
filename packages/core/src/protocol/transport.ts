@@ -417,6 +417,20 @@ export const PushUnsubscribeSchema = z.object({
 });
 
 /**
+ * client → server：**全量覆盖**该设备的会话静音名单（轮询制会话的
+ * run.done 风暴防骚扰）。总开关仍是订阅本身；这是订阅之上的细粒度过滤。
+ *
+ * † 判据：sessionId 本就是 transport 层明文路由字段（去抖分桶在用），
+ * 把「这台设备不想收哪些会话的通知」告诉中转不泄露任何新知识——relay
+ * 依然不知道会话标题、内容，甚至不知道静音的原因。全量覆盖语义让
+ * 客户端本地列表即真相，重连重报一次即收敛，不需要删除帧。
+ */
+export const PushMuteSchema = z.object({
+  type: z.literal('push.mute'),
+  sessionIds: z.array(z.string().min(1).max(128)).max(500),
+});
+
+/**
  * server → client：client 连接建立后立刻下发（没启用 Web Push 的部署不发）。
  * 告知本服务的 VAPID 公钥，client 拿它 `pushManager.subscribe`。
  * VAPID 公钥本就是公开值（每个订阅者都要拿到），不构成泄露。
@@ -453,6 +467,7 @@ export const TransportFrameSchema = z.discriminatedUnion('type', [
   PairAbortSchema,
   PushSubscribeSchema,
   PushUnsubscribeSchema,
+  PushMuteSchema,
   PushConfigSchema,
   PushSubscribedSchema,
 ]);

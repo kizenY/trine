@@ -102,6 +102,24 @@ describe('deliverTo:按设备定向的抑制与去抖', () => {
       .toBe('sent');
   });
 
+  test('会话级静音:run.done 不推,机器级事件(无 sessionId)不受影响', () => {
+    const svc = makeService();
+    svc.subscribe('phone', SUB);
+    svc.setMutes('phone', ['s-poll']);
+    expect(svc.deliverTo({ machineId: 'mbp', recipientDeviceId: 'phone', sessionId: 's-poll', hint: 'run_done' }))
+      .toEqual({ kind: 'skipped', reason: 'muted' });
+    // 未静音的会话照推
+    expect(svc.deliverTo({ machineId: 'mbp', recipientDeviceId: 'phone', sessionId: 's-other', hint: 'run_done' }).kind)
+      .toBe('sent');
+    // 机器级事件没有 sessionId,静音管不着
+    expect(svc.deliverTo({ machineId: 'mbp', recipientDeviceId: 'phone', hint: 'run_done' }).kind)
+      .toBe('sent');
+    // 全量覆盖式更新:清空名单后恢复推送
+    svc.setMutes('phone', []);
+    expect(svc.deliverTo({ machineId: 'mbp', recipientDeviceId: 'phone', sessionId: 's-poll', hint: 'run_done' }).kind)
+      .toBe('sent');
+  });
+
   test('同(设备,机器,会话,hint)窗口内去抖,不同会话不去抖', () => {
     let clock = 1_000_000;
     const svc = makeService({ now: () => clock });
@@ -232,6 +250,25 @@ describe('hub:push.* 帧接线', () => {
     hub.handleFrame(clientConn(ws), { type: 'push.unsubscribe', endpoint: SUB.endpoint });
     expect(store.getPushSubscription('phone')).toBeNull();
     expect((ws.frame(0) as { ok: boolean }).ok).toBe(true);
+  });
+
+  test('push.mute 全量覆盖静音名单(无回执,幂等)', () => {
+    const store = new Store(':memory:');
+    const svc = makeService({ store });
+    const { hub } = makeHub({ webpush: svc });
+    const ws = new FakeSocket();
+    hub.handleFrame(clientConn(ws), { type: 'push.mute', sessionIds: ['a', 'b'] });
+    expect(store.isPushMuted('phone', 'a')).toBe(true);
+    expect(store.isPushMuted('phone', 'b')).toBe(true);
+    expect(ws.sent.length).toBe(0); // 静音没有回执
+    hub.handleFrame(clientConn(ws), { type: 'push.mute', sessionIds: ['a'] });
+    expect(store.isPushMuted('phone', 'b')).toBe(false); // 全量覆盖
+    // agent 发 push.mute 直接拒
+    const rejected = hub.handleFrame(
+      { ws: new FakeSocket(), deviceId: 'mbp', role: 'agent', machineId: 'mbp', connectedAt: 1, lastSeenAt: 1, pendingPings: 0 },
+      { type: 'push.mute', sessionIds: ['a'] },
+    );
+    expect(rejected.kind).toBe('rejected');
   });
 
   test('未启用 webpush 的 hub:订阅回执 ok:false,client 上线不下发 config', () => {
