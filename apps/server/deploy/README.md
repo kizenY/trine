@@ -283,6 +283,12 @@ Safari, Android/desktop Chrome) can receive native system notifications with
 **no server configuration**: VAPID keys are generated on first start and stored
 in the database. Toggle it per device in the web app: Settings → 通知.
 
+iPhone note (tested): Apple's push service rejects a `mailto:` subject on
+localhost (403 BadJwtToken) and binds each subscription to the VAPID public
+key (rotating keys returns 400 VapidPkHashMismatch). Set
+`TRINE_VAPID_SUBJECT=https://your-trine-host.example` before your first
+iPhone subscribes — see the environment template.
+
 Deployment notes:
 
 - Requires this server version **and** the matching web build — deploy both

@@ -208,6 +208,8 @@ export async function startServer(
     isDeviceOnline: (deviceId) =>
       registry.allClients().some((c) => c.deviceId === deviceId),
     rawAlias: config.pushAliases,
+    // env 缺省时服务用兜底 subject;iOS 部署应配 TRINE_VAPID_SUBJECT(见 config)
+    ...(config.vapidSubject ? { vapidSubject: config.vapidSubject } : {}),
     log: (line) => console.info(line),
   });
   // auth 注入 hub：背书式登记（D8）——agent 发来合规 pair.confirm 时

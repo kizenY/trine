@@ -42,8 +42,16 @@ import type { Store } from '../store/index.ts';
 import type { PushHint } from '@trine/core';
 import { renderPushMessage, parseAliases } from './text.ts';
 
-/** VAPID 联系人（RFC 8292 subject）：推送服务出问题时找谁，用占位地址即可 */
-const VAPID_SUBJECT = 'mailto:trine-server@localhost';
+/**
+ * VAPID 联系人（RFC 8292 subject）的兜底值：推送服务出问题时找谁。
+ * 会被 env TRINE_VAPID_SUBJECT 覆盖。
+ *
+ * **iOS 注意（实测 2026-11）**：Apple 的推送服务拒绝 `mailto:` 带
+ * localhost 域的 subject（HTTP 403 BadJwtToken），且订阅与 VAPID 公钥
+ * 绑定（换公钥发报 400 VapidPkHashMismatch）。iOS 场景务必把
+ * TRINE_VAPID_SUBJECT 配成自己的 https 地址，如 https://trine.example.com。
+ */
+const DEFAULT_VAPID_SUBJECT = 'mailto:trine@example.com';
 
 /** 通知存活时长：跑完/待确认的提醒过两小时还没送达就别响了 */
 const TTL_BY_HINT: Record<PushHint, number> = {
@@ -81,6 +89,8 @@ export interface WebPushDeps {
   isDeviceOnline: (deviceId: string) => boolean;
   /** 机器标识别名，与 Bark 渠道同一份 TRINE_PUSH_ALIAS 原串 */
   rawAlias?: string;
+  /** VAPID subject（env TRINE_VAPID_SUBJECT）；iOS 需配 https 域名，见 DEFAULT_VAPID_SUBJECT 注释 */
+  vapidSubject?: string;
   fetchImpl?: PushFetch;
   log?: (line: string) => void;
   now?: () => number;
@@ -103,6 +113,7 @@ export class WebPushService {
   readonly #now: () => number;
   readonly #dedupeWindowMs: number;
   readonly #timeoutMs: number;
+  readonly #subject: string;
   /** 去抖记录：key = device|machine|session|hint → 上次推送时刻 */
   readonly #lastSentAt = new Map<string, number>();
   #vapid: { publicKey: string; privateKey: string } | null = null;
@@ -116,6 +127,7 @@ export class WebPushService {
     this.#now = deps.now ?? (() => Date.now());
     this.#dedupeWindowMs = deps.dedupeWindowMs ?? 30_000;
     this.#timeoutMs = deps.timeoutMs ?? 5_000;
+    this.#subject = deps.vapidSubject ?? DEFAULT_VAPID_SUBJECT;
   }
 
   /**
@@ -129,7 +141,9 @@ export class WebPushService {
           const keys = generateVAPIDKeys();
           return { publicKey: keys.publicKey, privateKey: keys.privateKey };
         }, this.#now());
-        setVapidDetails(VAPID_SUBJECT, this.#vapid.publicKey, this.#vapid.privateKey);
+        setVapidDetails(
+          this.#subject, this.#vapid.publicKey, this.#vapid.privateKey,
+        );
       } catch (err) {
         // 推送是旁路，初始化失败只记日志：订阅/投递会各自返回 disabled/failed
         this.#log(`[webpush] VAPID 初始化失败：${String((err as Error).message ?? err)}`);
