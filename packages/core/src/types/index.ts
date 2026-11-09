@@ -419,7 +419,7 @@ export const MachineFilesInfoSchema = z.object({
   /** 单个文件可预览的字节上限 */
   maxBytes: z.number().int().positive(),
   /**
-   * 会话 cwd 之外的可浏览目录（trusted-browse-dirs，agent ≥ 0.22.0）。缺失 = 旧 agent，
+   * 会话 cwd 之外的可浏览目录（trusted-browse-dirs，agent ≥ 0.24.0）。缺失 = 旧 agent，
    * client 隐藏信任目录的管理与「位置」菜单；空数组 = 支持但还没配置。
    */
   roots: z.array(FilesRootSchema).max(128).optional(),

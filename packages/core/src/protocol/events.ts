@@ -568,8 +568,8 @@ export const AttachmentFetchResponseSchema = z.object({
 /**
  * 在会话上下文里浏览 / 预览 agent 机器上的文件（只读）。
  *
- * 范围由 agent 决定：会话 cwd 及其子目录，加上 agent 环境变量 `TRINE_FILES_ALLOW`
- * 列出的目录；符号链接按真实路径判断；密钥类文件（`.env`、私钥、`.ssh`、`.git` 内部、
+ * 范围由 agent 决定：会话 cwd 及其子目录，加上信任目录（agent 环境变量 `TRINE_FILES_ALLOW`
+ * 与可远程增删的 `files.trust.*` 列表）；符号链接按真实路径判断；密钥类文件（`.env`、私钥、`.ssh`、`.git` 内部、
  * trine 自己的 home）一律拒绝。与 attachment.fetch 一样**不拉起会话进程**，只定向回请求方。
  *
  * `path` 可以是绝对路径、`~` 开头，或相对会话 cwd 的相对路径。
@@ -584,7 +584,7 @@ export const FsErrorCodeSchema = z.enum(['not_found', 'denied', 'too_large', 'is
 export type FsErrorCode = z.infer<typeof FsErrorCodeSchema>;
 
 /**
- * `denied` 的细分（trusted-browse-dirs，agent ≥ 0.22.0；旧 agent 不带）：
+ * `denied` 的细分（trusted-browse-dirs，agent ≥ 0.24.0；旧 agent 不带）：
  * - `out_of_scope` 不在会话目录 / 信任目录之内（client 可以提供「信任此目录」入口）
  * - `sensitive`    密钥类路径、系统伪文件系统等不可覆盖的拒绝（不提供信任入口）
  */
@@ -665,7 +665,7 @@ export const FsReadResponseSchema = z.object({
 });
 
 /**
- * 信任目录（trusted-browse-dirs，agent ≥ 0.22.0，client 按 machine.info.files.roots 有无判断）：
+ * 信任目录（trusted-browse-dirs，agent ≥ 0.24.0，client 按 machine.info.files.roots 有无判断）：
  * 机器级、agent 端持久化的目录列表，除会话 cwd 外这些目录及其子目录也可浏览（密钥类照样拒绝）。
  * 对这台机器的所有会话、所有已配对设备生效。增删成功后 agent 重发 `machine.info`。
  *
