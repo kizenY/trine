@@ -17,7 +17,7 @@
  * `/proc/<pid>/environ` 是同用户可读的进程环境变量（token 常在里面），会话 cwd 设成 `/` 时
  * 原本能读到。
  */
-import { realpath } from 'node:fs/promises';
+import { lstat, realpath } from 'node:fs/promises';
 import { basename, dirname, isAbsolute, join, resolve, sep } from 'node:path';
 import type { FsDeniedReason, FsErrorCode } from '@trine/core';
 
@@ -120,13 +120,24 @@ export class FileAccess {
     return this.#osHome;
   }
 
-  /** 会话的根目录集合：cwd 在前（相对路径相对它），不存在的跳过 */
+  /**
+   * 会话的根目录集合：cwd 在前（相对路径相对它），不存在的跳过。
+   *
+   * 信任目录每次按**当前**真实路径复查：加入时校验过，但存的是字面路径，之后它（或某级祖先）
+   * 可能被换成指向 `/` 或密钥类目录的链接——这时不当根用，免得「不能信任 /」被绕过。
+   */
   async roots(cwd: string | undefined): Promise<Root[]> {
-    const candidates = [...(cwd === undefined || cwd === '' ? [] : [resolve(cwd)]), ...this.#allow, ...this.#trusted().map((p) => resolve(p))];
+    const fixed = [...(cwd === undefined || cwd === '' ? [] : [resolve(cwd)]), ...this.#allow];
+    const trusted = this.#trusted().map((p) => resolve(p));
     const out: Root[] = [];
-    for (const path of new Set(candidates)) {
+    const seen = new Set<string>();
+    for (const [path, isTrusted] of [...fixed.map((p) => [p, false] as const), ...trusted.map((p) => [p, true] as const)]) {
+      if (seen.has(path)) continue;
+      seen.add(path);
       const real = await realpath(path).catch(() => undefined);
-      if (real !== undefined) out.push({ path, real });
+      if (real === undefined) continue;
+      if (isTrusted && (real === '/' || (await this.isSensitivePath(real)))) continue;
+      out.push({ path, real });
     }
     return out;
   }
@@ -155,9 +166,11 @@ export class FileAccess {
     const path = input === undefined ? roots[0]!.path : this.absolute(input, roots[0]!.path)!;
 
     if (path.includes('\0')) throw new FileAccessError('denied', '路径不合法');
+    // 字面密钥类判断放在范围判断之前：只看路径字符串、不碰文件系统，不泄露什么；
+    // 范围外的 `.ssh`、`/proc` 回 sensitive，client 就不会给出注定失败的「信任」入口
+    if (await this.isSensitivePath(path)) throw sensitive();
     const lexical = roots.find((r) => isWithin(path, r.path) || isWithin(path, r.real));
     if (lexical === undefined) throw outOfScope();
-    if (await this.isSensitivePath(path)) throw sensitive();
 
     let real: string;
     try {
@@ -178,15 +191,24 @@ export class FileAccess {
     return { path, real, root };
   }
 
-  /** 不存在的路径：最深的已存在祖先解析后不在范围内（或是密钥类）就当 denied，与「范围外」回同一句话 */
+  /**
+   * 不存在的路径：最深的已存在祖先解析后不在范围内就当范围外，是密钥类就当密钥类——
+   * 与该位置真有文件时回的一样，不泄露存在性。
+   *
+   * 「已存在」按 lstat 算：断掉的符号链接（`link → /outside/missing`）自身存在但解析不了，
+   * 目标在不在范围内无从判断，按范围外处理；否则会退到链接所在目录回 not_found，而目标存在时
+   * 回 denied，两者一比就能探测范围外的文件。
+   */
   async #assertAncestorInScope(path: string, roots: readonly Root[]): Promise<void> {
-    let cur = dirname(path);
+    let cur = path;
     for (;;) {
       const real = await realpath(cur).catch(() => undefined);
       if (real !== undefined) {
-        if (!roots.some((r) => isWithin(real, r.real)) || (await this.isSensitivePath(real))) throw outOfScope();
+        if (!roots.some((r) => isWithin(real, r.real))) throw outOfScope();
+        if (await this.isSensitivePath(real)) throw sensitive();
         return;
       }
+      if (await lstat(cur).then(() => true, () => false)) throw outOfScope();
       const up = dirname(cur);
       if (up === cur) throw outOfScope();
       cur = up;

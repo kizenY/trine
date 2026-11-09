@@ -8,6 +8,7 @@ import { constants } from 'node:fs';
 import { open, readdir, realpath, stat } from 'node:fs/promises';
 import { basename, join } from 'node:path';
 import {
+  FILES_ROOTS_MAX,
   FILES_TRUSTED_MAX,
   FS_LIST_MAX_ENTRIES,
   type FilesRoot,
@@ -74,7 +75,9 @@ export class FileService {
       .list()
       .filter((d) => !seen.has(d.path))
       .map((d): FilesRoot => ({ path: d.path, source: 'trusted', addedAt: d.addedAt }));
-    return [...env, ...trusted];
+    // 协议上限：信任目录最多 FILES_TRUSTED_MAX 个，超出部分只可能来自过长的 TRINE_FILES_ALLOW，从 env 那头截
+    const room = Math.max(0, FILES_ROOTS_MAX - trusted.length);
+    return [...env.slice(0, room), ...trusted];
   }
 
   /** agent 的 home（web 用来提示「信任 home 及其上级」的风险） */

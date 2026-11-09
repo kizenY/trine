@@ -44,7 +44,8 @@ function setup(options: { roots?: FilesRoot[] | undefined; trusted?: string[] } 
       calls.lists.push(path);
       const p = path ?? CWD;
       const root = p.startsWith(CWD) ? CWD : [...trusted].find((t) => p === t || p.startsWith(`${t}/`));
-      if (p.includes('.ssh')) throw new FsRequestError('denied', '密钥类文件不提供查看', 'sensitive');
+      // 与 agent 同序：字面密钥类先于范围判断
+      if (p.split('/').includes('.ssh')) throw new FsRequestError('denied', '密钥类文件不提供查看', 'sensitive');
       if (root === undefined) throw new FsRequestError('denied', '不在可浏览的范围内（会话目录或信任目录）', 'out_of_scope');
       return { path: p, root, entries: [{ name: 'a.md', type: 'file', size: 1, mtime: 1 }], truncated: false };
     },
@@ -157,6 +158,32 @@ describe('文件面板 · 往上浏览', () => {
     expect($('file-out-of-scope')?.textContent).toContain('TRINE_FILES_ALLOW');
     expect($('file-trust-open')).toBeNull();
     expect($('file-locations')).toBeNull();
+  });
+});
+
+describe('信任确认对话框 · 规范化', () => {
+  test('`~/..`、末尾 / 按规范化后的路径提示；/ 不能确认', async () => {
+    setup();
+    host = document.createElement('div');
+    document.body.appendChild(host);
+    root = createRoot(host);
+    const { TrustDirDialog } = await import('./TrustDir.tsx');
+    const show = (path: string): void =>
+      act(() =>
+        root!.render(
+          <MemoryRouter>
+            <TrustDirDialog key={path} machineId={MACHINE} path={path} open onOpenChange={() => {}} />
+          </MemoryRouter>,
+        ),
+      );
+    show('~/..');
+    expect($('trust-dir-path')?.textContent).toBe('/home');
+    expect($('trust-dir-risk')?.textContent).toContain('包含 agent 用户的 home');
+    show('/home/u/');
+    expect($('trust-dir-risk')?.textContent).toContain('home 目录');
+    show('~/../..');
+    expect($('trust-dir-path')?.textContent).toBe('/');
+    expect(($('trust-dir-confirm') as HTMLButtonElement).disabled).toBe(true);
   });
 });
 

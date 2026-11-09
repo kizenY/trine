@@ -1,6 +1,7 @@
 import { describe, expect, test } from 'bun:test';
 import {
   isUnder,
+  normalizeDirInput,
   pathCrumbs,
   trustRisk,
   detectPath,
@@ -96,6 +97,15 @@ describe('链接与路径', () => {
     expect(pathCrumbs('/', '/')).toEqual([{ label: '/', path: '/', inScope: true }]);
     expect(parentDir('/w/repo/a.md')).toBe('/w/repo');
     expect(parentDir('/a')).toBe('/');
+  });
+
+  test('normalizeDirInput', () => {
+    expect(normalizeDirInput('~', '/home/u')).toBe('/home/u');
+    expect(normalizeDirInput('~/..', '/home/u')).toBe('/home');
+    expect(normalizeDirInput('/home/u/./w//', '/home/u')).toBe('/home/u/w');
+    expect(normalizeDirInput('/..', undefined)).toBe('/');
+    expect(normalizeDirInput('~/x', undefined)).toBeUndefined();
+    expect(normalizeDirInput('rel', '/home/u')).toBeUndefined();
   });
 
   test('isUnder 按路径段；trustRisk', () => {

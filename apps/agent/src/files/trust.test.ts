@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
 import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { FILES_TRUSTED_MAX } from '@trine/core';
+import { FILES_ROOTS_MAX, FILES_TRUSTED_MAX } from '@trine/core';
 import { FakeBlobs } from '../testing/fake-blobs.ts';
 import { FileAccess, FileAccessError } from './access.ts';
 import { FileService, TrustError } from './service.ts';
@@ -91,6 +91,55 @@ describe('往上浏览', () => {
     for (const p of ['/proc/self/environ', '/sys', '/dev']) {
       expect(await denied(files.list('/', p))).toBe('denied:sensitive');
     }
+  });
+});
+
+describe('评审补充：复查、存在性、上限', () => {
+  test('信任后把目录换成指向 / 的链接：不再当根用', async () => {
+    const store = TrustStore.memory();
+    const files = service(store);
+    const link = join(osHome, 'work', 'link');
+    symlinkSync(sibling, link);
+    await files.trust(link);
+    expect((await files.list(repo, link)).root).toBe(link);
+    rmSync(link);
+    symlinkSync('/', link);
+    expect(await denied(files.list(repo, link))).toBe('denied:out_of_scope');
+    expect(await denied(files.list(repo, join(link, 'etc')))).toBe('denied:out_of_scope');
+  });
+
+  test('范围外的密钥类路径回 sensitive（字面判断，不碰文件系统）', async () => {
+    const files = service(TrustStore.memory());
+    expect(await denied(files.list(repo, join(osHome, '.ssh')))).toBe('denied:sensitive');
+    expect(await denied(files.list(repo, '/proc'))).toBe('denied:sensitive');
+  });
+
+  test('指向范围外的断链与指向范围外的真文件回同样的结果', async () => {
+    const files = service(TrustStore.memory());
+    writeFileSync(join(base, 'outside.md'), 'x');
+    symlinkSync(join(base, 'outside.md'), join(repo, 'live'));
+    symlinkSync(join(base, 'missing.md'), join(repo, 'dangling'));
+    expect(await denied(files.read(repo, 'live'))).toBe('denied:out_of_scope');
+    expect(await denied(files.read(repo, 'dangling'))).toBe('denied:out_of_scope');
+    // 普通的不存在文件照旧 not_found
+    expect(await denied(files.read(repo, 'nope.md'))).toBe('not_found:-');
+  });
+
+  test('信任 trine home 的祖先后，trine home 里存在与不存在的文件回同一种拒绝', async () => {
+    const files = service(TrustStore.memory());
+    await files.trust(osHome);
+    writeFileSync(join(trineHome, 'identity.json'), '{}');
+    symlinkSync(trineHome, join(osHome, 'th'));
+    expect(await denied(files.read(repo, join(osHome, 'th', 'identity.json')))).toBe('denied:sensitive');
+    expect(await denied(files.read(repo, join(osHome, 'th', 'missing.json')))).toBe('denied:sensitive');
+  });
+
+  test('roots 不超过协议上限（过长的 TRINE_FILES_ALLOW 被截断）', async () => {
+    const env = Array.from({ length: FILES_ROOTS_MAX + 10 }, (_, i) => `/env/${i}`);
+    const store = TrustStore.memory([{ path: repo, addedAt: 1 }]);
+    const roots = service(store, env).roots()!;
+    expect(roots.length).toBe(FILES_ROOTS_MAX);
+    expect(roots.at(-1)).toEqual({ path: repo, source: 'trusted', addedAt: 1 });
   });
 });
 

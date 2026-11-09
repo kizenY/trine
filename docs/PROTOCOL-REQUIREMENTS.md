@@ -156,7 +156,7 @@
 - 信任目录（机器级，0.24.0 起）：`files.trust.add { reqId, path }` / `files.trust.remove { reqId, path }` →
   `files.trust.response { reqId, ok, path?, error?: { code: invalid | not_found | denied | limit | not_trusted | failed, message } }`，
   只回请求方；成功后广播 `machine.info`。add 要求绝对路径或 `~` 开头、存在且是目录、不是 `/`（字面与真实路径）、不是密钥类；
-  重复加或已在 `TRINE_FILES_ALLOW` 里算成功；最多 64 个。remove 按存下的路径匹配，`TRINE_FILES_ALLOW` 来源的回 `not_trusted`
+  重复加或已在 `TRINE_FILES_ALLOW` 里算成功；最多 64 个。信任目录每次请求按当前真实路径复查，之后被换成指向 `/` 或密钥类目录的链接就不再当根；`roots` 最多 256 条（过长的 `TRINE_FILES_ALLOW` 截断）。remove 按存下的路径匹配，`TRINE_FILES_ALLOW` 来源的回 `not_trusted`
 - client：入口是工具卡的预览按钮（`filePath`）、消息里像路径的行内代码与相对链接、会话菜单「浏览文件」；按 `machine.info.files` 有无决定显示。
   html 只显示源码；svg 只经 `<img>` 显示；PDF 放进 `<iframe>`（Blob 强制 `application/pdf`，静态响应的 CSP 因此带 `frame-src 'self' blob:`）
 

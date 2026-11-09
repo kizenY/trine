@@ -10,7 +10,8 @@ import { formatDateTime } from '@/lib/format.ts';
 import { Button } from '@/components/ui/button.tsx';
 import { Input } from '@/components/ui/input.tsx';
 import { ConfirmDialog } from '@/components/machines/ConfirmDialog.tsx';
-import { TrustDirDialog, trustErrorText } from './TrustDir.tsx';
+import { normalizeDirInput } from './file-model.ts';
+import { TrustDirDialog, trustErrorText, useFilesInfo } from './TrustDir.tsx';
 
 export function TrustedDirsSection({
   machineId,
@@ -22,14 +23,17 @@ export function TrustedDirsSection({
   roots: readonly FilesRoot[];
 }): React.JSX.Element {
   const client = useClient();
+  const home = useFilesInfo(machineId)?.home;
   const [draft, setDraft] = useState('');
   const [adding, setAdding] = useState<string | null>(null);
   const [removing, setRemoving] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const trimmed = draft.trim();
-  // 根目录 agent 也会拒绝，这里先挡掉
-  const valid = (trimmed.startsWith('/') && trimmed.replace(/\/+$/, '') !== '') || trimmed === '~' || trimmed.startsWith('~/');
+  // 根目录 agent 也会拒绝，这里先挡掉（`/..`、`~/../..` 这类写法规范化后再判断）
+  const normalized = normalizeDirInput(trimmed, home);
+  const valid =
+    normalized !== undefined ? normalized !== '/' : trimmed === '~' || trimmed.startsWith('~/');
 
   const remove = (path: string): void => {
     if (client === null) return;

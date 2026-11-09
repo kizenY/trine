@@ -30,7 +30,7 @@ import {
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu.tsx';
 import { cn } from '@/lib/utils.ts';
-import { isUnder, trustRisk } from './file-model.ts';
+import { isUnder, normalizeDirInput, trustRisk } from './file-model.ts';
 
 /** 这台机器的文件查看能力；undefined = 不支持或已关闭 */
 export function useFilesInfo(machineId: string): MachineFilesInfo | undefined {
@@ -72,7 +72,10 @@ export function TrustDirDialog({
   const home = useFilesInfo(machineId)?.home;
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const risk = trustRisk(path, home);
+  // 按 agent 会存下的样子判断（`~/..`、末尾 `/` 这类写法）；规范不了的原样显示，交给 agent 校验
+  const shown = normalizeDirInput(path, home) ?? path;
+  const isRoot = shown === '/';
+  const risk = isRoot ? undefined : trustRisk(shown, home);
   const change = (next: boolean): void => {
     if (busy) return;
     setError(null);
@@ -101,7 +104,10 @@ export function TrustDirDialog({
           <DialogTitle>信任这个目录？</DialogTitle>
           <DialogDescription asChild>
             <div className="text-text-2 flex flex-col gap-2 text-sm">
-              <code className="bg-surface-2 rounded px-2 py-1 font-mono text-[12.5px] break-all">{path}</code>
+              <code data-testid="trust-dir-path" className="bg-surface-2 rounded px-2 py-1 font-mono text-[12.5px] break-all">
+                {shown}
+              </code>
+              {isRoot && <p className="text-red font-medium">根目录 / 不能设为信任目录。</p>}
               {risk !== undefined && (
                 <p data-testid="trust-dir-risk" className="text-red flex gap-1.5 font-medium">
                   <ShieldAlertIcon className="mt-0.5 size-4 shrink-0" />
@@ -126,7 +132,7 @@ export function TrustDirDialog({
           <Button
             variant={risk === undefined ? 'default' : 'destructive'}
             data-testid="trust-dir-confirm"
-            disabled={busy || client === null}
+            disabled={busy || client === null || isRoot}
             onClick={confirm}
           >
             {busy ? '正在信任…' : '信任'}
@@ -204,7 +210,7 @@ export function LocationMenu({
   onTrustCurrent: (dir: string) => void;
 }): React.JSX.Element {
   const active = (p: string): boolean => current !== undefined && isUnder(current, p);
-  const canAddCurrent = current !== undefined && current !== sessionDir && !roots.some((r) => r.path === current);
+  const canAddCurrent = current !== undefined && current !== '/' && current !== sessionDir && !roots.some((r) => r.path === current);
   return (
     <DropdownMenu>
       <DropdownMenuTrigger asChild>

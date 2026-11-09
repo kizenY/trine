@@ -113,6 +113,28 @@ export function isUnder(path: string, dir: string): boolean {
 }
 
 /**
+ * 把用户输入的目录规范成 agent 会存下的样子：`~` 按 agent 的 home 展开，去掉 `.`、`..`、
+ * 重复和末尾的 `/`。不是绝对路径（或 `~` 开头但不知道 home）返回 undefined。
+ * 风险提示必须看规范化后的路径：`~/..`、`/home/u/` 实际信任的是 home 的上级 / home 本身。
+ */
+export function normalizeDirInput(input: string, home: string | undefined): string | undefined {
+  const text = input.trim();
+  let abs: string;
+  if (text === '~' || text.startsWith('~/')) {
+    if (home === undefined || home === '') return undefined;
+    abs = `${home}${text.slice(1)}`;
+  } else if (text.startsWith('/')) abs = text;
+  else return undefined;
+  const parts: string[] = [];
+  for (const seg of abs.split('/')) {
+    if (seg === '' || seg === '.') continue;
+    if (seg === '..') parts.pop();
+    else parts.push(seg);
+  }
+  return `/${parts.join('/')}`;
+}
+
+/**
  * 信任一个目录的风险等级：home 本身、home 的上级（含 `/` 之下的 `/home`、`/Users`）要加强提示。
  * 不知道 home（旧 agent）时返回 undefined。
  */
