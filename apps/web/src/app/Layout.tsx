@@ -35,7 +35,7 @@ import { takeOver, useRuntime, useTrine } from './runtime.ts';
 /** 从页遮罩：整页接管，不渲染外壳 */
 export function LeaderOverlay(): React.JSX.Element {
   return (
-    <main className="mx-auto flex min-h-dvh max-w-md flex-col items-center justify-center gap-4 p-6 text-center">
+    <main className="mx-auto flex min-h-dvh max-w-md flex-col items-center justify-center gap-4 p-6 text-center safe-top safe-bottom">
       <div className="text-brand font-mono text-3xl" aria-hidden>
         ◈
       </div>
@@ -53,7 +53,7 @@ export function LeaderOverlay(): React.JSX.Element {
 function BootGate({ phase, error }: { phase: 'booting' | 'error'; error: string | null }): React.JSX.Element {
   if (phase === 'booting') {
     return (
-      <main className="flex min-h-dvh items-center justify-center">
+      <main className="flex min-h-dvh items-center justify-center safe-top safe-bottom">
         <div className="text-text-3 flex flex-col items-center gap-3 text-sm">
           <span className="text-brand font-mono text-3xl motion-safe:animate-pulse" aria-hidden>
             ◈
@@ -64,7 +64,7 @@ function BootGate({ phase, error }: { phase: 'booting' | 'error'; error: string 
     );
   }
   return (
-    <main className="mx-auto flex min-h-dvh max-w-md flex-col justify-center gap-3 p-6 text-sm">
+    <main className="mx-auto flex min-h-dvh max-w-md flex-col justify-center gap-3 p-6 text-sm safe-top safe-bottom">
       <h1 className="text-red text-lg font-semibold">启动失败</h1>
       <pre className="bg-code-bg border-border overflow-x-auto rounded-lg border p-3 font-mono text-xs whitespace-pre-wrap">
         {error}
@@ -184,7 +184,12 @@ export function Layout(): React.JSX.Element {
               </div>
             </div>
           ) : (
-            <div className="mx-auto flex h-dvh max-w-[560px] flex-col overflow-hidden">{content}</div>
+            // safe-top/bottom：viewport-fit=cover 下 PWA 内容铺进刘海/圆角区，
+            // 外壳统一让位——视图层就不用各自记安全区（h-dvh + overflow-hidden
+            // 决定了只能在这里加 padding）
+            <div className="mx-auto flex h-dvh max-w-[560px] flex-col overflow-hidden safe-top safe-bottom">
+              {content}
+            </div>
           )}
         </ListFiltersContext>
       </MachineFilterContext>
