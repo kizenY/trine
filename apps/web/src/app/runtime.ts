@@ -74,6 +74,9 @@ export async function boot(): Promise<void> {
       },
       onClient: (client) => {
         runtimeState.setState({ client });
+        // Web Push 启动重报：本地开关开着就把当前订阅重报一遍（幂等收敛漂移）。
+        // fire-and-forget——推送是旁路，拖不得启动
+        void import('../lib/push.ts').then((m) => m.resyncPushOnBoot(client));
         return bindClient(store, client);
       },
       onClientGone: () => runtimeState.setState({ client: null }),

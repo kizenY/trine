@@ -48,6 +48,7 @@ import { formatBytes } from '@/lib/format.ts';
 import { ATTACHMENTS_MAX_COUNT } from '@trine/core/types';
 import { cn } from '@/lib/utils.ts';
 import { ExtensionsSettings } from '@/components/ext/ExtensionsSettings.tsx';
+import { disablePush, enablePush, pushSupported, pushWanted } from '@/lib/push.ts';
 
 const THEME_OPTIONS: { value: ThemeMode; label: string }[] = [
   { value: 'system', label: '跟随系统' },
@@ -351,6 +352,74 @@ function SendKeySetting(): React.JSX.Element {
           </Chip>
         ))}
       </div>
+    </section>
+  );
+}
+
+/** Web Push（PWA 通知）：订阅开关。iOS 需 16.4+ 且从 Safari 添加到主屏幕 */
+function PushNotificationsSetting(): React.JSX.Element {
+  const client = useClient();
+  const [wanted, setWanted] = useState(pushWanted);
+  const [busy, setBusy] = useState(false);
+
+  useEffect(() => {
+    if (!client) return;
+    // 服务端回执失败（未启用等）弹出来;成功则收掉开关的等待态
+    return client.on('pushSubscribed', (ok, error) => {
+      setBusy(false);
+      if (!ok) toast.error(error || '服务端未接受订阅');
+    });
+  }, [client]);
+
+  const supported = pushSupported();
+  const serverReady = supported && (client?.pushVapidKey ?? null) !== null;
+
+  const on = async (enable: boolean): Promise<void> => {
+    if (busy) return;
+    setBusy(true);
+    try {
+      if (enable) {
+        const res = await enablePush(client);
+        if (!res.ok) {
+          toast.error(res.error);
+          setWanted(false);
+          return;
+        }
+        setWanted(true);
+        // 回执（pushSubscribed）到达后收等待态;先兜底超时收掉
+        setTimeout(() => setBusy(false), 4_000);
+      } else {
+        await disablePush(client);
+        setWanted(false);
+        setBusy(false);
+        toast.success('已关闭通知');
+      }
+    } finally {
+      if (!enable) setBusy(false);
+    }
+  };
+
+  return (
+    <section className="flex flex-col gap-2" data-testid="push-setting">
+      <h2 className="font-medium">通知</h2>
+      <p className="text-text-3 text-xs">
+        任务跑完、等你确认或报错时推系统通知（文案只有机器名与事件类型，不带内容），点通知直达会话。
+        仅在 trine 没在前台连着时推送。iOS 需 16.4+ 并从 Safari「添加到主屏幕」安装。
+      </p>
+      {!supported ? (
+        <p className="text-text-3 text-xs">此设备/浏览器不支持推送。</p>
+      ) : !serverReady ? (
+        <p className="text-text-3 text-xs">服务端未启用推送（连接后仍显示这条=服务端版本过旧）。</p>
+      ) : (
+        <div className="flex flex-wrap gap-1.5">
+          <Chip data-testid="push-on" selected={wanted} onClick={() => void on(true)}>
+            {busy && wanted !== true ? '订阅中…' : '开启'}
+          </Chip>
+          <Chip data-testid="push-off" selected={!wanted} onClick={() => void on(false)}>
+            关闭
+          </Chip>
+        </div>
+      )}
     </section>
   );
 }
@@ -722,6 +791,9 @@ export function SettingsView(): React.JSX.Element {
         <AttachmentSettings />
 
         <ExtensionsSettingsBlock />
+
+        <Separator />
+        <PushNotificationsSetting />
 
         <Separator />
 

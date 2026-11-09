@@ -384,6 +384,56 @@ export const PairAbortSchema = z.object({
 });
 
 // ---------------------------------------------------------------------------
+// Web Push（PWA 通知）：client 上报订阅、server 下发公钥与回执
+// ---------------------------------------------------------------------------
+
+/**
+ * client → server：上报本设备的 Web Push 订阅（RFC 8030 endpoint + 密钥）。
+ *
+ * deviceId **不在帧上**：与 hello 同理，身份一律以 token 换回的连接身份为准，
+ * 自报的永远只做交叉检查（transport.ts 的 † 总则）。
+ *
+ * † 判据：endpoint 与加密公钥是「把通知送到这台设备」的中转本职字段——
+ * 服务端不持订阅就无从投递；p256dh/auth 是浏览器生成的推送加密公钥
+ * （不是 E2E 的 X25519 身份钥），推送服务与 Apple/Google 都本来就知道它们。
+ * 一台设备一条订阅：重复订阅按 endpoint 幂等覆盖。
+ */
+export const PushSubscribeSchema = z.object({
+  type: z.literal('push.subscribe'),
+  /** 推送服务端点（Chrome=FCM、iOS=Apple 的 push 服务），恒为 https */
+  endpoint: z
+    .string()
+    .min(16)
+    .max(2048)
+    .refine((s) => s.startsWith('https://'), 'push endpoint 必须 https'),
+  /** RFC 8291 客户端加密密钥（base64url） */
+  keys: z.object({ p256dh: Base64Schema, auth: Base64Schema }),
+});
+
+/** client → server：退订（如系统权限被收回、用户在设置里关掉通知） */
+export const PushUnsubscribeSchema = z.object({
+  type: z.literal('push.unsubscribe'),
+  endpoint: z.string().min(16).max(2048),
+});
+
+/**
+ * server → client：client 连接建立后立刻下发（没启用 Web Push 的部署不发）。
+ * 告知本服务的 VAPID 公钥，client 拿它 `pushManager.subscribe`。
+ * VAPID 公钥本就是公开值（每个订阅者都要拿到），不构成泄露。
+ */
+export const PushConfigSchema = z.object({
+  type: z.literal('push.config'),
+  vapidPublicKey: Base64Schema,
+});
+
+/** server → client：订阅回执（设置页据此显示成功/失败原因） */
+export const PushSubscribedSchema = z.object({
+  type: z.literal('push.subscribed'),
+  ok: z.boolean(),
+  error: z.string().max(200).optional(),
+});
+
+// ---------------------------------------------------------------------------
 // 联合
 // ---------------------------------------------------------------------------
 
@@ -401,6 +451,10 @@ export const TransportFrameSchema = z.discriminatedUnion('type', [
   PairBeginSchema,
   PairConfirmSchema,
   PairAbortSchema,
+  PushSubscribeSchema,
+  PushUnsubscribeSchema,
+  PushConfigSchema,
+  PushSubscribedSchema,
 ]);
 export type TransportFrame = z.infer<typeof TransportFrameSchema>;
 
