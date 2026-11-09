@@ -24,6 +24,7 @@ import { useLocation } from 'react-router';
 import { ChevronRightIcon, MoreHorizontalIcon, PinIcon } from 'lucide-react';
 import type { SessionMeta } from '@trine/core';
 import type { MachineState } from '@/store/types.ts';
+import { useTrine } from '@/app/runtime.ts';
 import { capabilitiesOf, sessionEngineTag } from '@/lib/engine-model.ts';
 import { cn } from '@/lib/utils.ts';
 import { Button } from '@/components/ui/button.tsx';
@@ -93,6 +94,8 @@ export function SessionList({
 }): React.JSX.Element {
   const location = useLocation();
   const compact = variant === 'compact';
+  // 「已完成」是展示性本地态：组件自订（四个调用点共用，逐个传 props 不值当）
+  const doneAt = useTrine((s) => s.doneAt);
   const [collapsed, setCollapsed] = useCollapsedGroups();
   const machineNames = useMemo(() => {
     const out: Record<string, string> = {};
@@ -105,8 +108,8 @@ export function SessionList({
     return out;
   }, [machines]);
   const result = useMemo(
-    () => filterSessions(sessions, query, machineNames, pinnedCwds),
-    [sessions, query, machineNames, pinnedCwds],
+    () => filterSessions(sessions, query, machineNames, pinnedCwds, doneAt),
+    [sessions, query, machineNames, pinnedCwds, doneAt],
   );
   const { requestRename, requestDelete, dialogs } = useRowActionDialogs(actions);
 
@@ -259,6 +262,7 @@ export function SessionList({
         machineId={machineId}
         machineName={machineNames[machineId] ?? machineId}
         meta={meta}
+        justDone={row.justDone === true}
         variant={variant}
         showMachine={showMachine}
         showCost={capabilitiesOf(machines[machineId]?.info, meta).cost === true}

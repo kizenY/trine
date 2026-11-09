@@ -72,7 +72,7 @@ import { SessionHeadMenu } from '@/components/chat/SessionHeadMenu.tsx';
 import { SessionUsage } from '@/components/usage/PlanUsage.tsx';
 import { supportsContextRefresh } from '@/components/usage/usage-model.ts';
 import { composerOfflineHint } from '@/components/banners/conditions.ts';
-import { useClient, useTrine } from '@/app/runtime.ts';
+import { store, useClient, useTrine } from '@/app/runtime.ts';
 import {
   agentSupportsAttachments,
   agentSupportsBgTaskStop,
@@ -146,6 +146,16 @@ export function ChatView(): React.JSX.Element {
   const [insertRequest, setInsertRequest] = useState<{ id: number; text: string } | undefined>(undefined);
   // 换了会话（例如扩展的「新会话接续」跳过来）：面板不跟过去
   useEffect(() => setExtOpen(false), [machineId, sessionId]);
+  // 「已完成」是看过即消的本地提示（store/types.ts doneAt 注释）：进会话即清
+  useEffect(() => {
+    store.setState((s) =>
+      s.doneAt[key] === undefined ? s : (() => {
+        const doneAt = { ...s.doneAt };
+        delete doneAt[key];
+        return { doneAt };
+      })(),
+    );
+  }, [key]);
   const composerExts = useComposerExtensions(machineId);
   // 文件查看（agent ≥ 0.20.0，按 machine.info.files 判断）：工具卡与消息里的路径可点，
   // 头部菜单「浏览文件」；面板状态在 URL 里（返回键逐级退回）
