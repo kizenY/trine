@@ -350,7 +350,7 @@ function DirPane({
       <div className="min-h-0 flex-1 overflow-auto pb-[env(safe-area-inset-bottom)]">
         {load.state === 'loading' && <div className="text-text-3 p-6 text-[13px]">正在读取…</div>}
         {outOfScope !== undefined && (
-          <OutOfScopeNotice path={outOfScope} canTrust={roots !== undefined} onTrust={() => setTrustPath(outOfScope)} onSessionDir={() => browse(undefined)} />
+          <OutOfScopeNotice path={outOfScope} canTrust={roots !== undefined && outOfScope !== '/'} onTrust={() => setTrustPath(outOfScope)} onSessionDir={() => browse(undefined)} />
         )}
         {load.state === 'error' && outOfScope === undefined && <ErrorBox message={load.message} onRetry={reload} />}
         {listing !== undefined && (

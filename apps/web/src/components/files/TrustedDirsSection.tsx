@@ -28,7 +28,8 @@ export function TrustedDirsSection({
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const trimmed = draft.trim();
-  const valid = trimmed.startsWith('/') || trimmed === '~' || trimmed.startsWith('~/');
+  // 根目录 agent 也会拒绝，这里先挡掉
+  const valid = (trimmed.startsWith('/') && trimmed.replace(/\/+$/, '') !== '') || trimmed === '~' || trimmed.startsWith('~/');
 
   const remove = (path: string): void => {
     if (client === null) return;
@@ -51,8 +52,7 @@ export function TrustedDirsSection({
     <section id="files" className="flex scroll-mt-16 flex-col gap-2" data-testid="trusted-dirs">
       <h2 className="font-medium">文件浏览：信任目录</h2>
       <p className="text-text-3 text-xs">
-        「浏览文件」默认只能看会话目录。这里的目录及其子目录也可以浏览（也是文件面板「位置」菜单里的预设目录），
-        对这台机器的所有会话和已配对设备生效；密钥类文件始终不可见。
+        「浏览文件」默认只能看会话目录。这里的目录及其子目录也可以浏览（也是文件面板「位置」菜单里的预设目录），对这台机器的所有会话和已配对设备生效；密钥类文件始终不可见。根目录 / 不能信任。
       </p>
       {roots.length === 0 ? (
         <p className="text-text-3 text-xs">还没有信任目录。</p>

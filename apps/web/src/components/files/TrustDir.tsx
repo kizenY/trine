@@ -159,7 +159,11 @@ export function OutOfScopeNotice({
       <code className="bg-surface-2 text-text-2 rounded px-2 py-1 font-mono text-[12px] break-all">{path}</code>
       <p className="text-text-2">
         默认只能浏览会话目录。
-        {canTrust ? '把这个目录（或它的上级）设为信任目录后即可浏览；' : '这台 agent 版本较旧，只能在机器上用环境变量 TRINE_FILES_ALLOW 加目录；'}
+        {canTrust
+          ? '把这个目录（或它的上级）设为信任目录后即可浏览；'
+          : path === '/'
+            ? '根目录 / 不能设为信任目录，请进入具体的子目录；'
+            : '这台 agent 版本较旧，只能在机器上用环境变量 TRINE_FILES_ALLOW 加目录；'}
         信任对这台机器的所有会话和已配对设备生效，密钥类文件始终不可见。
       </p>
       <div className="flex flex-wrap justify-center gap-2">
@@ -210,7 +214,7 @@ export function LocationMenu({
           <ChevronDownIcon className="size-3" />
         </Button>
       </DropdownMenuTrigger>
-      <DropdownMenuContent align="end" className="max-w-[min(26rem,90vw)]">
+      <DropdownMenuContent align="end" className="w-[min(24rem,90vw)]">
         <DropdownMenuItem data-testid="file-location" data-path="" onSelect={() => onBrowse(undefined)}>
           <HouseIcon />
           <span className={cn('truncate', sessionDir !== undefined && active(sessionDir) && 'font-medium')}>会话目录</span>
@@ -221,7 +225,13 @@ export function LocationMenu({
         {roots.map((r) => (
           <DropdownMenuItem key={r.path} data-testid="file-location" data-path={r.path} onSelect={() => onBrowse(r.path)} title={r.path}>
             <FolderIcon />
-            <span className={cn('min-w-0 flex-1 truncate font-mono text-[12px]', active(r.path) && 'font-semibold')}>{r.path}</span>
+            <span className="flex min-w-0 flex-1 flex-col">
+              <span className={cn('truncate', active(r.path) && 'font-semibold')}>{r.path.slice(r.path.lastIndexOf('/') + 1) || '/'}</span>
+              {/* 长路径保留尾部（rtl 截断从左边省略），LTR 文本包一层避免标点跑位 */}
+              <span className="text-text-3 truncate font-mono text-[11px] [direction:rtl]">
+                <bdi>{r.path}</bdi>
+              </span>
+            </span>
             {r.source === 'env' && <span className="text-text-3 shrink-0 text-[11px]">环境变量</span>}
           </DropdownMenuItem>
         ))}
