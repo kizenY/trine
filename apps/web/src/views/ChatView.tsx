@@ -93,7 +93,7 @@ import {
 import { timelineKey } from '@/lib/storage.ts';
 import { CLAUDE_ENGINE_ID } from '@trine/core';
 import { capabilitiesOf, engineModeLabel, engineOf, sessionEngineTag } from '@/lib/engine-model.ts';
-import { formatCost } from '@/lib/format.ts';
+import { CostLabel } from '@/components/chat/CostLabel.tsx';
 import { waitingForOfTool } from '@/lib/waiting.ts';
 import { ExtHeadEntry, ExtPanelSheet } from '@/components/ext/ExtPanel.tsx';
 import { FilePanel } from '@/components/files/FilePanel.tsx';
@@ -103,7 +103,7 @@ import { composerPickerLabel, ExtComposerPicker, useComposerExtensions } from '@
 import { useExtRecords } from '@/components/ext/use-ext.ts';
 
 type InfoCardState =
-  | { kind: 'status'; rows: { label: string; value: string }[] }
+  | { kind: 'status'; rows: { label: string; value: React.ReactNode }[] }
   | { kind: 'mcp'; servers: McpServerStatus[] }
   | { kind: 'error'; message: string };
 
@@ -533,7 +533,9 @@ export function ChatView(): React.JSX.Element {
             { label: '模型', value: res.model === '' ? '默认' : res.model },
             { label: '工作目录', value: res.cwd },
             { label: '权限模式', value: engineModeText ?? res.permissionMode },
-            ...(engineCaps.cost === true ? [{ label: '本会话成本', value: formatCost(res.costUsd) }] : []),
+            ...(engineCaps.cost === true
+              ? [{ label: '本会话成本', value: <CostLabel usd={res.costUsd} /> }]
+              : []),
             {
               label: '上下文',
               value:

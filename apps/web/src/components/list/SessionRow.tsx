@@ -29,7 +29,8 @@ import { NavLink } from 'react-router';
 import { BlocksIcon, CheckIcon, PinIcon } from 'lucide-react';
 import type { SessionMeta } from '@trine/core';
 import { StatePill } from '@/components/shell/StatusDot.tsx';
-import { formatCost, formatRelativeTime, truncate } from '@/lib/format.ts';
+import { formatRelativeTime, truncate } from '@/lib/format.ts';
+import { formatCostIn, useCostCurrency } from '@/lib/currency.ts';
 import { cn } from '@/lib/utils.ts';
 import { lastEventPrefix, sessionTitle, shortCwd } from './sorting.ts';
 
@@ -79,6 +80,7 @@ export function SessionRow({
   const compact = variant === 'compact';
   const attn = meta.state === 'waiting_permission';
   const prefix = lastEventPrefix(meta.state);
+  const currency = useCostCurrency();
 
   return (
     <div
@@ -194,7 +196,7 @@ export function SessionRow({
           )}
           {!compact && showCost && (
             <span className="text-text-3 tabular shrink-0 font-mono text-[11px]">
-              {formatCost(meta.costUsd)}
+              {formatCostIn(meta.costUsd, currency)}
             </span>
           )}
         </div>
