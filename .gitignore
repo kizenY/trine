@@ -36,6 +36,8 @@ cwd.json
 *.tar.gz
 
 # Private working files and assistant configuration
+# Per-machine agent launcher: copy start-agent.example.vbs (holds relay URL and paths)
+start-agent.vbs
 .local/
 .claude/
 .agents/skills/local-*/
