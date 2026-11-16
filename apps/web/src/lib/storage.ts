@@ -263,6 +263,8 @@ const TimelineDocSchema = z.object({
   history: HistoryStateSchema.optional(),
   /** 后台任务快照——**加法字段**（background-tasks） */
   bgTasks: BgTasksSchema.optional(),
+  /** 用户清除掉的已结束后台任务 id——**加法字段** */
+  bgDismissed: z.array(z.string()).optional(),
   /** 等父条目的子 agent 工具条目——**加法字段**（subagent-view）；工具条目的 children 随 entries 走 */
   pendingChildren: PendingChildrenSchema.optional(),
   /** 被裁掉的 Agent/Task 条目 id——**加法字段**（评审 m2），它们的迟到子帧直接丢 */
@@ -377,7 +379,7 @@ export async function loadTimeline(docs: DocStore, key: string): Promise<Timelin
   if (raw === undefined) return null;
   const parsed = TimelineDocSchema.safeParse(raw);
   if (!parsed.success) return null;
-  const { lastAppliedSeq, entries, history, bgTasks, pendingChildren, trimmedToolIds } = parsed.data;
+  const { lastAppliedSeq, entries, history, bgTasks, bgDismissed, pendingChildren, trimmedToolIds } = parsed.data;
   return {
     lastAppliedSeq,
     entries,
@@ -385,6 +387,7 @@ export async function loadTimeline(docs: DocStore, key: string): Promise<Timelin
     state: null,
     ...(history === undefined ? {} : { history }),
     ...(bgTasks === undefined ? {} : { bgTasks }),
+    ...(bgDismissed === undefined ? {} : { bgDismissed }),
     ...(pendingChildren === undefined ? {} : { pendingChildren }),
     ...(trimmedToolIds === undefined ? {} : { trimmedToolIds }),
   };
@@ -453,6 +456,7 @@ export async function saveTimeline(docs: DocStore, key: string, timeline: Timeli
     entries,
     ...(history === undefined ? {} : { history }),
     ...(timeline.bgTasks === undefined ? {} : { bgTasks: timeline.bgTasks }),
+    ...(timeline.bgDismissed === undefined ? {} : { bgDismissed: timeline.bgDismissed }),
     ...(pendingChildren === undefined ? {} : { pendingChildren }),
     ...(trimmedToolIds === undefined ? {} : { trimmedToolIds }),
   });

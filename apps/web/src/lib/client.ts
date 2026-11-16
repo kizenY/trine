@@ -51,6 +51,7 @@ import { ensureIdentity } from './identity.ts';
 import { Outbox, OutboxScopeFatalError, type OutboundBody } from './outbox.ts';
 import { PairingFlow, type PairingDeps } from './pairing.ts';
 import {
+  dismissEndedBgTasks,
   addLocalUserEntry,
   applyEvent,
   applyMachineEvent,
@@ -995,6 +996,14 @@ export class TrineClient {
     const body: { type: 'bgtask.stop'; sessionId: string; taskId: string } = { type: 'bgtask.stop', sessionId, taskId };
     const res = await this.request(machineId, body);
     if (res.type !== 'session.mutate.response') throw new Error(`意外的应答 ${res.type}`);
+  }
+
+  /**
+   * 「清除已结束」后台任务：纯本地隐藏（记进时间线的 bgDismissed，随时间线落盘），
+   * 不发给 agent。`stale` 时连同状态未知的一起清。
+   */
+  dismissEndedBgTasks(machineId: string, sessionId: string, stale = false): void {
+    this.#updateTimeline(machineId, sessionId, (tl) => dismissEndedBgTasks(tl, stale));
   }
 
   /**

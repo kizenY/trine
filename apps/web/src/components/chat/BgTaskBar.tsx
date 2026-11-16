@@ -8,7 +8,14 @@
  * 有「停止」（`bgtask.stop`，agent < 0.7.0 不显示——旧 agent 不认识这帧，按了只会
  * 等到超时）。
  *
- * 全部结束后折成一行「后台任务 N 个已完成」，点开可看摘要，不永久占屏。
+ * 顶部常驻一行汇总（「后台任务 1 个运行中 · 3 个已完成」），点它折叠 / 展开列表。
+ * 默认：有任务在跑时展开，全部结束后自动折成这一行，不永久占屏；用户手动点过
+ * 之后以用户的选择为准（随会话重置——ChatView 按会话给 key）。展开的列表限高
+ * 滚动，任务多时不把时间线挤没。
+ *
+ * 快照由 agent 维护：在跑的全收、已结束的只留最近 10 条（MAX_ENDED）。汇总行右侧
+ * 的「清除已结束」把当前已结束（stale 时连同状态未知）的行从条上隐藏——纯本地，
+ * 记在时间线的 bgDismissed，不影响 agent；全清空了整条消失。
  *
  * 描述（多为命令原文）默认单行省略；较长时点一下展开成可换行的全文，再点收起
  * ——手机上没有悬停，title 看不到。
@@ -24,15 +31,17 @@ import { cn } from '@/lib/utils.ts';
 
 const KIND_ICON: Record<BgTask['kind'], string> = { bash: '🔧', agent: '🤖', other: '⚙️' };
 
-/** 折叠行的文案：`后台任务 3 个已完成` / `… 2 个已完成 · 1 个失败 · 1 个已停止 · 1 个状态未知` */
+/** 汇总行的文案：`后台任务 1 个运行中 · 3 个已完成` / `… 2 个已完成 · 1 个失败 · 1 个已停止 · 1 个状态未知` */
 export function collapsedLabel(tasks: readonly BgTask[], stale = false): string {
-  const counts = { completed: 0, failed: 0, stopped: 0, unknown: 0 };
+  const counts = { running: 0, completed: 0, failed: 0, stopped: 0, unknown: 0 };
   for (const t of tasks) {
     if (t.status === 'running') {
       if (stale) counts.unknown += 1;
+      else counts.running += 1;
     } else counts[t.status] += 1;
   }
   const parts: string[] = [];
+  if (counts.running > 0) parts.push(`${counts.running} 个运行中`);
   if (counts.completed > 0) parts.push(`${counts.completed} 个已完成`);
   if (counts.failed > 0) parts.push(`${counts.failed} 个失败`);
   if (counts.stopped > 0) parts.push(`${counts.stopped} 个已停止`);
@@ -103,6 +112,7 @@ export function BgTaskBar({
   now,
   canStop,
   onStop,
+  onClearEnded,
   stale = false,
 }: {
   tasks: readonly BgTask[];
@@ -111,46 +121,53 @@ export function BgTaskBar({
   /** agent 是否支持 bgtask.stop（≥ 0.7.0） */
   canStop: boolean;
   onStop: (taskId: string) => void;
+  /** 「清除已结束」；省略 = 不显示该按钮 */
+  onClearEnded?: () => void;
   /** 快照里的 running 已陈旧（见文件头） */
   stale?: boolean;
 }): React.JSX.Element | null {
-  const [expanded, setExpanded] = useState(false);
+  // null = 跟随默认（有在跑的就展开）；用户点过之后以用户选择为准
+  const [userOpen, setUserOpen] = useState<boolean | null>(null);
   if (tasks.length === 0) return null;
   const running = stale ? 0 : tasks.filter((t) => t.status === 'running').length;
-  const collapsed = running === 0 && !expanded;
+  const open = userOpen ?? running > 0;
+  // 可清除的：已结束的，stale 时连同状态未知的（= 不在跑的）
+  const clearable = tasks.length - running;
 
   return (
     <div
       data-testid="bgtask-bar"
       data-running={running}
+      data-open={open}
       data-stale={stale || undefined}
       className="border-border bg-surface-2 text-text-2 shrink-0 border-t px-3.5 py-1.5 text-[12px]"
     >
-      {collapsed ? (
+      <div className="flex min-w-0 items-center gap-2">
         <button
           type="button"
-          data-testid="bgtask-collapsed"
-          className="hover:text-text-1 flex w-full items-center gap-1.5 text-left"
-          onClick={() => setExpanded(true)}
+          data-testid="bgtask-toggle"
+          aria-expanded={open}
+          className="hover:text-text-1 flex min-w-0 flex-1 items-center gap-1.5 text-left"
+          onClick={() => setUserOpen(!open)}
         >
-          <span aria-hidden>▸</span>
-          <span className="truncate">{collapsedLabel(tasks, stale)}</span>
+          <span aria-hidden className="w-[18px] shrink-0 text-center">
+            {open ? '▾' : '▸'}
+          </span>
+          <span className={cn('truncate', running > 0 && 'text-brand')}>{collapsedLabel(tasks, stale)}</span>
         </button>
-      ) : (
-        <ul className="flex flex-col gap-1">
-          {running === 0 && (
-            <li>
-              <button
-                type="button"
-                data-testid="bgtask-collapse"
-                className="hover:text-text-1 flex items-center gap-1.5 text-left"
-                onClick={() => setExpanded(false)}
-              >
-                <span aria-hidden>▾</span>
-                <span className="truncate">{collapsedLabel(tasks, stale)}</span>
-              </button>
-            </li>
-          )}
+        {onClearEnded !== undefined && clearable > 0 && (
+          <button
+            type="button"
+            data-testid="bgtask-clear"
+            className="text-text-3 hover:text-text-1 shrink-0 text-[11px]"
+            onClick={onClearEnded}
+          >
+            清除已结束
+          </button>
+        )}
+      </div>
+      {open && (
+        <ul data-testid="bgtask-list" className="mt-1 flex max-h-[30vh] flex-col gap-1 overflow-y-auto">
           {tasks.map((task) => {
             const status = statusText(task, now, stale);
             return (
