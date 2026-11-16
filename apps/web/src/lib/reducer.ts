@@ -381,12 +381,6 @@ export interface Timeline {
    */
   bgTasks?: BgTask[];
   /**
-   * 用户在后台任务条上「清除已结束」掉的任务 id（纯本地，不发给 agent）。条上不再显示
-   * 它们；每次快照到来时只留仍在快照里且已结束的 id（被挤出 MAX_ENDED 的、又跑起来的
-   * 都不再隐藏）。省略 = 没清过。随时间线落盘。
-   */
-  bgDismissed?: string[];
-  /**
    * 父条目还没出现的子 agent 工具条目，按父 toolUseId 分组暂存（subagent-view；
    * 见 tool-tree.ts）。省略 = 没有。随时间线落盘（父可能在更早的历史页里）。
    */
@@ -780,16 +774,8 @@ export function applyEvent(tl: Timeline, event: AgentToClientEvent): Timeline {
         seq,
         ts: event.ts,
       });
-    case 'bgtask.snapshot': {
-      const { bgDismissed: _old, ...rest } = tl;
-      const bgDismissed = pruneBgDismissed(tl.bgDismissed, event.tasks);
-      return {
-        ...rest,
-        lastAppliedSeq: Math.max(tl.lastAppliedSeq, seq),
-        bgTasks: event.tasks,
-        ...(bgDismissed === undefined ? {} : { bgDismissed }),
-      };
-    }
+    case 'bgtask.snapshot':
+      return { ...tl, lastAppliedSeq: Math.max(tl.lastAppliedSeq, seq), bgTasks: event.tasks };
     case 'input.rejected': {
       // agent 没接受（附件准备失败）：本地条目转 failed，可原样重试。别的设备没有这条本地条目
       const idx = tl.entries.findIndex((e) => e.kind === 'user' && e.local && e.id === event.clientMsgId);
@@ -1422,34 +1408,6 @@ export function bgRunningCount(tasks: readonly BgTask[] | undefined): number {
   let n = 0;
   for (const t of tasks) if (t.status === 'running') n += 1;
   return n;
-}
-
-/** 已清除 id 只留仍在快照里且已结束的；空了返回 undefined（字段省略） */
-export function pruneBgDismissed(dismissed: readonly string[] | undefined, tasks: readonly BgTask[]): string[] | undefined {
-  if (dismissed === undefined || dismissed.length === 0) return undefined;
-  const ended = new Set(tasks.filter((t) => t.status !== 'running').map((t) => t.taskId));
-  const kept = dismissed.filter((id) => ended.has(id));
-  return kept.length === 0 ? undefined : kept;
-}
-
-/**
- * 「清除已结束」：把当前已结束的任务（stale 时连同状态未知的）记进 bgDismissed。
- * 没有可清的返回原对象。
- */
-export function dismissEndedBgTasks(tl: Timeline, stale: boolean): Timeline {
-  const tasks = tl.bgTasks ?? [];
-  const hidden = new Set(tl.bgDismissed ?? []);
-  const add = tasks.filter((t) => (stale || t.status !== 'running') && !hidden.has(t.taskId)).map((t) => t.taskId);
-  if (add.length === 0) return tl;
-  return { ...tl, bgDismissed: [...hidden, ...add] };
-}
-
-/** 条上要显示的任务（去掉用户清除掉的） */
-export function visibleBgTasks(tl: Pick<Timeline, 'bgTasks' | 'bgDismissed'>): BgTask[] | undefined {
-  if (tl.bgTasks === undefined) return undefined;
-  if (tl.bgDismissed === undefined || tl.bgDismissed.length === 0) return tl.bgTasks;
-  const hidden = new Set(tl.bgDismissed);
-  return tl.bgTasks.filter((t) => !hidden.has(t.taskId));
 }
 
 /**

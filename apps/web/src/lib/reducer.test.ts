@@ -12,8 +12,6 @@ import {
   applyEvent,
   bgRunningCount,
   bgTasksStale,
-  dismissEndedBgTasks,
-  visibleBgTasks,
   applyMachineEvent,
   applySessionsEvent,
   emptyMachine,
@@ -559,29 +557,6 @@ describe('reducer · 后台任务（background-tasks）', () => {
     // 没收到过快照的时间线读回来也没有这个字段
     await saveTimeline(docs, 'm/t', emptyTimeline());
     expect((await loadTimeline(docs, 'm/t'))?.bgTasks).toBeUndefined();
-  });
-
-  test('清除已结束：只隐藏不在跑的；快照到来时只留仍在快照里且已结束的 id；随时间线落盘', async () => {
-    const done = task({ taskId: 'd', status: 'completed', endedAt: 2_000 });
-    const failed = task({ taskId: 'f', status: 'failed', endedAt: 3_000 });
-    let tl = apply(emptyTimeline(), ev({ type: 'bgtask.snapshot', ...S, tasks: [task(), done, failed] }, 1));
-    tl = dismissEndedBgTasks(tl, false);
-    expect(tl.bgDismissed).toEqual(['d', 'f']);
-    expect(visibleBgTasks(tl)!.map((t) => t.taskId)).toEqual(['t1']);
-    // 没有可清的：原对象
-    expect(dismissEndedBgTasks(tl, false)).toBe(tl);
-    // stale：连同状态未知（快照里 running）的一起清
-    expect(dismissEndedBgTasks(tl, true).bgDismissed).toEqual(['d', 'f', 't1']);
-
-    const docs = new MemoryDocStore();
-    await saveTimeline(docs, 'm/s', tl);
-    expect((await loadTimeline(docs, 'm/s'))?.bgDismissed).toEqual(['d', 'f']);
-
-    // d 被挤出快照、f 又跑起来（resume）：都不再记着；t1 结束了也照常显示
-    tl = apply(tl, ev({ type: 'bgtask.snapshot', ...S, tasks: [task({ status: 'completed', endedAt: 4_000 }), task({ taskId: 'f' })] }, 2));
-    expect(tl.bgDismissed).toBeUndefined();
-    expect(visibleBgTasks(tl)!.map((t) => t.taskId)).toEqual(['t1', 'f']);
-    expect(visibleBgTasks(emptyTimeline())).toBeUndefined();
   });
 
   test('bgTasksStale（评审 M2）：agent ≥ 0.7.0 且 meta 说没有在跑、快照却有 running → 陈旧；其余情形不下结论', () => {

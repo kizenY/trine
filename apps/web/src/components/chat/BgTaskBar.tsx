@@ -14,8 +14,9 @@
  * 滚动，任务多时不把时间线挤没。
  *
  * 快照由 agent 维护：在跑的全收、已结束的只留最近 10 条（MAX_ENDED）。汇总行右侧
- * 的「清除已结束」把当前已结束（stale 时连同状态未知）的行从条上隐藏——纯本地，
- * 记在时间线的 bgDismissed，不影响 agent；全清空了整条消失。
+ * 的「隐藏已结束 / 显示已结束（N）」是全局偏好（prefs.bgHideEnded）：隐藏时列表只列
+ * 在跑的（之后新结束的也自动隐藏），汇总行照常计数；没有在跑的就只剩汇总行一行，
+ * 随时点「显示」找回。stale 时状态未知的算已结束。
  *
  * 描述（多为命令原文）默认单行省略；较长时点一下展开成可换行的全文，再点收起
  * ——手机上没有悬停，title 看不到。
@@ -112,7 +113,8 @@ export function BgTaskBar({
   now,
   canStop,
   onStop,
-  onClearEnded,
+  hideEnded = false,
+  onHideEndedChange,
   stale = false,
 }: {
   tasks: readonly BgTask[];
@@ -121,8 +123,10 @@ export function BgTaskBar({
   /** agent 是否支持 bgtask.stop（≥ 0.7.0） */
   canStop: boolean;
   onStop: (taskId: string) => void;
-  /** 「清除已结束」；省略 = 不显示该按钮 */
-  onClearEnded?: () => void;
+  /** 隐藏已结束的任务（全局偏好） */
+  hideEnded?: boolean;
+  /** 切换隐藏；省略 = 不显示该按钮 */
+  onHideEndedChange?: (hide: boolean) => void;
   /** 快照里的 running 已陈旧（见文件头） */
   stale?: boolean;
 }): React.JSX.Element | null {
@@ -130,15 +134,19 @@ export function BgTaskBar({
   const [userOpen, setUserOpen] = useState<boolean | null>(null);
   if (tasks.length === 0) return null;
   const running = stale ? 0 : tasks.filter((t) => t.status === 'running').length;
-  const open = userOpen ?? running > 0;
-  // 可清除的：已结束的，stale 时连同状态未知的（= 不在跑的）
-  const clearable = tasks.length - running;
+  // 已结束的（stale 时连同状态未知的 = 不在跑的）
+  const ended = tasks.length - running;
+  const shown = hideEnded && ended > 0 ? tasks.filter((t) => !stale && t.status === 'running') : tasks;
+  // 隐藏后没有可列的：只剩汇总行，没有可展开的东西
+  const expandable = shown.length > 0;
+  const open = expandable && (userOpen ?? running > 0);
 
   return (
     <div
       data-testid="bgtask-bar"
       data-running={running}
       data-open={open}
+      data-hide-ended={hideEnded || undefined}
       data-stale={stale || undefined}
       className="border-border bg-surface-2 text-text-2 shrink-0 border-t px-3.5 py-1.5 text-[12px]"
     >
@@ -147,28 +155,34 @@ export function BgTaskBar({
           type="button"
           data-testid="bgtask-toggle"
           aria-expanded={open}
-          className="hover:text-text-1 flex min-w-0 flex-1 items-center gap-1.5 text-left"
+          disabled={!expandable}
+          className="enabled:hover:text-text-1 flex min-w-0 flex-1 items-center gap-1.5 text-left"
           onClick={() => setUserOpen(!open)}
         >
           <span aria-hidden className="w-[18px] shrink-0 text-center">
-            {open ? '▾' : '▸'}
+            {expandable ? (open ? '▾' : '▸') : '·'}
           </span>
           <span className={cn('truncate', running > 0 && 'text-brand')}>{collapsedLabel(tasks, stale)}</span>
         </button>
-        {onClearEnded !== undefined && clearable > 0 && (
+        {onHideEndedChange !== undefined && ended > 0 && (
           <button
             type="button"
-            data-testid="bgtask-clear"
+            data-testid="bgtask-hide-ended"
+            aria-pressed={hideEnded}
             className="text-text-3 hover:text-text-1 shrink-0 text-[11px]"
-            onClick={onClearEnded}
+            onClick={() => {
+              // 点「显示」时顺手展开，不然显示了也看不到
+              if (hideEnded) setUserOpen(true);
+              onHideEndedChange(!hideEnded);
+            }}
           >
-            清除已结束
+            {hideEnded ? `显示已结束（${ended}）` : '隐藏已结束'}
           </button>
         )}
       </div>
       {open && (
         <ul data-testid="bgtask-list" className="mt-1 flex max-h-[30vh] flex-col gap-1 overflow-y-auto">
-          {tasks.map((task) => {
+          {shown.map((task) => {
             const status = statusText(task, now, stale);
             return (
               <li

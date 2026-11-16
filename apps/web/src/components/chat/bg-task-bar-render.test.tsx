@@ -36,7 +36,8 @@ function mount(props: {
   now?: number;
   canStop?: boolean;
   onStop?: (id: string) => void;
-  onClearEnded?: () => void;
+  hideEnded?: boolean;
+  onHideEndedChange?: (hide: boolean) => void;
   stale?: boolean;
 }): HTMLDivElement {
   host = document.createElement('div');
@@ -50,7 +51,8 @@ function mount(props: {
         canStop={props.canStop ?? true}
         onStop={props.onStop ?? (() => {})}
         {...(props.stale === undefined ? {} : { stale: props.stale })}
-        {...(props.onClearEnded === undefined ? {} : { onClearEnded: props.onClearEnded })}
+        {...(props.hideEnded === undefined ? {} : { hideEnded: props.hideEnded })}
+        {...(props.onHideEndedChange === undefined ? {} : { onHideEndedChange: props.onHideEndedChange })}
       />,
     );
   });
@@ -160,23 +162,39 @@ describe('BgTaskBar', () => {
     expect($$(el, 'bgtask-desc')).toHaveLength(1);
   });
 
-  test('清除已结束：有不在跑的才显示按钮，点了回调；没传回调不显示', () => {
-    let cleared = 0;
-    const el = mount({ tasks: [task(), task({ taskId: 'done', status: 'completed', endedAt: T0 + 1 })], onClearEnded: () => (cleared += 1) });
-    act(() => $(el, 'bgtask-clear')!.click());
-    expect(cleared).toBe(1);
+  test('隐藏已结束：按钮切换偏好；隐藏时只列在跑的，汇总照常计数', () => {
+    const calls: boolean[] = [];
+    const tasks = [task(), task({ taskId: 'done', status: 'completed', endedAt: T0 + 1 }), task({ taskId: 'f', status: 'failed', endedAt: T0 + 2 })];
+    let el = mount({ tasks, onHideEndedChange: (h) => calls.push(h) });
+    expect($(el, 'bgtask-hide-ended')!.textContent).toBe('隐藏已结束');
+    act(() => $(el, 'bgtask-hide-ended')!.click());
+    expect(calls).toEqual([true]);
     act(() => root?.unmount());
     host?.remove();
-    const onlyRunning = mount({ tasks: [task()], onClearEnded: () => {} });
-    expect($(onlyRunning, 'bgtask-clear')).toBeNull();
-    act(() => root?.unmount());
-    host?.remove();
-    const noCb = mount({ tasks: [task({ status: 'completed' })] });
-    expect($(noCb, 'bgtask-clear')).toBeNull();
+
+    el = mount({ tasks, hideEnded: true, onHideEndedChange: (h) => calls.push(h) });
+    expect($$(el, 'bgtask-row').map((r) => r.dataset['taskId'])).toEqual(['bd4zj554r']);
+    expect($(el, 'bgtask-toggle')!.textContent).toContain('1 个运行中 · 1 个已完成 · 1 个失败');
+    expect($(el, 'bgtask-hide-ended')!.textContent).toBe('显示已结束（2）');
+    act(() => $(el, 'bgtask-hide-ended')!.click());
+    expect(calls).toEqual([true, false]);
   });
 
-  test('stale 时状态未知的也算可清除', () => {
-    const el = mount({ tasks: [task()], stale: true, onClearEnded: () => {} });
-    expect($(el, 'bgtask-clear')).not.toBeNull();
+  test('隐藏且没有在跑的：只剩汇总行，不可展开；只有在跑的不显示按钮', () => {
+    let el = mount({ tasks: [task({ status: 'completed', endedAt: T0 + 1 })], hideEnded: true, onHideEndedChange: () => {} });
+    const toggle = $(el, 'bgtask-toggle')!;
+    expect((toggle as HTMLButtonElement).disabled).toBe(true);
+    expect($$(el, 'bgtask-row')).toHaveLength(0);
+    expect($(el, 'bgtask-hide-ended')!.textContent).toBe('显示已结束（1）');
+    act(() => root?.unmount());
+    host?.remove();
+    el = mount({ tasks: [task()], onHideEndedChange: () => {} });
+    expect($(el, 'bgtask-hide-ended')).toBeNull();
+    act(() => root?.unmount());
+    host?.remove();
+    // stale：状态未知的算已结束，隐藏后不列
+    el = mount({ tasks: [task()], stale: true, hideEnded: true, onHideEndedChange: () => {} });
+    expect($$(el, 'bgtask-row')).toHaveLength(0);
+    expect($(el, 'bgtask-hide-ended')!.textContent).toBe('显示已结束（1）');
   });
 });

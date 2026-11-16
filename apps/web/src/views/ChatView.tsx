@@ -82,7 +82,6 @@ import {
   agentSupportsSubagentHistory,
   bgRunningCount,
   bgTasksStale,
-  visibleBgTasks,
   emptyTimeline,
   isPendingEntry,
   rewindTargetId,
@@ -337,8 +336,6 @@ export function ChatView(): React.JSX.Element {
   // agent 重启 / 崩溃后落盘快照里的 running 已陈旧：按 agent 权威的 meta.bgRunning 对账（评审 M2）
   const bgStale = bgTasksStale({ bgTasks, meta, agentVersion: machine?.info?.agentVersion });
   const bgRunning = bgTasks === undefined ? (meta?.bgRunning ?? 0) : bgStale ? 0 : bgRunningCount(bgTasks);
-  // 条上去掉用户「清除已结束」掉的；时间线里的子 agent 状态仍按完整快照派生
-  const barTasks = visibleBgTasks(timeline);
   const needsTick = running || pendingPermission !== undefined || hasRecalling || bgRunning > 0;
   useEffect(() => {
     if (!needsTick) return;
@@ -850,16 +847,17 @@ export function ChatView(): React.JSX.Element {
         />
       )}
 
-      {barTasks !== undefined && barTasks.length > 0 && (
+      {bgTasks !== undefined && bgTasks.length > 0 && (
         <BgTaskBar
           // 折叠状态随会话重置（路由切会话不会重挂 ChatView）
           key={key}
-          tasks={barTasks}
+          tasks={bgTasks}
           now={now}
           stale={bgStale}
           canStop={agentSupportsBgTaskStop(machine?.info?.agentVersion)}
           onStop={stopBgTask}
-          onClearEnded={() => client?.dismissEndedBgTasks(machineId, sessionId, bgStale)}
+          hideEnded={prefs.bgHideEnded}
+          onHideEndedChange={(hide) => client?.updatePrefs({ bgHideEnded: hide })}
         />
       )}
       {running && hbView !== null && <HeartbeatFooter view={hbView} />}

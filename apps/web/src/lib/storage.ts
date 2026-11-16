@@ -194,6 +194,8 @@ export const PrefsSchema = z.object({
   sessionContentWidth: z.record(z.string(), ContentWidthSchema).catch({}),
   /** PC 会话页文件工作区的宽度（px）；null = 主区一半。见 lib/layout-prefs.ts。`.catch` 同 listGroupBy */
   workspaceWidth: z.number().int().min(WORKSPACE_MIN_WIDTH).max(WORKSPACE_MAX_STORED_WIDTH).nullable().catch(null),
+  /** 后台任务条隐藏已结束的任务（全局；条上「隐藏已结束 / 显示」切换） */
+  bgHideEnded: z.boolean().catch(false),
 });
 export type Prefs = z.infer<typeof PrefsSchema>;
 
@@ -239,6 +241,7 @@ export function defaultPrefs(): Prefs {
     contentWidth: 'standard',
     sessionContentWidth: {},
     workspaceWidth: null,
+    bgHideEnded: false,
   };
 }
 
@@ -263,8 +266,6 @@ const TimelineDocSchema = z.object({
   history: HistoryStateSchema.optional(),
   /** 后台任务快照——**加法字段**（background-tasks） */
   bgTasks: BgTasksSchema.optional(),
-  /** 用户清除掉的已结束后台任务 id——**加法字段** */
-  bgDismissed: z.array(z.string()).optional(),
   /** 等父条目的子 agent 工具条目——**加法字段**（subagent-view）；工具条目的 children 随 entries 走 */
   pendingChildren: PendingChildrenSchema.optional(),
   /** 被裁掉的 Agent/Task 条目 id——**加法字段**（评审 m2），它们的迟到子帧直接丢 */
@@ -379,7 +380,7 @@ export async function loadTimeline(docs: DocStore, key: string): Promise<Timelin
   if (raw === undefined) return null;
   const parsed = TimelineDocSchema.safeParse(raw);
   if (!parsed.success) return null;
-  const { lastAppliedSeq, entries, history, bgTasks, bgDismissed, pendingChildren, trimmedToolIds } = parsed.data;
+  const { lastAppliedSeq, entries, history, bgTasks, pendingChildren, trimmedToolIds } = parsed.data;
   return {
     lastAppliedSeq,
     entries,
@@ -387,7 +388,6 @@ export async function loadTimeline(docs: DocStore, key: string): Promise<Timelin
     state: null,
     ...(history === undefined ? {} : { history }),
     ...(bgTasks === undefined ? {} : { bgTasks }),
-    ...(bgDismissed === undefined ? {} : { bgDismissed }),
     ...(pendingChildren === undefined ? {} : { pendingChildren }),
     ...(trimmedToolIds === undefined ? {} : { trimmedToolIds }),
   };
@@ -456,7 +456,6 @@ export async function saveTimeline(docs: DocStore, key: string, timeline: Timeli
     entries,
     ...(history === undefined ? {} : { history }),
     ...(timeline.bgTasks === undefined ? {} : { bgTasks: timeline.bgTasks }),
-    ...(timeline.bgDismissed === undefined ? {} : { bgDismissed: timeline.bgDismissed }),
     ...(pendingChildren === undefined ? {} : { pendingChildren }),
     ...(trimmedToolIds === undefined ? {} : { trimmedToolIds }),
   });
