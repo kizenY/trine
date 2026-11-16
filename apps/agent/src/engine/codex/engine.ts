@@ -209,6 +209,8 @@ export class CodexEngine implements CodexSessionClient {
   readonly #now: () => number;
   readonly #log: (line: string) => void;
   readonly #onChange: () => void;
+  /** thread 的名字变了（Codex 自动起名、别的客户端改名）：manager 据此广播 session.updated */
+  #onTitle: ((sessionId: string, title: string) => void) | undefined;
   readonly #owned = new Map<string, SessionMeta>();
   readonly #notOwned = new Map<string, number>();
   #accountAt: number | undefined;
@@ -553,6 +555,11 @@ export class CodexEngine implements CodexSessionClient {
     });
   }
 
+  /** 订阅 thread 名字变化（`thread/name/updated`）；只留一个监听者，后设的替换先设的 */
+  onTitle(listener: (sessionId: string, title: string) => void): void {
+    this.#onTitle = listener;
+  }
+
   async rename(sessionId: string, title: string): Promise<void> {
     try {
       await this.#client.call('thread/name/set', { threadId: sessionId, name: title });
@@ -579,7 +586,11 @@ export class CodexEngine implements CodexSessionClient {
     if (method === 'thread/name/updated' && threadId !== undefined) {
       const meta = this.#owned.get(threadId);
       const name = str(params['threadName']) ?? str(params['name']);
-      if (meta !== undefined && name !== undefined) this.#owned.set(threadId, { ...meta, title: name });
+      if (name !== undefined) {
+        if (meta !== undefined) this.#owned.set(threadId, { ...meta, title: name });
+        // 新建的 thread 往往还不在 #owned 里（列表没刷新过），照样通知
+        this.#onTitle?.(threadId, name);
+      }
     }
     // thread/started 只带 {thread}，没有顶层 threadId（评审 低10）
     if (method === 'thread/started') {

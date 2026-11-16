@@ -77,7 +77,9 @@ import type {
 // - 0.27.0 起支持新建会话前检查 / 创建工作目录（cwd.prepare.request，MachineInfo.cwd.create 能力位）
 // - 0.28.0 起支持重启引擎的后台进程（machine.engine.restart.request，EngineCapabilities.restart；
 //   Codex：换掉 trine 的 app-server、常驻 daemon 在跑时一并重启，换账号后重新读登录）
-export const AGENT_VERSION = '0.28.0';
+// - 0.29.0 起引擎自动起的会话标题随 session.updated 推送（Claude Code 轮末查转录里的 aiTitle，
+//   Codex 接 thread/name/updated），不用重新列会话。协议不变
+export const AGENT_VERSION = '0.29.0';
 
 export function buildMachineInfo(input: {
   name: string;

@@ -178,7 +178,7 @@
   `{ sessionId, title, state, lastEvent（单行摘要）, lastActivityAt, cwd, model, permissionMode, costUsd }`
 - `session.created` / `session.updated` — 列表增量更新（标题生成、状态迁移、成本累计）
 - `session.create`（client→agent）— `{ cwd, model, permissionMode }`（新建表单字段；cwd 默认值 = 该机器 defaultCwd，见 §6；model / permissionMode 默认值取 client 设置「新会话默认值」，初值 opus[1m] / bypassPermissions；model 可为家族别名如 opus、opus[1m]；permissionMode 含 bypassPermissions 档，UI 改选时两击确认）
-- 标题：MVP = 首条用户消息截断；`session.title` 字段留好，后续 agent 生成摘要
+- 标题：首条消息时先用首条用户消息占位；引擎自动起的标题（agent ≥ 0.29.0）随 `session.updated` 推送，client 不用重新列会话。Claude Code：每轮结束时 agent 查一次转录里的正式标题（`/rename` 的标题或自动生成的 aiTitle），没有就隔 5 秒再查一次，拿到后该会话不再查；有待落盘的用户标题时不查。Codex：agent 收到 app-server 的 `thread/name/updated` 即广播
 
 ### 2.1 会话元数据字段扩展（session-list-v2，2026-09-25）
 

@@ -295,6 +295,7 @@ export class AgentApp {
               rename: (sessionId: string, title: string) => codex.rename(sessionId, title),
               delete: (sessionId: string) => codex.delete(sessionId),
               createSession: (args: CreateSessionArgs) => (args.engine === CODEX_ENGINE_ID ? codex.createSession(args) : undefined),
+              onTitle: (listener) => codex.onTitle(listener),
             },
           }),
       uploadsDir: (sessionId) => attachments.sessionDir(sessionId),

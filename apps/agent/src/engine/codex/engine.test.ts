@@ -551,6 +551,28 @@ describe('CodexEngine · 写操作', () => {
     h.codex.dispose();
   });
 
+  test('thread/name/updated：更新缓存并通知订阅者（不在缓存里的 thread 也通知）', async () => {
+    const h = engine({
+      'thread/list': () => ({ data: [fakeThread('a')], nextCursor: null }),
+      'account/read': () => ({ account: { type: 'chatgpt' } }),
+      'account/rateLimits/read': () => ({}),
+    });
+    await h.codex.listSessions();
+    const seen: Array<[string, string]> = [];
+    h.codex.onTitle((id, title) => seen.push([id, title]));
+    const note = (params: Record<string, unknown>) =>
+      h.server.handlers!.onLine(JSON.stringify({ method: 'thread/name/updated', params }));
+    note({ threadId: 'a', threadName: '修复登录页' });
+    note({ threadId: 'new', threadName: '新会话' });
+    note({ threadId: 'a' });
+    expect(h.codex.metaOf('a')?.title).toBe('修复登录页');
+    expect(seen).toEqual([
+      ['a', '修复登录页'],
+      ['new', '新会话'],
+    ]);
+    h.codex.dispose();
+  });
+
   test('delete：调 thread/delete，缓存删掉', async () => {
     const h = engine({
       'thread/list': () => ({ data: [fakeThread('a')], nextCursor: null }),

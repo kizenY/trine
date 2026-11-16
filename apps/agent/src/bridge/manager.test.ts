@@ -44,6 +44,9 @@ function makeHarness(options?: {
   rememberedParams?: SessionManagerOptions['rememberedParams'];
   headlessProbe?: SessionManagerOptions['headlessProbe'];
   onRewindApplied?: (sessionId: string) => void;
+  /** 覆盖默认的 getSessionInfo（默认按 sessions 查） */
+  getSessionInfo?: (sessionId: string) => Promise<unknown>;
+  titleRetryMs?: number;
 }) {
   const events: OutboundEvent[] = [];
   const created: FakeSession[] = [];
@@ -57,8 +60,9 @@ function makeHarness(options?: {
     ...(options?.idleTimeoutMs === undefined ? {} : { idleTimeoutMs: options.idleTimeoutMs }),
     listSessionsFn: (async () => options?.sessions ?? []) as typeof listSessions,
     // 默认实现会去读真 ~/.claude：测试一律注入
-    getSessionInfoFn: (async (sid: string) =>
-      options?.sessions?.find((s) => s.sessionId === sid)) as never,
+    getSessionInfoFn: (options?.getSessionInfo ??
+      (async (sid: string) => options?.sessions?.find((s) => s.sessionId === sid))) as never,
+    ...(options?.titleRetryMs === undefined ? {} : { titleRetryMs: options.titleRetryMs }),
     renameSessionFn: (async () => {}) as never,
     deleteSessionFn: (async () => {}) as never,
     ...(options?.flags === undefined ? {} : { flags: options.flags }),
@@ -811,6 +815,114 @@ describe('SessionManager · 自动取消归档（M1）与 onRunEnd', () => {
   });
 });
 
+describe('SessionManager · 轮末跟上自动标题', () => {
+  /** 首条消息：running（带 firstPrompt，占位标题）→ idle（轮末） */
+  function firstTurn(fake: FakeSession, prompt: string): void {
+    fake.args.onMeta?.({
+      sessionId: fake.sessionId,
+      state: 'running',
+      costUsd: 0,
+      lastActivityAt: 0,
+      cwd: fake.args.cwd,
+      model: fake.args.model,
+      permissionMode: fake.args.permissionMode,
+      firstPrompt: prompt,
+    } as never);
+    transition(fake, 'idle');
+  }
+
+  test('转录里有了自动标题：写进缓存并广播一次 session.updated；之后的轮次不再查', async () => {
+    const queried: string[] = [];
+    const { manager, events, created } = makeHarness({
+      getSessionInfo: async (sid) => {
+        queried.push(sid);
+        return sdkInfo({ sessionId: sid, summary: '修复登录页', customTitle: '修复登录页', firstPrompt: '帮我看看登录' });
+      },
+    });
+    manager.acquire({ sessionId: 's1', ...base });
+    firstTurn(created[0]!, '帮我看看登录');
+    expect(manager.metaOf('s1')!.title).toBe('帮我看看登录');
+    await Bun.sleep(0);
+    expect(manager.metaOf('s1')!.title).toBe('修复登录页');
+    expect(updatedOf(events).at(-1)).toMatchObject({ sessionId: 's1', title: '修复登录页' });
+    const count = updatedOf(events).length;
+
+    transition(created[0]!, 'running');
+    transition(created[0]!, 'idle');
+    await Bun.sleep(0);
+    expect(queried).toEqual(['s1']);
+    // 只有两次状态迁移本身的广播，标题保持
+    expect(updatedOf(events).length).toBe(count + 2);
+    expect(updatedOf(events).at(-1)!.title).toBe('修复登录页');
+  });
+
+  test('轮末还没生成：隔一段时间再查一次，拿到后广播', async () => {
+    let ready = false;
+    const { manager, events, created } = makeHarness({
+      titleRetryMs: 5,
+      getSessionInfo: async (sid) =>
+        sdkInfo({ sessionId: sid, summary: 'hi', ...(ready ? { customTitle: '问候' } : {}) }),
+    });
+    manager.acquire({ sessionId: 's1', ...base });
+    firstTurn(created[0]!, 'hi');
+    await Bun.sleep(0);
+    expect(manager.metaOf('s1')!.title).toBe('hi');
+    ready = true;
+    await Bun.sleep(20);
+    expect(manager.metaOf('s1')!.title).toBe('问候');
+    expect(updatedOf(events).at(-1)!.title).toBe('问候');
+    manager.stopReaper();
+  });
+
+  test('只重试一次；没有正式标题时标题不动、不多发广播', async () => {
+    let calls = 0;
+    const { manager, events, created } = makeHarness({
+      titleRetryMs: 5,
+      getSessionInfo: async (sid) => {
+        calls++;
+        return sdkInfo({ sessionId: sid, summary: '最后一条输入' });
+      },
+    });
+    manager.acquire({ sessionId: 's1', ...base });
+    firstTurn(created[0]!, 'hi');
+    const count = updatedOf(events).length;
+    await Bun.sleep(30);
+    expect(calls).toBe(2);
+    expect(manager.metaOf('s1')!.title).toBe('hi');
+    expect(updatedOf(events).length).toBe(count);
+  });
+
+  test('有待落盘的用户标题时不查转录', async () => {
+    const f = fakeFlags();
+    let calls = 0;
+    const { manager, created } = makeHarness({
+      flags: f.flags,
+      getSessionInfo: async () => {
+        calls++;
+        return undefined;
+      },
+    });
+    manager.acquire({ sessionId: 's1', ...base });
+    f.pending.set('s1', '我的名字');
+    firstTurn(created[0]!, 'hi');
+    await Bun.sleep(0);
+    expect(calls).toBe(0);
+    expect(manager.metaOf('s1')!.title).toBe('我的名字');
+  });
+
+  test('查询失败只记日志', async () => {
+    const { manager, created } = makeHarness({
+      getSessionInfo: async () => {
+        throw new Error('io');
+      },
+    });
+    manager.acquire({ sessionId: 's1', ...base });
+    firstTurn(created[0]!, 'hi');
+    await Bun.sleep(0);
+    expect(manager.metaOf('s1')!.title).toBe('hi');
+  });
+});
+
 describe('SessionManager · waitingFor 与权限模式变化（exit-plan-mode）', () => {
   /** 带任意运行时字段回调 onMeta（模拟真会话的 meta()） */
   function emitMeta(fake: FakeSession, over: Record<string, unknown>): void {
@@ -933,5 +1045,66 @@ describe('SessionManager · 其他引擎的会话', () => {
 
   test('目录抛错：只记日志，不影响 Claude 列表', async () => {
     expect(await make(new Error('down')).list()).toEqual([]);
+  });
+
+  test('引擎推来的标题：更新缓存并广播；同名、不在缓存、已删除的不广播', () => {
+    const f = fakeFlags();
+    const events: OutboundEvent[] = [];
+    let push: ((sessionId: string, title: string) => void) | undefined;
+    const manager = new SessionManager({
+      emitter: new EventEmitter({ now: () => 1, sink: (out) => events.push(out) }),
+      flags: f.flags,
+      listSessionsFn: (async () => []) as never,
+      getSessionInfoFn: (async () => undefined) as never,
+      externalSessions: {
+        list: async () => [],
+        metaOf: () => undefined,
+        rename: async () => {},
+        delete: async () => {},
+        createSession: () => undefined,
+        onTitle: (listener) => {
+          push = listener;
+        },
+      },
+    });
+    manager.setMeta(meta('a', { title: '帮我看看登录' }));
+    manager.setMeta(meta('d'));
+    f.deleted.add('d');
+
+    push!('a', '修复登录页');
+    expect(manager.metaOf('a')!.title).toBe('修复登录页');
+    expect(updatedOf(events)).toEqual([expect.objectContaining({ sessionId: 'a', title: '修复登录页', engine: 'codex' })]);
+
+    push!('a', '修复登录页');
+    push!('x', '不认识');
+    push!('d', '删了');
+    expect(updatedOf(events)).toHaveLength(1);
+  });
+
+  test('Claude 轮末不去查 Codex 会话的转录', async () => {
+    let calls = 0;
+    const manager = new SessionManager({
+      emitter: new EventEmitter({ now: () => 1, sink: () => {} }),
+      listSessionsFn: (async () => []) as never,
+      getSessionInfoFn: (async () => {
+        calls++;
+        return undefined;
+      }) as never,
+      externalSessions: {
+        list: async () => [],
+        metaOf: () => undefined,
+        rename: async () => {},
+        delete: async () => {},
+        createSession: (args) =>
+          ({ args, sessionId: args.sessionId, state: 'idle', close: () => Promise.resolve() }) as never,
+      },
+    });
+    const { session } = manager.acquire({ sessionId: 'c1', ...base, engine: 'codex' });
+    const args = (session as unknown as { args: CreateSessionArgs }).args;
+    const runtime = { sessionId: 'c1', costUsd: 0, lastActivityAt: 0, cwd: '/tmp', model: 'm', permissionMode: 'default' as const };
+    args.onMeta?.({ ...runtime, state: 'running', firstPrompt: 'hi' } as never);
+    args.onMeta?.({ ...runtime, state: 'idle' } as never);
+    await Bun.sleep(0);
+    expect(calls).toBe(0);
   });
 });

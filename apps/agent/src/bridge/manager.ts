@@ -96,6 +96,11 @@ export interface ExternalSessions {
   delete(sessionId: string): Promise<void>;
   /** 这个引擎的活跃会话；不是它的返回 undefined */
   createSession(args: CreateSessionArgs): EngineSession | undefined;
+  /**
+   * 订阅引擎推来的标题变化（Codex `thread/name/updated`：自动起名、别处改名）。
+   * manager 构造时订阅一次；不给 = 引擎不推，标题只在列会话时跟上。
+   */
+  onTitle?(listener: (sessionId: string, title: string) => void): void;
 }
 
 export interface SessionManagerOptions {
@@ -157,6 +162,11 @@ export interface SessionManagerOptions {
   headlessProbe?: HeadlessProbe;
   /** 会话报来的订阅限额用量（账号级），app 汇总进 machine.info */
   onRateLimits?: (patch: RateLimitPatch) => void;
+  /**
+   * 一轮跑完后，转录里还没有正式标题时隔多久再查一次（毫秒，见 #refreshTitle）。
+   * 测试注入小值；默认 5 秒。
+   */
+  titleRetryMs?: number;
 }
 
 /** 建会话所需参数 */
@@ -188,6 +198,7 @@ export interface CreateSessionArgs {
 
 const DEFAULT_MAX_CONCURRENT = 10;
 const DEFAULT_IDLE_TIMEOUT_MS = 15 * 60_000;
+const DEFAULT_TITLE_RETRY_MS = 5_000;
 
 /**
  * `acquire()` 的结果。
@@ -235,6 +246,14 @@ export class SessionManager {
   readonly #onRateLimits: ((patch: RateLimitPatch) => void) | undefined;
   /** 已探明是非交互出身的 sessionId（出身不变，只增不减） */
   readonly #headless = new Set<string>();
+  readonly #titleRetryMs: number;
+  /**
+   * 转录里已有正式标题（SDK 的 customTitle：/rename 或 Claude Code 自动生成的 aiTitle）
+   * 的 Claude 会话：轮末不再去查（见 #refreshTitle）
+   */
+  readonly #titled = new Set<string>();
+  /** 轮末标题复查的定时器（每个会话至多一个） */
+  readonly #titleTimers = new Map<string, ReturnType<typeof setTimeout>>();
 
   /** sessionId → 活跃会话。**这张表就是互斥锁** */
   readonly #sessions = new Map<string, EngineSession>();
@@ -266,6 +285,8 @@ export class SessionManager {
     this.#log = options.log;
     this.#headlessProbe = options.headlessProbe;
     this.#onRateLimits = options.onRateLimits;
+    this.#titleRetryMs = options.titleRetryMs ?? DEFAULT_TITLE_RETRY_MS;
+    this.#external?.onTitle?.((sessionId, title) => this.#applyEngineTitle(sessionId, title));
     this.#createSession =
       (() => {
         const claude = options.createSession ?? ((args: CreateSessionArgs) => new ClaudeSession(args));
@@ -687,6 +708,8 @@ export class SessionManager {
       throw new Error(`会话 ${sessionId} 仍有活跃实例，不能 forget`);
     }
     this.#meta.delete(sessionId);
+    this.#titled.delete(sessionId);
+    this.#clearTitleTimer(sessionId);
   }
 
   /** SDK getSessionInfo（不传 dir：全项目目录查找） */
@@ -755,6 +778,7 @@ export class SessionManager {
     const title = titleFromInfo(info);
     const patch: Partial<SessionMeta> = {};
     if (info.customTitle !== undefined) {
+      this.#titled.add(info.sessionId);
       if (cached.title !== info.customTitle) patch.title = info.customTitle;
     } else if (cached.title === '' && title !== '') {
       patch.title = title;
@@ -827,6 +851,7 @@ export class SessionManager {
 
   /** 停掉回收定时器（进程退出前调，避免测试里留悬挂定时器） */
   stopReaper(): void {
+    for (const id of [...this.#titleTimers.keys()]) this.#clearTitleTimer(id);
     if (this.#reapTimer === undefined) return;
     clearTimeout(this.#reapTimer as ReturnType<typeof setTimeout>);
     this.#reapTimer = undefined;
@@ -878,10 +903,80 @@ export class SessionManager {
     this.#emitter.emit({ type: 'session.updated', session: this.decorate(merged) }, null);
     if (previous !== undefined && inRun(previous.state) && !inRun(runtime.state)) {
       this.#onRunEnd?.(sid);
+      this.#refreshTitle(sid, true);
     }
     if (previous !== undefined && previous.permissionMode !== runtime.permissionMode) {
       this.#onPermissionModeChange?.(sid, runtime.permissionMode);
     }
+  }
+
+  /**
+   * 轮末跟上引擎自动起的标题（Claude Code）。
+   *
+   * 首条消息时 #onMeta 先拿首条输入当占位标题；Claude Code 随后自动生成标题
+   * （aiTitle）写进转录，但流里没有对应事件，不查转录就只能等下次列会话才跟上。
+   * SDK 的 customTitle 是「/rename 的标题 ‖ aiTitle」，有它就是正式标题：经
+   * #backfill 写进缓存，变了就广播 session.updated（与其他字段同一条增量通道）。
+   *
+   * 只查到拿到正式标题为止（#titled），之后的轮次不再读转录。标题可能比这一轮
+   * 晚生成，没拿到时隔 titleRetryMs 再查一次。用户设过还没落盘的标题
+   * （pendingTitle）优先，这时不查。Codex 会话的标题由引擎推送（#applyEngineTitle）。
+   */
+  #refreshTitle(sessionId: string, retry: boolean): void {
+    if (!this.#wantsTitle(sessionId)) return;
+    this.#clearTitleTimer(sessionId);
+    void this.#getSessionInfo(sessionId).then(
+      (info) => {
+        if (!this.#wantsTitle(sessionId)) return;
+        if (info?.customTitle !== undefined) {
+          const before = this.#meta.get(sessionId)?.title;
+          this.#backfill(info);
+          const after = this.#meta.get(sessionId);
+          if (after !== undefined && after.title !== before) {
+            this.#emitter.emit({ type: 'session.updated', session: this.decorate(after, { hasCustomTitle: true }) }, null);
+          }
+          return;
+        }
+        if (!retry) return;
+        const handle = setTimeout(() => {
+          this.#titleTimers.delete(sessionId);
+          this.#refreshTitle(sessionId, false);
+        }, this.#titleRetryMs);
+        (handle as { unref?: () => void }).unref?.();
+        this.#titleTimers.set(sessionId, handle);
+      },
+      (err: unknown) => {
+        this.#log?.(`查会话标题失败（${sessionId}）：${err instanceof Error ? err.message : String(err)}`);
+      },
+    );
+  }
+
+  /** 还需要从转录里取正式标题：Claude 会话、在缓存里、没删、没有待落盘的用户标题 */
+  #wantsTitle(sessionId: string): boolean {
+    if (this.#titled.has(sessionId) || !this.#meta.has(sessionId) || this.#isExternal(sessionId)) return false;
+    if (this.#flags?.isDeleted(sessionId) === true) return false;
+    return this.#flags?.pendingTitle(sessionId) === undefined;
+  }
+
+  #clearTitleTimer(sessionId: string): void {
+    const handle = this.#titleTimers.get(sessionId);
+    if (handle === undefined) return;
+    clearTimeout(handle);
+    this.#titleTimers.delete(sessionId);
+  }
+
+  /**
+   * 引擎推来的标题（Codex `thread/name/updated`）：thread 名字就是 Codex 会话的
+   * 正式标题（与 list() 合并目录时同口径），变了就写进缓存并广播。不在缓存里的
+   * 会话（本进程没开过）不插入，等列会话时随目录带出。
+   */
+  #applyEngineTitle(sessionId: string, title: string): void {
+    if (this.#flags?.isDeleted(sessionId) === true) return;
+    const cached = this.#meta.get(sessionId);
+    if (cached === undefined || cached.title === title) return;
+    const next = { ...cached, title };
+    this.#meta.set(sessionId, next);
+    this.#emitter.emit({ type: 'session.updated', session: this.decorate(next) }, null);
   }
 
   /** 记录一个会话的状态（测试/恢复用） */
