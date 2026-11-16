@@ -104,7 +104,8 @@ function TextBody({ opened, mode, wrap }: { opened: OpenedFile; mode: 'rendered'
           '[&_pre]:!m-0 [&_pre]:!rounded-none [&_pre]:!border-0 [&_pre]:px-4 [&_pre]:py-3',
         )}
       >
-        <Markdown text={fenced} streaming={false} fullHeightCode />
+        {/* 看源码：`.mmd` 文件包成 ```mermaid 围栏后不能被渲染成图 */}
+        <Markdown text={fenced} streaming={false} fullHeightCode diagrams={false} />
       </div>
     );
   }

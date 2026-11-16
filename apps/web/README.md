@@ -32,8 +32,10 @@ Design and interaction conventions: [product design system](../../docs/DESIGN.md
 
 Fonts, Markdown rendering dependencies and syntax highlighting are bundled locally.
 Keep external scripts and remote content requests out of the application runtime.
-libsodium and the syntax language bundles are split/lazy loaded; the larger build
-chunks are expected. Recheck the browser's network requests after dependency changes.
+libsodium, the syntax language bundles and mermaid are split/lazy loaded; the larger build
+chunks are expected. Mermaid SVG bypasses the Markdown sanitizer, so
+`components/chat/mermaid-plugin.ts` checks the source before rendering and strips external
+URLs from the output. Recheck the browser's network requests after dependency changes.
 
 Keys and cached messages are sensitive browser data. See [SECURITY.md](../../SECURITY.md)
 for the frontend-host trust boundary and lost-device recovery limits.

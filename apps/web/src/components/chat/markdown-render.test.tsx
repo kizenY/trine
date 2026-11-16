@@ -257,3 +257,26 @@ describe('Markdown 文件预览：标题 slug 与锚点（§6）', () => {
     expect(html).not.toContain('<script');
   });
 });
+
+describe('mermaid 代码块', () => {
+  const SRC = '```mermaid\ngraph TD\n  A --> B\n```';
+  const BLOCK = 'data-streamdown="mermaid-block"';
+
+  test('回复结束后走图表渲染（图表组件是 lazy 的，SSR 里只有 Suspense 占位，不出源码）', () => {
+    const html = renderToStaticMarkup(<Markdown text={SRC} streaming={false} />);
+    expect(html).not.toContain('graph TD');
+    expect(html).not.toContain('data-streamdown="code-block"');
+  });
+
+  test('流式中、扩展输出、看源码时只显示代码', () => {
+    for (const el of [
+      <Markdown key="s" text={SRC} streaming />,
+      <Markdown key="r" text={SRC} streaming={false} restricted />,
+      <Markdown key="d" text={SRC} streaming={false} diagrams={false} />,
+    ]) {
+      const html = renderToStaticMarkup(el);
+      expect(html).not.toContain(BLOCK);
+      expect(html).toContain('graph TD');
+    }
+  });
+});

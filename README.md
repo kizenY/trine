@@ -42,7 +42,10 @@ the agent runs on your own computer.
   directory. Requires agent 0.20.0 or later (trusted directories: 0.24.0).
   Markdown previews get a table of contents (a side rail when there is room, a floating button
   otherwise) that follows your reading position, `#heading` links jump within the document or to
-  another file, and front matter shows as a small metadata block. The reading position is kept
+  another file, and front matter shows as a small metadata block. ```` ```mermaid ```` blocks render
+  as diagrams with fullscreen and zoom, both in previews and in finished chat replies (still
+  streaming: shown as code). Diagrams that reference external images or `url()` styles show their
+  source instead, so a diagram never makes the browser contact another site. The reading position is kept
   when switching between source and rendered view or resizing the window. On desktop, files can
   also open in a workspace next to the chat: "在工作区打开" in the file drawer, "在侧边打开" on tool
   cards, or Alt-click a path. The workspace works like an editor area — tabs in groups, drag a tab

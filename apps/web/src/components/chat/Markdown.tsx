@@ -11,8 +11,9 @@
  *
  * - 核心包不拉网；代码高亮用 `@streamdown/code` 的 shiki **JS 引擎**，
  *   语法与主题都打进 bundle，不走 CDN、不 fetch wasm；
- * - `@streamdown/math` / mermaid **不装**——MVP 用不上，且它们会引入远端
- *   资源与大体积依赖；
+ * - `@streamdown/math` **不装**；mermaid 用自己的懒加载插件（mermaid-plugin.ts）：
+ *   打进 bundle 但单独成 chunk，遇到 ```mermaid 才下载；产出的 SVG 绕过 rehype 管线，
+ *   由插件自己消毒（去掉一切外部 URL）。流式中与扩展输出（restricted）不渲染图，只显示源码；
  * - `linkSafety` 不开（它要外部检查）；
  * - **图片一律不外连**（见下）。
  * 构建后 `dist/` 的外链 grep 是这条约束在构建产物上的守门测。
@@ -52,9 +53,11 @@
  * 与 app/theme.ts 的三态主题自洽（跟随 `prefers-color-scheme` 与 `.dark`）。
  */
 import { memo, useContext, useMemo } from 'react';
-import { defaultRehypePlugins, Streamdown, type StreamdownProps } from 'streamdown';
+import { defaultRehypePlugins, Streamdown, type MermaidErrorComponentProps, type StreamdownProps } from 'streamdown';
 import { code } from '@streamdown/code';
 import { ImageIcon } from 'lucide-react';
+import { useResolvedTheme } from '@/app/theme.ts';
+import { mermaid } from './mermaid-plugin.ts';
 import { decodeHref, detectPath, isLocalHref, resolveRelative, type DetectedPath } from '@/components/files/file-model.ts';
 import {
   FileBaseContext,
@@ -76,6 +79,27 @@ function intentFor(detected: DetectedPath, target: FileOpenTarget, fragment?: st
 
 /** 插件实例提到模块级：每次渲染新建会丢掉 shiki 已加载的语言缓存 */
 const plugins = { code };
+/**
+ * 带 mermaid：只在非流式、非 restricted 时用。流式中图表源码每个 token 都在变，逐次重渲染既费
+ * 又闪（半截源码多半是语法错误），所以先显示成代码块，回复结束后再换成图。
+ */
+const pluginsWithDiagrams = { code, mermaid };
+
+/** 图表渲染失败：退回源码（语法错误时用户至少能看到写了什么） */
+function MermaidError({ chart, error }: MermaidErrorComponentProps): React.JSX.Element {
+  return (
+    <div data-testid="mermaid-error" className="bg-surface-2 my-2 rounded-lg">
+      <div className="text-text-3 px-3 pt-2 text-[11px]" title={error}>
+        mermaid 图表无法渲染，显示源码
+      </div>
+      <pre className="bg-code-bg overflow-x-auto rounded-b-lg p-3 font-mono text-[12.5px] whitespace-pre">{chart}</pre>
+    </div>
+  );
+}
+const mermaidOptions = {
+  light: { config: { theme: 'default' }, errorComponent: MermaidError },
+  dark: { config: { theme: 'dark' }, errorComponent: MermaidError },
+} as const;
 
 /**
  * `<source>` 一律不渲染（N1）。
@@ -376,6 +400,7 @@ export const Markdown = memo(function Markdown({
   restricted = false,
   fileBase,
   fullHeightCode = false,
+  diagrams: diagramsProp = true,
 }: {
   text: string;
   /** 还在流式接收：开 streaming 模式（增量解析 + 未闭合语法修补） */
@@ -387,17 +412,22 @@ export const Markdown = memo(function Markdown({
   fileBase?: string;
   /** 代码块不限高（文件预览整页看源码）；默认 400px 内滚动 */
   fullHeightCode?: boolean;
+  /** ```mermaid 渲染成图（流式中与 restricted 时总是不渲染）；看源码的场景传 false */
+  diagrams?: boolean;
 }): React.JSX.Element {
   const links = useFileLinks();
   const mode = restricted || links === null ? 'plain' : fileBase === undefined ? 'chat' : 'doc';
   // 只有文件预览识别开头的 front matter（聊天消息不动）：剥出来单独显示，正文里换成等量空行
   const frontMatter = useMemo(() => (fileBase !== undefined && !restricted ? splitFrontMatter(text) : undefined), [fileBase, restricted, text]);
   const chosen = restricted ? restrictedComponents : mode === 'chat' ? fileComponents : mode === 'doc' ? fileDocComponents : components;
+  const theme = useResolvedTheme();
+  const diagrams = diagramsProp && !restricted && !streaming;
   const body = (
     <Streamdown
       mode={streaming ? 'streaming' : 'static'}
       parseIncompleteMarkdown={streaming}
-      plugins={plugins}
+      plugins={diagrams ? pluginsWithDiagrams : plugins}
+      {...(diagrams ? { mermaid: mermaidOptions[theme] } : {})}
       // 零远端资源：外域图片一律不请求（streamdown 默认放行 '*'，见文件头 M4）
       urlTransform={restricted ? restrictedUrlTransform : safeUrlTransform}
       // `<source srcset>` 绕过 urlTransform（见文件头 N1）：整个不渲染
@@ -406,7 +436,12 @@ export const Markdown = memo(function Markdown({
       shikiTheme={['github-light', 'github-dark']}
       {...(fullHeightCode ? { codeBlockMaxHeight: 0 } : {})}
       // 代码块只留复制（下载会触发浏览器下载，远程场景意义不大）
-      controls={{ code: { copy: true, download: false }, table: { copy: true, download: false } }}
+      // 图表：全屏 + 缩放平移；不给下载 / 复制（源码在文件里，PNG 导出要走 canvas）
+      controls={{
+        code: { copy: true, download: false },
+        table: { copy: true, download: false },
+        mermaid: { copy: false, download: false, fullscreen: true, panZoom: true },
+      }}
       lineNumbers={false}
       // 动画交给流式本身：逐词淡入在长回复里会拖慢观感
       animated={false}
