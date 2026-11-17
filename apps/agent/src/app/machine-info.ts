@@ -79,7 +79,9 @@ import type {
 //   Codex：换掉 trine 的 app-server、常驻 daemon 在跑时一并重启，换账号后重新读登录）
 // - 0.29.0 起引擎自动起的会话标题随 session.updated 推送（Claude Code 轮末查转录里的 aiTitle，
 //   Codex 接 thread/name/updated），不用重新列会话。协议不变
-export const AGENT_VERSION = '0.29.0';
+// - 0.29.1 起历史读取出错时 session.history.response 带 error 回给请求方（不再发会话级 error.fatal）；
+//   Codex 新会话首轮落盘前拉历史返回空页，不再撞上 rollout 空文件的内部错误
+export const AGENT_VERSION = '0.29.1';
 
 export function buildMachineInfo(input: {
   name: string;

@@ -766,10 +766,20 @@ export class CodexEngine implements CodexSessionClient {
     try {
       return await this.#readPaginatedItems(sessionId);
     } catch (err) {
-      // legacy thread 没有分页接口（-32601）：退回一次读完整个 thread
+      // legacy thread 没有分页接口（-32601）：退回一次读完整个 thread。
+      // 0.169 起首轮落盘前的新 thread 也回 -32601（not supported yet）
       if (!(err instanceof AppServerError) || err.code !== -32601) throw err;
     }
-    const result = await this.#client.call('thread/read', { threadId: sessionId, includeTurns: true });
+    let result: unknown;
+    try {
+      result = await this.#client.call('thread/read', { threadId: sessionId, includeTurns: true });
+    } catch (err) {
+      // 本进程里活跃的新会话：rollout 先建空文件、稍后才写首行，这个窗口里读会回内部错误
+      // （rollout is empty）。还没有可回看的历史，内容随实时事件到达，按空历史处理
+      if (!this.#sessions.has(sessionId)) throw err;
+      this.#log(`[codex] 会话 ${sessionId} 的历史暂不可读，按空历史返回：${err instanceof Error ? err.message : String(err)}`);
+      return [];
+    }
     const thread = isRecord(result) ? result['thread'] : undefined;
     const turns = isRecord(thread) && Array.isArray(thread['turns']) ? thread['turns'] : [];
     return turns.flatMap((turn: unknown) => (isRecord(turn) && Array.isArray(turn['items']) ? turn['items'] : []));

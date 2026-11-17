@@ -86,7 +86,8 @@
 - `session.history.request`（client→agent，会话级）— `{ reqId, before?, limit?(1..500) }`；
   `before` 是上一页响应给的不透明游标，省略即最新一页。agent **不为它拉起会话进程**
   （读的是 `~/.claude/projects` 转录，SDK `getSessionMessages`）
-- `session.history.response`（agent→client，**只发给请求方设备**）— `{ reqId, items[], hasMore, nextBefore? }`；
+- `session.history.response`（agent→client，**只发给请求方设备**）— `{ reqId, items[], hasMore, nextBefore?, error? }`；
+  读取出错（agent ≥ 0.29.1）回空页带 `error{message}`，不发会话级 `error.fatal`，client 按失败处理、可重试；
   items 旧→新，三种：`user{id,text,attachments?,ts}` / `assistant{id=SDK message.id,text,ts}` /
   `tool{id=toolUseId,toolName,argSummary,filePath?,argDetail?,status?,durationMs?,resultSummary?,outputPreview?,ts}`，
   id 与实时流同源以便去重。单条文本截断（~8KB），整帧体积封顶（~512KB，超了少给并 hasMore）——

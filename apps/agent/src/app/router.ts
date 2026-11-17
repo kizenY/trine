@@ -892,14 +892,34 @@ export class Router {
    *
    * 转录读取见 #readTranscript（为了一个 dir 去跑 listSessions 不值）。有待生效的
    * 回退截断点时先截掉被撤的尾巴。会话不存在 → 空页，不报错。
-   * 读取抛错交给命令链兜底（error.fatal，现有惯例）。
+   * 读取抛错：空页带 error，只回给请求方。不交给命令链兜底——那会发会话级 error.fatal，
+   * 所有设备都把正在跑的一轮显示成出错 / 已停止，请求方还得等到超时。
    */
   async #history(
     sessionId: string,
     event: Extract<ClientToAgentEvent, { type: 'session.history.request' }>,
     sender: Recipient,
   ): Promise<void> {
-    const page = paginateHistory(await this.#historyItems(sessionId), { before: event.before, limit: event.limit });
+    let items: HistoryItem[];
+    try {
+      items = await this.#historyItems(sessionId);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      this.#log(`[router] 读取历史失败 session=${sessionId}: ${message}`);
+      this.#deps.emitter.emit(
+        {
+          type: 'session.history.response',
+          reqId: event.reqId,
+          items: [],
+          hasMore: false,
+          error: { message: `读取历史失败：${message}`.slice(0, 300) },
+        },
+        sessionId,
+        { to: sender.deviceId },
+      );
+      return;
+    }
+    const page = paginateHistory(items, { before: event.before, limit: event.limit });
     this.#deps.emitter.emit(
       {
         type: 'session.history.response',

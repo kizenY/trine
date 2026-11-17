@@ -446,6 +446,21 @@ describe('CodexEngine', () => {
     codex.dispose();
   });
 
+  test('历史：活跃的新会话首轮落盘前（-32601 后 thread/read 也失败）按空历史；不活跃的照常抛', async () => {
+    const { codex } = engine({
+      'thread/items/list': () => {
+        throw rpcError(-32601, 'not supported yet');
+      },
+      'thread/read': () => {
+        throw rpcError(-32603, 'failed to read thread: rollout at /x.jsonl is empty');
+      },
+    });
+    await expect(codex.history('t1')).rejects.toThrow('is empty');
+    codex.attach('t1', { onNotification: () => {} } as never);
+    expect(await codex.history('t1')).toEqual([]);
+    codex.dispose();
+  });
+
   test('summary：版本从 userAgent 取；模型目录去掉隐藏的；限额进 summary 且过 schema；有变化才回调', async () => {
     const h = engine({
       'account/read': () => ({ account: { type: 'chatgpt' }, requiresOpenaiAuth: true }),

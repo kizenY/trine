@@ -2127,13 +2127,16 @@ describe('Router · session.history.request', () => {
     expect(p2!.nextBefore).toBe('u1');
   });
 
-  test('读取异常走命令链兜底：会话级 error.fatal，不拉起会话', async () => {
+  test('读取异常：空页带 error 只回给请求方，不发 error.fatal，不拉起会话', async () => {
     const h = await makeHarness({ historyThrows: true });
     await h.router.handle({ type: 'session.history.request', ...c2a('old'), reqId: 'h1' }, phone);
-    const fatals = h.byType('error.fatal');
-    expect(fatals).toHaveLength(1);
-    expect(fatals[0]).toMatchObject({ sessionId: 'old', kind: 'other' });
-    expect((fatals[0] as { message: string }).message).toContain('读转录炸了');
+    expect(h.byType('error.fatal')).toHaveLength(0);
+    const out = h.events.filter((e) => e.event.type === 'session.history.response');
+    expect(out).toHaveLength(1);
+    expect(out[0]!.to).toBe('phone');
+    const res = out[0]!.event as Extract<OutboundEvent['event'], { type: 'session.history.response' }>;
+    expect(res).toMatchObject({ reqId: 'h1', items: [], hasMore: false });
+    expect(res.error?.message).toContain('读转录炸了');
     expect(h.created).toHaveLength(0);
   });
 });

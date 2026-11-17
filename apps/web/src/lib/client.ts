@@ -1570,6 +1570,8 @@ export class TrineClient {
     )
       .then((res) => {
         if (res.type !== 'session.history.response') throw new Error(`意外的应答 ${res.type}`);
+        // agent ≥ 0.29.1 读取出错时回空页带 error：不合并（否则会当成「已读完、没有更早的」），按失败处理可重试
+        if (res.error !== undefined) throw new Error(res.error.message);
         this.#updateTimeline(machineId, sessionId, (tl) => mergeHistory(tl, res));
       })
       .finally(() => {

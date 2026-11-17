@@ -1137,6 +1137,10 @@ export const SessionHistoryRequestSchema = z.object({
  * 整帧体积由 agent 封顶（会进服务端离线补发存储），超了就少给几条并置
  * `hasMore`；`hasMore` 时 `nextBefore` 即翻下一页用的游标。
  * 会话不存在 / 无转录 → 空 items、hasMore false，不报错。
+ *
+ * 读取出错（agent ≥ 0.29.1）：空 items、hasMore false，并带 `error`，只回给请求方；
+ * 不再走会话级 error.fatal（那会把正在跑的一轮误显示成出错 / 已停止）。旧 agent
+ * 出错时不应答，client 只能等超时。
  */
 export const SessionHistoryResponseSchema = z.object({
   type: z.literal('session.history.response'),
@@ -1145,6 +1149,7 @@ export const SessionHistoryResponseSchema = z.object({
   items: z.array(HistoryItemSchema),
   hasMore: z.boolean(),
   nextBefore: z.string().min(1).optional(),
+  error: z.object({ message: z.string().max(300) }).optional(),
 });
 
 /**

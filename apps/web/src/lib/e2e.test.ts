@@ -150,7 +150,10 @@ beforeEach(async () => {
     home,
     machineId: 'mbp',
     log: (l) => agentLogs.push(l),
-    getSessionMessagesFn: (async (sid: string) => transcripts[sid] ?? []) as GetSessionMessages,
+    getSessionMessagesFn: (async (sid: string) => {
+      if (sid === 'broken') throw new Error('读转录炸了');
+      return transcripts[sid] ?? [];
+    }) as GetSessionMessages,
     commandsQueryFn: fakeCommandsQuery,
   });
   await waitFor(() => agent.app.node.online, 'agent 接入');
@@ -834,6 +837,15 @@ describe('web lib · 斜杠命令补拉', () => {
 });
 
 describe('web lib · 本机转录历史', () => {
+  test('历史读取出错：loadHistory 立即带原因失败（不等超时），不记成已读完', async () => {
+    await pair();
+    await waitFor(() => client.machine('mbp')?.info !== null, 'machine.info');
+    client.openSession('mbp', 'broken');
+    await waitFor(() => client.syncing['mbp/broken'] === undefined, 'sync.done');
+    await expect(client.loadHistory('mbp', 'broken')).rejects.toThrow('读转录炸了');
+    expect(client.timeline('mbp', 'broken').history).toBeUndefined();
+  }, 20_000);
+
   test('⑮ 打开本机终端建的会话（服务端无帧）→ sync 结束 → 拉到历史；翻页到底；刷新后仍在且不重拉', async () => {
     await pair();
     await waitFor(() => client.machine('mbp')?.info !== null, 'machine.info');
