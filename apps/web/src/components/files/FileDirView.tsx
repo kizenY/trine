@@ -8,6 +8,7 @@ import { useClient } from '@/app/runtime.ts';
 import type { FsListing } from '@/lib/client.ts';
 import { cn } from '@/lib/utils.ts';
 import { Button } from '@/components/ui/button.tsx';
+import { BookmarkToggle, useFileBookmarks } from './Bookmarks.tsx';
 import { Breadcrumbs, FileList } from './FileBrowser.tsx';
 import type { FileOpenTarget } from './file-links.ts';
 import { parentDir } from './file-model.ts';
@@ -67,6 +68,7 @@ export function FileDirView({
   const roots = useFilesInfo(machineId)?.roots;
   const [showHidden, setShowHidden] = useState(readShowHidden);
   const [trustPath, setTrustPath] = useState<string | null>(null);
+  const bookmarks = useFileBookmarks(machineId);
   const toggleHidden = (): void =>
     setShowHidden((v) => {
       writeShowHidden(!v);
@@ -123,9 +125,17 @@ export function FileDirView({
         }
         {...(here === undefined || here === '/' ? {} : { onBack: () => browse(parentDir(here)), backTitle: '上一级' })}
       >
-        {roots !== undefined && (
-          <LocationMenu machineId={machineId} roots={roots} current={here} sessionDir={sessionDir} onBrowse={browse} onTrustCurrent={setTrustPath} />
-        )}
+        <BookmarkToggle bookmarks={bookmarks} path={here} kind="dir" />
+        <LocationMenu
+          machineId={machineId}
+          roots={roots}
+          current={here}
+          sessionDir={sessionDir}
+          bookmarks={bookmarks}
+          onBrowse={browse}
+          onOpenFile={(p) => onOpenFile(p, 'auto')}
+          onTrustCurrent={setTrustPath}
+        />
         <Button
           size="sm"
           variant="ghost"

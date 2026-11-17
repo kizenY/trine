@@ -48,6 +48,7 @@ import { z } from 'zod';
 import type { DocStore, KvAdapter } from './adapters.ts';
 import type { HistoryState, MachineCwd, Timeline, TimelineEntry, ToolEntry } from './reducer.ts';
 import { dropPending, isSubagentTool, type PendingChildren } from './tool-tree.ts';
+import { BOOKMARKS_MAX, FileBookmarkSchema } from './file-bookmarks.ts';
 import { ContentWidthSchema, SIDEBAR_MAX_WIDTH, SIDEBAR_MIN_WIDTH, WORKSPACE_MAX_STORED_WIDTH, WORKSPACE_MIN_WIDTH } from './layout-prefs.ts';
 import { BgTasksSchema, HistoryStateSchema, isHistoryEntry, isPendingEntry, PendingChildrenSchema, TimelineEntrySchema } from './reducer.ts';
 
@@ -196,6 +197,8 @@ export const PrefsSchema = z.object({
   workspaceWidth: z.number().int().min(WORKSPACE_MIN_WIDTH).max(WORKSPACE_MAX_STORED_WIDTH).nullable().catch(null),
   /** 后台任务条隐藏已结束的任务（全局；条上「隐藏已结束 / 显示」切换） */
   bgHideEnded: z.boolean().catch(false),
+  /** 文件书签，键为 machineId（见 lib/file-bookmarks.ts）；坏的条目整张表丢弃 */
+  fileBookmarks: z.record(z.string(), z.array(FileBookmarkSchema).max(BOOKMARKS_MAX)).catch({}),
 });
 export type Prefs = z.infer<typeof PrefsSchema>;
 
@@ -242,6 +245,7 @@ export function defaultPrefs(): Prefs {
     sessionContentWidth: {},
     workspaceWidth: null,
     bgHideEnded: false,
+    fileBookmarks: {},
   };
 }
 

@@ -2,13 +2,13 @@
  * 信任目录（trusted-browse-dirs，agent ≥ 0.24.0，按 machine.info.files.roots 有无判断）：
  * - `TrustDirDialog`：信任一个目录前的确认（讲清楚影响范围；home 及其上级加强提示）
  * - `OutOfScopeNotice`：浏览到范围外时代替报错的说明卡片，带「信任此目录…」入口
- * - `LocationMenu`：文件面板的「位置」菜单（会话目录 + 信任目录，即预设目录）
+ * - `LocationMenu`：文件面板的「位置」菜单（会话目录 + 书签 + 信任目录）
  *
  * 列表真值在 agent：增删成功后 agent 重发 machine.info，这里不做乐观更新。
  */
 import { useState } from 'react';
 import { Link } from 'react-router';
-import { BookmarkIcon, ChevronDownIcon, FolderIcon, HouseIcon, ShieldAlertIcon, ShieldCheckIcon } from 'lucide-react';
+import { ChevronDownIcon, FileIcon, FolderIcon, HouseIcon, MapPinIcon, ShieldAlertIcon, ShieldCheckIcon, XIcon } from 'lucide-react';
 import type { FilesRoot, MachineFilesInfo } from '@trine/core';
 import { useClient, useTrine } from '@/app/runtime.ts';
 import { FilesTrustError } from '@/lib/client.ts';
@@ -30,6 +30,8 @@ import {
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu.tsx';
 import { cn } from '@/lib/utils.ts';
+import { bookmarkDisplayPath, bookmarkName } from '@/lib/file-bookmarks.ts';
+import type { FileBookmarksApi } from './Bookmarks.tsx';
 import { isUnder, normalizeDirInput, trustRisk } from './file-model.ts';
 
 /** 这台机器的文件查看能力；undefined = 不支持或已关闭 */
@@ -188,71 +190,127 @@ export function OutOfScopeNotice({
 }
 
 /**
- * 「位置」菜单：会话目录 + 信任目录（TRINE_FILES_ALLOW 的标「环境变量」）。当前目录可浏览但
- * 不是任何一项时，可以把它也加进来。
+ * 「位置」菜单：会话目录 + 书签（本设备，目录和文件都可以）+ 信任目录（TRINE_FILES_ALLOW 的标「环境变量」）。
+ * 当前目录可浏览但不是任何一项时，可以信任它（加书签在视图头部的书签按钮）。
+ * `roots` 省略 = agent 不支持信任目录（旧版本），只显示会话目录与书签。
  */
 export function LocationMenu({
   machineId,
   roots,
   current,
   sessionDir,
+  bookmarks,
   onBrowse,
+  onOpenFile,
   onTrustCurrent,
 }: {
   machineId: string;
-  roots: readonly FilesRoot[];
+  roots: readonly FilesRoot[] | undefined;
   /** 当前所在目录（还没加载出来时 undefined） */
   current: string | undefined;
   /** 会话目录（列表 root 为会话 cwd 时才知道） */
   sessionDir: string | undefined;
+  bookmarks: FileBookmarksApi;
   /** undefined = 会话目录 */
   onBrowse: (dir: string | undefined) => void;
+  onOpenFile: (path: string) => void;
   onTrustCurrent: (dir: string) => void;
 }): React.JSX.Element {
+  const home = useFilesInfo(machineId)?.home;
   const active = (p: string): boolean => current !== undefined && isUnder(current, p);
-  const canAddCurrent = current !== undefined && current !== '/' && current !== sessionDir && !roots.some((r) => r.path === current);
+  const canAddCurrent =
+    roots !== undefined && current !== undefined && current !== '/' && current !== sessionDir && !roots.some((r) => r.path === current);
   return (
     <DropdownMenu>
       <DropdownMenuTrigger asChild>
-        <Button size="sm" variant="ghost" data-testid="file-locations" className="text-text-2 h-7 gap-1 px-2 text-[12px]" title="位置：会话目录与信任目录">
-          <BookmarkIcon />
+        <Button
+          size="sm"
+          variant="ghost"
+          data-testid="file-locations"
+          className="text-text-2 h-7 gap-1 px-2 text-[12px]"
+          title={roots === undefined ? '位置：会话目录与书签' : '位置：会话目录、书签与信任目录'}
+        >
+          <MapPinIcon />
           位置
           <ChevronDownIcon className="size-3" />
         </Button>
       </DropdownMenuTrigger>
-      <DropdownMenuContent align="end" className="w-[min(24rem,90vw)]">
+      <DropdownMenuContent align="end" className="max-h-[min(36rem,80dvh)] w-[min(24rem,90vw)] overflow-y-auto">
         <DropdownMenuItem data-testid="file-location" data-path="" onSelect={() => onBrowse(undefined)}>
           <HouseIcon />
           <span className={cn('truncate', sessionDir !== undefined && active(sessionDir) && 'font-medium')}>会话目录</span>
         </DropdownMenuItem>
         <DropdownMenuSeparator />
-        <DropdownMenuLabel className="text-text-3 text-[11.5px] font-normal">信任目录</DropdownMenuLabel>
-        {roots.length === 0 && <div className="text-text-3 px-2 pb-1.5 text-[12px]">还没有。浏览到上级目录时可以信任它。</div>}
-        {roots.map((r) => (
-          <DropdownMenuItem key={r.path} data-testid="file-location" data-path={r.path} onSelect={() => onBrowse(r.path)} title={r.path}>
-            <FolderIcon />
+        <DropdownMenuLabel className="text-text-3 text-[11.5px] font-normal">书签</DropdownMenuLabel>
+        {bookmarks.list.length === 0 && (
+          <div className="text-text-3 px-2 pb-1.5 text-[12px]">还没有。在目录或文件的头部点书签按钮即可加入。</div>
+        )}
+        {bookmarks.list.map((b) => (
+          <DropdownMenuItem
+            key={b.path}
+            data-testid="file-bookmark"
+            data-path={b.path}
+            data-kind={b.kind}
+            onSelect={() => (b.kind === 'dir' ? onBrowse(b.path) : onOpenFile(b.path))}
+            title={b.path}
+          >
+            {b.kind === 'dir' ? <FolderIcon /> : <FileIcon />}
             <span className="flex min-w-0 flex-1 flex-col">
-              <span className={cn('truncate', active(r.path) && 'font-semibold')}>{r.path.slice(r.path.lastIndexOf('/') + 1) || '/'}</span>
-              {/* 长路径保留尾部（rtl 截断从左边省略），LTR 文本包一层避免标点跑位 */}
+              <span className={cn('truncate', b.kind === 'dir' && current === b.path && 'font-semibold')}>{bookmarkName(b.path)}</span>
               <span className="text-text-3 truncate font-mono text-[11px] [direction:rtl]">
-                <bdi>{r.path}</bdi>
+                <bdi>{bookmarkDisplayPath(b.path, home)}</bdi>
               </span>
             </span>
-            {r.source === 'env' && <span className="text-text-3 shrink-0 text-[11px]">环境变量</span>}
+            <button
+              type="button"
+              data-testid="file-bookmark-remove"
+              aria-label={`移出书签：${bookmarkName(b.path)}`}
+              title="移出书签"
+              // 不触发菜单项本身（跳转）；菜单保持打开，可以连着删
+              onPointerDown={(e) => e.stopPropagation()}
+              onClick={(e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                bookmarks.remove(b.path);
+              }}
+              className="text-text-3 hover:text-text hover:bg-surface-3 -my-1 -mr-1 flex size-7 shrink-0 items-center justify-center rounded pointer-coarse:size-9"
+            >
+              <XIcon className="size-3.5" />
+            </button>
           </DropdownMenuItem>
         ))}
-        <DropdownMenuSeparator />
-        {canAddCurrent && (
-          <DropdownMenuItem data-testid="file-trust-current" onSelect={() => onTrustCurrent(current)}>
-            <ShieldCheckIcon />
-            信任当前目录…
-          </DropdownMenuItem>
+        {roots !== undefined && (
+          <>
+            <DropdownMenuSeparator />
+            <DropdownMenuLabel className="text-text-3 text-[11.5px] font-normal">信任目录</DropdownMenuLabel>
+            {roots.length === 0 && <div className="text-text-3 px-2 pb-1.5 text-[12px]">还没有。浏览到上级目录时可以信任它。</div>}
+            {roots.map((r) => (
+              <DropdownMenuItem key={r.path} data-testid="file-location" data-path={r.path} onSelect={() => onBrowse(r.path)} title={r.path}>
+                <FolderIcon />
+                <span className="flex min-w-0 flex-1 flex-col">
+                  <span className={cn('truncate', active(r.path) && 'font-semibold')}>{r.path.slice(r.path.lastIndexOf('/') + 1) || '/'}</span>
+                  {/* 长路径保留尾部（rtl 截断从左边省略），LTR 文本包一层避免标点跑位 */}
+                  <span className="text-text-3 truncate font-mono text-[11px] [direction:rtl]">
+                    <bdi>{r.path}</bdi>
+                  </span>
+                </span>
+                {r.source === 'env' && <span className="text-text-3 shrink-0 text-[11px]">环境变量</span>}
+              </DropdownMenuItem>
+            ))}
+            <DropdownMenuSeparator />
+            {canAddCurrent && (
+              <DropdownMenuItem data-testid="file-trust-current" onSelect={() => onTrustCurrent(current)}>
+                <ShieldCheckIcon />
+                信任当前目录…
+              </DropdownMenuItem>
+            )}
+            <DropdownMenuItem asChild>
+              <Link to={`/machines/${machineId}#files`} data-testid="file-locations-manage">
+                管理信任目录…
+              </Link>
+            </DropdownMenuItem>
+          </>
         )}
-        <DropdownMenuItem asChild>
-          <Link to={`/machines/${machineId}#files`} data-testid="file-locations-manage">
-            管理信任目录…
-          </Link>
-        </DropdownMenuItem>
       </DropdownMenuContent>
     </DropdownMenu>
   );

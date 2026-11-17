@@ -200,12 +200,11 @@ describe('文件面板 · 往上浏览', () => {
     expect(nav).toEqual(['/home/u/notes']);
   });
 
-  test('旧 agent（没有 roots）：范围外照样说明，但没有信任入口和位置菜单', async () => {
+  test('旧 agent（没有 roots）：范围外照样说明，但没有信任入口（位置菜单只剩会话目录与书签）', async () => {
     setup({ roots: undefined });
     await mountPanel('/home/u/w');
     expect($('file-out-of-scope')?.textContent).toContain('TRINE_FILES_ALLOW');
     expect($('file-trust-open')).toBeNull();
-    expect($('file-locations')).toBeNull();
   });
 });
 

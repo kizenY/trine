@@ -14,6 +14,7 @@ import type { OpenedFile } from '@/lib/client.ts';
 import { formatBytes, formatDateTime } from '@/lib/format.ts';
 import { cn } from '@/lib/utils.ts';
 import { Button } from '@/components/ui/button.tsx';
+import { BookmarkToggle, useFileBookmarks } from './Bookmarks.tsx';
 import { Breadcrumbs } from './FileBrowser.tsx';
 import { FileDocAnchorContext, useFileLinks, type FileDocAnchors, type FileOpenTarget } from './file-links.ts';
 import { absoluteFilePath, HIGHLIGHT_MAX_BYTES, parentDir } from './file-model.ts';
@@ -89,6 +90,7 @@ export function FileDocView({
   const sessionCwd = useTrine((s) => s.sessions[machineId]?.[sessionId]?.cwd);
   const home = useFilesInfo(machineId)?.home;
   const absPath = absoluteFilePath(path, sessionCwd, home);
+  const bookmarks = useFileBookmarks(machineId);
   // 锚点：intent 带来的先挂起，等渲染好的预览出现再定位；找不到给一条提示。
   // 视图记着「当前定位目标」（intent 带来的或用户点过的同文件锚点）：刷新后对**新内容**复核一次——
   // 还在就重新定位（刷新会重建正文、滚动归零），没了就提示失效。复核只在刷新后跑一次，
@@ -248,6 +250,8 @@ export function FileDocView({
             <WrapTextIcon />
           </Button>
         )}
+        {/* 用 agent 解析后的绝对路径（打开时可能是相对路径或 `~`），加载出来才显示 */}
+        <BookmarkToggle bookmarks={bookmarks} path={file?.path} kind="file" />
         <Button size="icon-sm" variant="ghost" title="刷新" aria-label="刷新" onClick={doRefresh} disabled={load.state === 'loading'} data-testid="file-refresh">
           <RefreshCwIcon className={cn(load.state === 'loading' && 'motion-safe:animate-spin')} />
         </Button>

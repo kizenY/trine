@@ -38,8 +38,10 @@ the agent runs on your own computer.
   downloaded. Read-only; limited to the session directory plus the machine's trusted
   directories, and key material such as `.env` and private keys is always refused. The browser
   can go up past the session directory: a directory outside the scope shows what trusting it
-  means and offers to trust it, and a "位置" menu jumps to the session directory or any trusted
-  directory. Requires agent 0.20.0 or later (trusted directories: 0.24.0).
+  means and offers to trust it, and a "位置" menu jumps to the session directory, a bookmark or any
+  trusted directory. The bookmark button in a directory's or file's header adds it to the
+  bookmarks (per machine, shared by that machine's sessions, stored on this device only; it does
+  not widen what can be browsed). Requires agent 0.20.0 or later (trusted directories: 0.24.0).
   Markdown previews get a table of contents (a side rail when there is room, a floating button
   otherwise) that follows your reading position, `#heading` links jump within the document or to
   another file, and front matter shows as a small metadata block. ```` ```mermaid ```` blocks render
