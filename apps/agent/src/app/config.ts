@@ -61,6 +61,7 @@ export function agentPaths(home: string): {
   state: string;
   cwd: string;
   filesTrust: string;
+  fileBookmarks: string;
   sessions: string;
   uploads: string;
   extensions: string;
@@ -75,6 +76,8 @@ export function agentPaths(home: string): {
     cwd: join(home, 'cwd.json'),
     /** 信任目录（文件浏览，见 files/trust-store.ts） */
     filesTrust: join(home, 'files.json'),
+    /** 文件书签（见 files/bookmark-store.ts） */
+    fileBookmarks: join(home, 'bookmarks.json'),
     sessions: join(home, 'sessions.json'),
     /** 用户消息附件（见 bridge/attachments.ts） */
     uploads: join(home, 'uploads'),

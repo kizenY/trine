@@ -60,7 +60,9 @@ is not a substitute for those controls, backups or TLS.
   `TRINE_FILES_ALLOW`, and (agent 0.24.0+) those in `<home>/files.json`, which any paired
   device can add or remove. This does not give a paired device more than it already has (it can
   start a session in any directory), but a trusted directory stays readable for every session
-  and device until removed. `/` cannot be trusted.
+  and device until removed. `/` cannot be trusted. File bookmarks (agent 0.30.0+) are kept in
+  `<home>/bookmarks.json` and sent to paired devices inside the encrypted `machine.info`; they
+  are only shortcuts and never widen the browsable scope.
   File contents travel like attachments (encrypted relay blobs). The agent always
   refuses key material (`.env*` except templates, private keys and certificates,
   `.ssh`, `.gnupg`, `.aws`, `.git` internals, `.netrc`/`.npmrc`, the agent's own home, and

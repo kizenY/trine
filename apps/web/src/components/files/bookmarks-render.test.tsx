@@ -4,7 +4,7 @@
  */
 import { afterEach, describe, expect, test } from 'bun:test';
 import type { Root } from 'react-dom/client';
-import type { FilesRoot, FsFile } from '@trine/core';
+import type { FileBookmark, FilesRoot, FsFile } from '@trine/core';
 import type { Prefs } from '@/lib/storage.ts';
 import '@/lib/dom-test-env.ts';
 
@@ -33,8 +33,44 @@ afterEach(() => {
   });
 });
 
-function setup(options: { roots?: FilesRoot[] | undefined; bookmarks?: Prefs['fileBookmarks'] } = {}): { prefs: () => Prefs } {
+interface SetupResult {
+  prefs: () => Prefs;
+  /** agent 端的书签（server 模式下 setFileBookmark 改它并「重发 machine.info」） */
+  server: () => FileBookmark[] | undefined;
+  calls: Array<{ path: string; kind: FileBookmark['kind'] | null }>;
+}
+
+function setup(
+  options: {
+    roots?: FilesRoot[] | undefined;
+    bookmarks?: Prefs['fileBookmarks'];
+    /** 给了 = 新 agent（machine.info.files.bookmarks），书签存在 agent */
+    server?: FileBookmark[];
+    /** setFileBookmark 的应答闸门：给了就等它 resolve 再应答 */
+    gate?: Promise<void>;
+    fail?: boolean;
+  } = {},
+): SetupResult {
   let prefs: Prefs = { ...defaultPrefs(), fileBookmarks: options.bookmarks ?? {} };
+  let server = options.server;
+  const calls: SetupResult['calls'] = [];
+  const filesInfo = (): Record<string, unknown> => ({
+    maxBytes: 1024,
+    ...('roots' in options && options.roots === undefined ? {} : { roots: options.roots ?? [], home: HOME }),
+    ...(server === undefined ? {} : { bookmarks: server }),
+  });
+  const machine = (): Record<string, unknown> => ({
+    machineId: MACHINE,
+    name: 'MBP',
+    online: true,
+    lastSeenAt: 1,
+    parkedCount: 0,
+    info: { name: 'MBP', files: filesInfo() },
+    cwd: null,
+    lastError: null,
+    stats: null,
+    statsHistory: [],
+  });
   const file = (path: string): FsFile => ({
     path,
     root: CWD,
@@ -67,29 +103,22 @@ function setup(options: { roots?: FilesRoot[] | undefined; bookmarks?: Prefs['fi
       blob: new Blob(['hello']),
       url: 'blob:x',
     }),
+    // 模拟 agent：先改列表、重发 machine.info，再回应答
+    setFileBookmark: async (_m: string, path: string, kind: FileBookmark['kind'] | null) => {
+      calls.push({ path, kind });
+      if (options.gate !== undefined) await options.gate;
+      if (options.fail === true) throw new Error('离线');
+      const rest = (server ?? []).filter((b) => b.path !== path);
+      server = kind === null ? rest : [{ path, kind, addedAt: 1 }, ...rest];
+      store.setState({ machines: { [MACHINE]: machine() } as never });
+      return path;
+    },
   };
   act(() => {
     runtimeState.setState({ client: client as never });
-    store.setState({
-      prefs,
-      machines: {
-        [MACHINE]: {
-          machineId: MACHINE,
-          name: 'MBP',
-          online: true,
-          lastSeenAt: 1,
-          parkedCount: 0,
-          info: { name: 'MBP', files: { maxBytes: 1024, ...('roots' in options && options.roots === undefined ? {} : { roots: options.roots ?? [], home: HOME }) } },
-          cwd: null,
-          lastError: null,
-          stats: null,
-          statsHistory: [],
-        },
-      } as never,
-      sessions: {},
-    });
+    store.setState({ prefs, machines: { [MACHINE]: machine() } as never, sessions: {} });
   });
-  return { prefs: () => prefs };
+  return { prefs: () => prefs, server: () => server, calls };
 }
 
 const tick = (): Promise<void> => act(() => new Promise<void>((r) => setTimeout(r, 0)));
@@ -197,5 +226,70 @@ describe('文件书签', () => {
     expect($$('file-bookmark').length).toBe(1);
     expect($('file-locations-manage')).toBeNull();
     expect($('file-trust-current')).toBeNull();
+  });
+});
+
+describe('文件书签 · 存在 agent（machine.info.files.bookmarks）', () => {
+  test('加入 / 移出走 agent，不写 prefs；列表以 machine.info 为准', async () => {
+    const h = setup({ server: [{ path: '/home/u/notes', kind: 'dir', addedAt: 1 }] });
+    await mountPanel({ kind: 'dir', path: undefined });
+    const toggle = (): HTMLElement => $('file-bookmark-toggle')!;
+    act(() => toggle().click());
+    await tick();
+    expect(h.calls).toEqual([{ path: CWD, kind: 'dir' }]);
+    expect(h.server()?.map((b) => b.path)).toEqual([CWD, '/home/u/notes']);
+    expect(h.prefs().fileBookmarks).toEqual({});
+    expect(toggle().getAttribute('aria-pressed')).toBe('true');
+
+    await openLocations();
+    expect($$('file-bookmark').map((i) => i.dataset['path'])).toEqual([CWD, '/home/u/notes']);
+    act(() => ($$('file-bookmark')[1]!.querySelector('[data-testid="file-bookmark-remove"]') as HTMLElement).click());
+    await tick();
+    expect(h.calls.at(-1)).toEqual({ path: '/home/u/notes', kind: null });
+    expect($$('file-bookmark').map((i) => i.dataset['path'])).toEqual([CWD]);
+  });
+
+  test('应答前先按预期显示；失败后恢复原样', async () => {
+    let open!: () => void;
+    const gate = new Promise<void>((r) => (open = r));
+    setup({ server: [], gate, fail: true });
+    await mountPanel({ kind: 'dir', path: undefined });
+    const toggle = (): HTMLElement => $('file-bookmark-toggle')!;
+    act(() => toggle().click());
+    expect(toggle().getAttribute('aria-pressed')).toBe('true');
+    open();
+    await tick();
+    await tick();
+    expect(toggle().getAttribute('aria-pressed')).toBe('false');
+  });
+
+  test('本设备的旧书签自动传给 agent（保持顺序、已有的跳过），成功后从 prefs 删掉', async () => {
+    const h = setup({
+      server: [{ path: '/home/u/b', kind: 'dir', addedAt: 1 }],
+      bookmarks: {
+        [MACHINE]: [
+          { path: '/home/u/a', kind: 'dir' },
+          { path: '/home/u/b', kind: 'dir' },
+          { path: '/home/u/c.md', kind: 'file' },
+        ],
+        other: [{ path: '/elsewhere', kind: 'dir' }],
+      },
+    });
+    await mountPanel({ kind: 'dir', path: undefined });
+    await tick();
+    expect(h.calls).toEqual([
+      { path: '/home/u/c.md', kind: 'file' },
+      { path: '/home/u/a', kind: 'dir' },
+    ]);
+    expect(h.server()?.map((b) => b.path)).toEqual(['/home/u/a', '/home/u/c.md', '/home/u/b']);
+    expect(h.prefs().fileBookmarks).toEqual({ other: [{ path: '/elsewhere', kind: 'dir' }] });
+  });
+
+  test('迁移失败（离线）：本地书签留着，下次再试', async () => {
+    const h = setup({ server: [], fail: true, bookmarks: { [MACHINE]: [{ path: '/home/u/a', kind: 'dir' }] } });
+    await mountPanel({ kind: 'dir', path: undefined });
+    await tick();
+    expect(h.calls).toHaveLength(1);
+    expect(h.prefs().fileBookmarks[MACHINE]).toEqual([{ path: '/home/u/a', kind: 'dir' }]);
   });
 });

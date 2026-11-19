@@ -12,7 +12,7 @@ import {
   TransportFrameSchema,
   type E2eEvent,
 } from './index.ts';
-import { EngineSummarySchema, SessionMetaSchema } from '../types/index.ts';
+import { EngineSummarySchema, MachineFilesInfoSchema, SessionMetaSchema } from '../types/index.ts';
 
 const ts = Date.now();
 
@@ -255,6 +255,18 @@ describe('E2E 事件帧', () => {
     const denied = { type: 'fs.list.response', ...a2c, reqId: 'l', ok: false, error: { code: 'denied', message: 'x', reason: 'out_of_scope' } };
     const parsed = AgentToClientEventSchema.parse(denied);
     expect(parsed.type === 'fs.list.response' && parsed.error?.reason).toBe('out_of_scope');
+  });
+
+  test('files.bookmark.* 与 machine.info.files.bookmarks（file-bookmarks）', () => {
+    const add = { type: 'files.bookmark.add', ...c2a, reqId: 'r', path: '/w/a.md', kind: 'file' };
+    expect(ClientToAgentEventSchema.parse(add).type).toBe('files.bookmark.add');
+    expect(ClientToAgentEventSchema.safeParse({ ...add, kind: 'link' }).success).toBe(false);
+    expect(ClientToAgentEventSchema.safeParse({ type: 'files.bookmark.remove', ...c2a, reqId: 'r', path: '' }).success).toBe(false);
+    const res = { type: 'files.bookmark.response', ...a2c, reqId: 'r', ok: false, error: { code: 'invalid', message: 'x' } };
+    expect(AgentToClientEventSchema.parse(res).type).toBe('files.bookmark.response');
+    expect(MachineFilesInfoSchema.parse({ maxBytes: 1, bookmarks: [{ path: '/w', kind: 'dir', addedAt: 1 }] }).bookmarks).toHaveLength(1);
+    expect(MachineFilesInfoSchema.safeParse({ maxBytes: 1, bookmarks: [{ path: 'w', kind: 'dir' }] }).success).toBe(false);
+    expect(MachineFilesInfoSchema.parse({ maxBytes: 1 }).bookmarks).toBeUndefined();
   });
 
   test('fs.list / fs.read 请求与应答', () => {

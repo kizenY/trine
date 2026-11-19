@@ -32,6 +32,7 @@ import type {
   CwdPrepareErrorCode,
   CwdPrepareStatus,
   FsEntry,
+  FilesBookmarkErrorCode,
   FilesTrustErrorCode,
   FsDeniedReason,
   FsErrorCode,
@@ -1981,6 +1982,20 @@ export class TrineClient {
   }
 
   /**
+   * 增删文件书签（agent ≥ 0.30.0，machine.info.files.bookmarks 存在才支持）。成功后 agent 重发
+   * machine.info（列表以那里为准，所有设备同步）；返回 agent 规范化后的路径。被拒抛 `FilesBookmarkError`。
+   */
+  async setFileBookmark(machineId: string, path: string, kind: 'dir' | 'file' | null): Promise<string> {
+    const res =
+      kind === null
+        ? await this.request<Extract<OutboundBody, { type: 'files.bookmark.remove' }>>(machineId, { type: 'files.bookmark.remove', path })
+        : await this.request<Extract<OutboundBody, { type: 'files.bookmark.add' }>>(machineId, { type: 'files.bookmark.add', path, kind });
+    if (res.type !== 'files.bookmark.response') throw new Error(`意外的应答 ${res.type}`);
+    if (!res.ok) throw new FilesBookmarkError(res.error?.code ?? 'failed', res.error?.message ?? '操作失败');
+    return res.path ?? path;
+  }
+
+  /**
    * 重启 agent（machine.info.restart 存在才支持，调用方先做能力探测）：`schedule` 等会话空闲后重启，
    * `now` 立即重启，`cancel` 取消。应答在预检结束后到达；排空进度随 machine.info.restart 广播。
    * 业务失败不抛，发不出去 / 超时才抛。
@@ -2427,6 +2442,16 @@ export class CwdPrepareError extends Error {
   constructor(code: CwdPrepareErrorCode, message: string) {
     super(message);
     this.name = 'CwdPrepareError';
+    this.code = code;
+  }
+}
+
+/** agent 拒绝了书签的增删（code 见协议 FilesBookmarkErrorCode） */
+export class FilesBookmarkError extends Error {
+  readonly code: FilesBookmarkErrorCode;
+  constructor(code: FilesBookmarkErrorCode, message: string) {
+    super(message);
+    this.name = 'FilesBookmarkError';
     this.code = code;
   }
 }

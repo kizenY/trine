@@ -113,6 +113,7 @@ import { CODEX_DEFAULT_MODEL, CODEX_ENGINE_ID } from '../engine/codex/ids.ts';
 import { AttachmentError, type AttachmentStore, type PreparedInput } from '../bridge/attachments.ts';
 import { FileAccessError } from '../files/access.ts';
 import { TrustError, type FileService } from '../files/service.ts';
+import { BookmarkError } from '../files/bookmark-store.ts';
 import type { EventEmitter } from '../bridge/emitter.ts';
 import {
   cutAtRewind,
@@ -204,6 +205,8 @@ const MACHINE_LEVEL_TYPES = new Set<ClientToAgentEvent['type']>([
   'cwd.prepare.request',
   'files.trust.add',
   'files.trust.remove',
+  'files.bookmark.add',
+  'files.bookmark.remove',
   'ext.catalog.request',
   'ext.read',
   'ext.action.prepare',
@@ -1114,6 +1117,30 @@ export class Router {
     this.#deps.emitter.emit(body, null, { to: sender.deviceId });
   }
 
+  /** 文件书签增删（机器级链上串行：都写 bookmarks.json）。成功后重发 machine.info，应答只给请求方 */
+  async #filesBookmark(
+    event: Extract<ClientToAgentEvent, { type: 'files.bookmark.add' | 'files.bookmark.remove' }>,
+    sender: Recipient,
+  ): Promise<void> {
+    const files = this.#deps.files;
+    let body: EventBody;
+    if (files?.bookmarks() === undefined) {
+      body = { type: 'files.bookmark.response', reqId: event.reqId, ok: false, error: { code: 'failed', message: '这台 agent 关闭了文件查看' } };
+    } else {
+      try {
+        const path = event.type === 'files.bookmark.add' ? await files.addBookmark(event.path, event.kind) : await files.removeBookmark(event.path);
+        this.#log(`[files] ${event.type === 'files.bookmark.add' ? '加入书签' : '移出书签'} ${path}（设备 ${sender.deviceId}）`);
+        body = { type: 'files.bookmark.response', reqId: event.reqId, ok: true, path };
+        this.#emitMachine({ type: 'machine.info', info: this.#deps.machineInfo() });
+      } catch (err) {
+        const code = err instanceof BookmarkError ? err.code : 'failed';
+        const message = (err instanceof Error ? err.message : String(err)).slice(0, 300);
+        body = { type: 'files.bookmark.response', reqId: event.reqId, ok: false, error: { code, message } };
+      }
+    }
+    this.#deps.emitter.emit(body, null, { to: sender.deviceId });
+  }
+
   /**
    * 读会话主链：cwd 只从零成本来源取（state.json / manager meta），拿不到就不传 dir、
    * 让 SDK 搜全部项目；给了 dir 却没读到（会话切过 cwd）再不带 dir 兜一次。
@@ -1630,6 +1657,10 @@ export class Router {
       case 'files.trust.add':
       case 'files.trust.remove':
         await this.#filesTrust(event, sender);
+        return;
+      case 'files.bookmark.add':
+      case 'files.bookmark.remove':
+        await this.#filesBookmark(event, sender);
         return;
       case 'machine.rename':
         await this.#deps.renameMachine(event.name);

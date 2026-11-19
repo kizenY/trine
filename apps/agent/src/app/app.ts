@@ -35,6 +35,7 @@ import { FileAccess } from '../files/access.ts';
 import { CwdPreparer } from './cwd-prepare.ts';
 import { FileService } from '../files/service.ts';
 import { TrustStore } from '../files/trust-store.ts';
+import { BookmarkStore } from '../files/bookmark-store.ts';
 import { EventEmitter } from '../bridge/emitter.ts';
 import { SessionManager, type CreateSessionArgs } from '../bridge/manager.ts';
 import type { EngineSession } from '../engine/types.ts';
@@ -265,6 +266,8 @@ export class AgentApp {
             maxBytes: FS_READ_DEFAULT_MAX_BYTES,
             blobs: () => blobClient,
             trust,
+            // 书签只是快捷入口，不参与范围判断
+            bookmarks: await BookmarkStore.load(paths.fileBookmarks, { log }),
             now,
           });
 
@@ -760,7 +763,12 @@ export class AgentApp {
 
   #filesInfo(files: FileService): NonNullable<MachineInfo['files']> {
     const roots = files.roots();
-    return { maxBytes: files.maxBytes, ...(roots === undefined ? {} : { roots, home: files.osHome }) };
+    const bookmarks = files.bookmarks();
+    return {
+      maxBytes: files.maxBytes,
+      ...(roots === undefined ? {} : { roots, home: files.osHome }),
+      ...(bookmarks === undefined ? {} : { bookmarks }),
+    };
   }
 
   #restartInfo(): NonNullable<MachineInfo['restart']> {

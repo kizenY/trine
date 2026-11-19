@@ -730,6 +730,44 @@ export const FilesTrustResponseSchema = z.object({
   error: z.object({ code: FilesTrustErrorCodeSchema, message: z.string().max(500) }).optional(),
 });
 
+/**
+ * 文件书签（file-bookmarks，agent ≥ 0.30.0，client 按 machine.info.files.bookmarks 有无判断）：
+ * 机器级、agent 端持久化（`~/.trine/bookmarks.json`），所有已配对设备共享。增删成功后 agent
+ * 重发 `machine.info`。书签只是快捷入口，不扩大可浏览范围，agent 不检查路径是否存在。
+ *
+ * - add：`path` 须为绝对路径（不含 NUL），agent 规范化（去掉 `.`/`..`、末尾 `/`）后存下；
+ *   已存在则移到最前（kind 以这次为准）；超出 FILES_BOOKMARKS_MAX 丢最旧的
+ * - remove：按存下的路径匹配；不在列表里也算成功（多设备同时删不报错）
+ */
+export const FilesBookmarkAddSchema = z.object({
+  type: z.literal('files.bookmark.add'),
+  ...c2aBase,
+  reqId: ReqIdSchema,
+  path: z.string().min(1).max(FS_PATH_MAX),
+  kind: z.enum(['dir', 'file']),
+});
+
+export const FilesBookmarkRemoveSchema = z.object({
+  type: z.literal('files.bookmark.remove'),
+  ...c2aBase,
+  reqId: ReqIdSchema,
+  path: z.string().min(1).max(FS_PATH_MAX),
+});
+
+/** `invalid` 路径不是绝对路径或含 NUL；`failed` 其他（关闭了文件查看、写文件失败） */
+export const FilesBookmarkErrorCodeSchema = z.enum(['invalid', 'failed']);
+export type FilesBookmarkErrorCode = z.infer<typeof FilesBookmarkErrorCodeSchema>;
+
+export const FilesBookmarkResponseSchema = z.object({
+  type: z.literal('files.bookmark.response'),
+  ...a2cBase,
+  reqId: ReqIdSchema,
+  ok: z.boolean(),
+  /** 成功时：实际存下 / 删掉的路径（规范化过） */
+  path: z.string().max(FS_PATH_MAX).optional(),
+  error: z.object({ code: FilesBookmarkErrorCodeSchema, message: z.string().max(500) }).optional(),
+});
+
 // ---------------------------------------------------------------------------
 // §1.8 回退（rewind，agent ≥ 0.9.0）
 // ---------------------------------------------------------------------------
@@ -1963,6 +2001,7 @@ export const AgentToClientEventSchema = z.discriminatedUnion('type', [
   FsListResponseSchema,
   FsReadResponseSchema,
   FilesTrustResponseSchema,
+  FilesBookmarkResponseSchema,
   SessionCapabilitiesSchema,
   MachineInfoEventSchema,
   MachineClaudeUpdateResponseSchema,
@@ -2021,6 +2060,8 @@ export const ClientToAgentEventSchema = z.discriminatedUnion('type', [
   FsReadRequestSchema,
   FilesTrustAddSchema,
   FilesTrustRemoveSchema,
+  FilesBookmarkAddSchema,
+  FilesBookmarkRemoveSchema,
   MachineRenameSchema,
   MachineUnpairSchema,
   MachineClaudeUpdateRequestSchema,

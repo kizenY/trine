@@ -39,7 +39,7 @@ import { DEFAULT_LIST_QUERY, filterSessions } from '../components/list/filtering
 // 会话 cwd 在系统临时目录下（测试约定），默认会被当成临时会话隐藏
 const LIST_QUERY = { ...DEFAULT_LIST_QUERY, showTemp: true };
 import { supportsSessionMutations } from '../components/list/session-actions.ts';
-import { CwdPinMoveError, CwdPrepareError, FilesTrustError, FsRequestError, RequestTimeoutError, SessionMutateError, TrineClient } from './client.ts';
+import { CwdPinMoveError, CwdPrepareError, FilesBookmarkError, FilesTrustError, FsRequestError, RequestTimeoutError, SessionMutateError, TrineClient } from './client.ts';
 import { LeaderElector } from './leader.ts';
 import { shouldAutoLoadHistory, type PermissionEntry, type TimelineEntry, type UserEntry } from './reducer.ts';
 import { KV_PEER, loadMachineDoc, type PeerState } from './storage.ts';
@@ -1095,6 +1095,28 @@ describe('web lib · 信任目录 e2e', () => {
     } finally {
       await rm(parent, { recursive: true, force: true });
     }
+  }, 20_000);
+});
+
+describe('web lib · 文件书签 e2e', () => {
+  test('加入（路径规范化）→ machine.info 带上 bookmarks → 移出；相对路径被拒', async () => {
+    await pair();
+    await waitFor(() => client.machine('mbp')?.info?.files?.bookmarks !== undefined, 'machine.info.files.bookmarks');
+    expect(client.machine('mbp')?.info?.files?.bookmarks).toEqual([]);
+
+    expect(await client.setFileBookmark('mbp', '/synthetic/w/./docs/', 'dir')).toBe('/synthetic/w/docs');
+    await client.setFileBookmark('mbp', '/synthetic/w/a.md', 'file');
+    await waitFor(() => client.machine('mbp')?.info?.files?.bookmarks?.length === 2, 'bookmarks 更新');
+    expect(client.machine('mbp')?.info?.files?.bookmarks?.map((b) => [b.path, b.kind])).toEqual([
+      ['/synthetic/w/a.md', 'file'],
+      ['/synthetic/w/docs', 'dir'],
+    ]);
+
+    const err = await client.setFileBookmark('mbp', 'w/rel', 'dir').then(() => undefined, (e: unknown) => e);
+    expect(err instanceof FilesBookmarkError ? err.code : String(err)).toBe('invalid');
+
+    await client.setFileBookmark('mbp', '/synthetic/w/docs', null);
+    await waitFor(() => client.machine('mbp')?.info?.files?.bookmarks?.length === 1, 'bookmarks 移出');
   }, 20_000);
 });
 

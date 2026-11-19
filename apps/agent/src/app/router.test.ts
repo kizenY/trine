@@ -21,6 +21,7 @@ import { AttachmentStore, type PreparedInput } from '../bridge/attachments.ts';
 import { FileAccess } from '../files/access.ts';
 import { FileService } from '../files/service.ts';
 import { TrustStore } from '../files/trust-store.ts';
+import { BookmarkStore } from '../files/bookmark-store.ts';
 import { EventEmitter } from '../bridge/emitter.ts';
 import { SessionManager, type CreateSessionArgs } from '../bridge/manager.ts';
 import type { PendingPermissionSnapshot, PermissionVerdict } from '../bridge/permission.ts';
@@ -2670,16 +2671,50 @@ describe('Router · 文件查看', () => {
     mkdirSync(join(repo, 'docs'), { recursive: true });
     writeFileSync(join(repo, 'docs', 'a.md'), '# a');
     const trust = TrustStore.memory();
+    const bookmarks = BookmarkStore.memory();
     const files = new FileService({
       access: new FileAccess({ allow: [], trusted: () => trust.list().map((d) => d.path), osHome: dir, trineHome: join(dir, 'trine-home') }),
       maxBytes: 1024,
       blobs: () => blobs,
       trust,
+      bookmarks,
     });
     const h = await makeHarness(withFiles ? { files } : {});
     h.state.rememberSession('s1', { ...params, cwd: repo });
-    return { ...h, repo, blobs, trust };
+    return { ...h, repo, blobs, trust, bookmarks };
   }
+
+  test('files.bookmark.add / remove：存在 agent，应答只回请求方并重发 machine.info；非绝对路径拒绝', async () => {
+    const h = await setup();
+    await h.router.handle({ type: 'files.bookmark.add', ...c2a(), reqId: 'b1', path: `${h.repo}/docs/`, kind: 'dir' }, phone);
+    await h.router.handle({ type: 'files.bookmark.add', ...c2a(), reqId: 'b2', path: `${h.repo}/docs/a.md`, kind: 'file' }, phone);
+    await h.router.handle({ type: 'files.bookmark.add', ...c2a(), reqId: 'b3', path: 'docs', kind: 'dir' }, phone);
+    await h.router.idle();
+    const r = (reqId: string) => h.events.find((e) => e.event.type === 'files.bookmark.response' && 'reqId' in e.event && e.event.reqId === reqId);
+    expect(r('b1')?.to).toBe('phone');
+    expect(r('b1')?.event).toMatchObject({ ok: true, path: `${h.repo}/docs` });
+    expect(r('b3')?.event).toMatchObject({ ok: false, error: { code: 'invalid' } });
+    expect(h.bookmarks.list().map((b) => [b.path, b.kind])).toEqual([
+      [`${h.repo}/docs/a.md`, 'file'],
+      [`${h.repo}/docs`, 'dir'],
+    ]);
+    expect(h.byType('machine.info')).toHaveLength(2);
+
+    await h.router.handle({ type: 'files.bookmark.remove', ...c2a(), reqId: 'b4', path: `${h.repo}/docs` }, phone);
+    await h.router.handle({ type: 'files.bookmark.remove', ...c2a(), reqId: 'b5', path: '/nope' }, phone);
+    await h.router.idle();
+    expect(r('b4')?.event).toMatchObject({ ok: true });
+    expect(r('b5')?.event).toMatchObject({ ok: true });
+    expect(h.bookmarks.list().map((b) => b.path)).toEqual([`${h.repo}/docs/a.md`]);
+  });
+
+  test('关闭文件查看：files.bookmark.* 回 failed', async () => {
+    const h = await setup(false);
+    await h.router.handle({ type: 'files.bookmark.add', ...c2a(), reqId: 'b1', path: '/w', kind: 'dir' }, phone);
+    await h.router.idle();
+    expect(h.byType('files.bookmark.response')[0]).toMatchObject({ ok: false, error: { code: 'failed' } });
+    expect(h.byType('machine.info')).toHaveLength(0);
+  });
 
   test('往上走到范围外：denied 带 reason；files.trust.add 后可浏览，应答只回请求方并重发 machine.info', async () => {
     const h = await setup();

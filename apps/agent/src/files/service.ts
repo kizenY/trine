@@ -11,6 +11,7 @@ import {
   FILES_ROOTS_MAX,
   FILES_TRUSTED_MAX,
   FS_LIST_MAX_ENTRIES,
+  type FileBookmark,
   type FilesRoot,
   type FilesTrustErrorCode,
   type FsEntry,
@@ -21,6 +22,7 @@ import type { BlobTransport } from '../bridge/attachments.ts';
 import { FileAccess, FileAccessError, isWithin, type Root } from './access.ts';
 import { detectKind, SNIFF_BYTES } from './kind.ts';
 import type { TrustStore } from './trust-store.ts';
+import { BookmarkError, type BookmarkStore } from './bookmark-store.ts';
 
 export class TrustError extends Error {
   readonly code: FilesTrustErrorCode;
@@ -38,6 +40,8 @@ export interface FileServiceOptions {
   blobs: () => BlobTransport | undefined;
   /** 信任目录；缺省 = 不支持远程增删（machine.info 不带 roots） */
   trust?: TrustStore;
+  /** 文件书签；缺省 = 不支持（machine.info 不带 bookmarks，web 退回只存本设备） */
+  bookmarks?: BookmarkStore;
   now?: () => number;
 }
 
@@ -56,6 +60,7 @@ export class FileService {
   readonly #access: FileAccess;
   readonly #blobs: () => BlobTransport | undefined;
   readonly #trust: TrustStore | undefined;
+  readonly #bookmarks: BookmarkStore | undefined;
   readonly #now: () => number;
 
   constructor(options: FileServiceOptions) {
@@ -63,6 +68,7 @@ export class FileService {
     this.maxBytes = options.maxBytes;
     this.#blobs = options.blobs;
     this.#trust = options.trust;
+    this.#bookmarks = options.bookmarks;
     this.#now = options.now ?? Date.now;
   }
 
@@ -78,6 +84,23 @@ export class FileService {
     // 协议上限：信任目录最多 FILES_TRUSTED_MAX 个，超出部分只可能来自过长的 TRINE_FILES_ALLOW，从 env 那头截
     const room = Math.max(0, FILES_ROOTS_MAX - trusted.length);
     return [...env.slice(0, room), ...trusted];
+  }
+
+  /** machine.info.files.bookmarks；不支持时返回 undefined */
+  bookmarks(): FileBookmark[] | undefined {
+    return this.#bookmarks?.list();
+  }
+
+  /** 加入书签（已存在则移到最前）。@returns 存下的路径；不合法 / 写失败抛 BookmarkError */
+  async addBookmark(path: string, kind: FileBookmark['kind']): Promise<string> {
+    if (this.#bookmarks === undefined) throw new BookmarkError('failed', '这台 agent 不支持书签');
+    return this.#bookmarks.add(path, kind, this.#now());
+  }
+
+  /** 移出书签（不在列表里也算成功）。@returns 规范化后的路径 */
+  async removeBookmark(path: string): Promise<string> {
+    if (this.#bookmarks === undefined) throw new BookmarkError('failed', '这台 agent 不支持书签');
+    return this.#bookmarks.remove(path);
   }
 
   /** agent 的 home（web 用来提示「信任 home 及其上级」的风险） */

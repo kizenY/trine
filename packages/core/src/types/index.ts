@@ -491,6 +491,18 @@ export const FilesRootSchema = z.object({
 });
 export type FilesRoot = z.infer<typeof FilesRootSchema>;
 
+/** 每台机器最多的文件书签数（超出时 agent 丢最旧的） */
+export const FILES_BOOKMARKS_MAX = 50;
+
+/** 文件书签：绝对路径 + 目录 / 文件。只是快捷入口，不扩大可浏览范围 */
+export const FileBookmarkSchema = z.object({
+  path: z.string().startsWith('/').max(4096),
+  kind: z.enum(['dir', 'file']),
+  /** 加入时间（agent 端记录） */
+  addedAt: z.number().int().nonnegative().optional(),
+});
+export type FileBookmark = z.infer<typeof FileBookmarkSchema>;
+
 export const MachineFilesInfoSchema = z.object({
   /** 单个文件可预览的字节上限 */
   maxBytes: z.number().int().positive(),
@@ -501,6 +513,11 @@ export const MachineFilesInfoSchema = z.object({
   roots: z.array(FilesRootSchema).max(FILES_ROOTS_MAX).optional(),
   /** agent 用户的 home（同上版本起）；client 据此对「信任 home 或其上级」加强提示 */
   home: z.string().max(4096).optional(),
+  /**
+   * 文件书签（file-bookmarks，agent ≥ 0.30.0）：机器级、所有已配对设备共享，新加的在前。
+   * 缺失 = 旧 agent，client 退回只存本设备；空数组 = 支持但还没有书签。增删见 `files.bookmark.*`。
+   */
+  bookmarks: z.array(FileBookmarkSchema).max(FILES_BOOKMARKS_MAX).optional(),
 });
 export type MachineFilesInfo = z.infer<typeof MachineFilesInfoSchema>;
 

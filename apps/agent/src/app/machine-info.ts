@@ -81,7 +81,9 @@ import type {
 //   Codex 接 thread/name/updated），不用重新列会话。协议不变
 // - 0.29.1 起历史读取出错时 session.history.response 带 error 回给请求方（不再发会话级 error.fatal）；
 //   Codex 新会话首轮落盘前拉历史返回空页，不再撞上 rollout 空文件的内部错误
-export const AGENT_VERSION = '0.29.1';
+// - 0.30.0 起文件书签存在 agent（files.bookmark.add / remove，`~/.trine/bookmarks.json`），
+//   MachineInfo.files 带 bookmarks，所有已配对设备同步（web 按 bookmarks 有无判断，旧 agent 退回本设备存储）
+export const AGENT_VERSION = '0.30.0';
 
 export function buildMachineInfo(input: {
   name: string;

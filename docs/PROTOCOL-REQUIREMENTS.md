@@ -170,6 +170,12 @@
   `files.trust.response { reqId, ok, path?, error?: { code: invalid | not_found | denied | limit | not_trusted | failed, message } }`，
   只回请求方；成功后广播 `machine.info`。add 要求绝对路径或 `~` 开头、存在且是目录、不是 `/`（字面与真实路径）、不是密钥类；
   重复加或已在 `TRINE_FILES_ALLOW` 里算成功；最多 64 个。信任目录每次请求按当前真实路径复查，之后被换成指向 `/` 或密钥类目录的链接就不再当根；`roots` 最多 256 条（过长的 `TRINE_FILES_ALLOW` 截断）。remove 按存下的路径匹配，`TRINE_FILES_ALLOW` 来源的回 `not_trusted`
+- 文件书签（机器级，0.30.0 起，存 `<home>/bookmarks.json`）：`machine.info.files.bookmarks: { path, kind: 'dir' | 'file', addedAt? }[]`
+  （有 = 支持，新加的在前，最多 50 个）。`files.bookmark.add { reqId, path, kind }` / `files.bookmark.remove { reqId, path }` →
+  `files.bookmark.response { reqId, ok, path?, error?: { code: invalid | failed, message } }`，只回请求方；成功后广播 `machine.info`。
+  path 须为绝对路径，agent 规范化（`.`/`..`、末尾 `/`）后存；重复加移到最前；超出丢最旧的；remove 不在列表里也算成功。
+  书签不扩大可浏览范围，agent 不查路径是否存在。client：没有 `bookmarks` 的旧 agent 退回存本设备 prefs；
+  有了之后把本设备的旧书签从最旧的开始补传（agent 已有的跳过），成功的从 prefs 删掉
 - client：入口是工具卡的预览按钮（`filePath`）、消息里像路径的行内代码与相对链接、会话菜单「浏览文件」；按 `machine.info.files` 有无决定显示。
   html 只显示源码；svg 只经 `<img>` 显示；PDF 放进 `<iframe>`（Blob 强制 `application/pdf`，静态响应的 CSP 因此带 `frame-src 'self' blob:`）
 
