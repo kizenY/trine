@@ -6,7 +6,7 @@
  * 只能等（6 分钟的）超时——所以 `agentVersion >= 0.4.0` 才给入口，版本号解析
  * 不了或还没收到 machine.info 一律当不支持。
  */
-import type { EngineInstall, EngineSummary, MachineInfo } from '@trine/core';
+import { CLAUDE_ENGINE_ID, type EngineInstall, type EngineSummary, type MachineInfo } from '@trine/core';
 import { compareVersions } from '@/components/list/session-actions.ts';
 import type { ClaudeUpdateResult } from '@/lib/client.ts';
 
@@ -138,6 +138,24 @@ export function engineLatestView(engine: Pick<EngineSummary, 'version' | 'latest
 export function claudeUpdateHint(info: Pick<MachineInfo, 'claudeVersion' | 'claudeLatest'> | null | undefined): string {
   const view = claudeLatestView(info);
   return view?.updateAvailable === true && view.latest !== null ? `claude 可更新 → ${view.latest}` : '';
+}
+
+/**
+ * 所有引擎的可更新提示（机器卡、详情页、导航红点共用）：Claude 看 claudeLatest，
+ * 其他引擎看 engines[].latest。如 `['claude 可更新 → 2.1.308', 'codex 可更新 → 0.170.0']`。
+ */
+export function engineUpdateHints(
+  info: Pick<MachineInfo, 'claudeVersion' | 'claudeLatest' | 'engines'> | null | undefined,
+): string[] {
+  const hints: string[] = [];
+  const claude = claudeUpdateHint(info);
+  if (claude !== '') hints.push(claude);
+  for (const engine of info?.engines ?? []) {
+    if (engine.id === CLAUDE_ENGINE_ID) continue;
+    const view = engineLatestView(engine);
+    if (view?.updateAvailable === true && view.latest !== null) hints.push(`${engine.id} 可更新 → ${view.latest}`);
+  }
+  return hints;
 }
 
 /** 手动检查的结论（toast 用） */

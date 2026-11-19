@@ -21,7 +21,7 @@ import { ConfirmDialog } from '@/components/machines/ConfirmDialog.tsx';
 import { AgentRestartSection } from '@/components/machines/AgentRestartSection.tsx';
 import { EngineCards } from '@/components/machines/EngineCards.tsx';
 import { EngineUpdateSection } from '@/components/machines/EngineUpdateSection.tsx';
-import { claudeLatestView, claudeUpdateHint, supportsClaudeUpdate } from '@/components/machines/claude-update.ts';
+import { claudeLatestView, engineUpdateHints, supportsClaudeUpdate } from '@/components/machines/claude-update.ts';
 import { supportsAgentRestart } from '@/components/machines/agent-restart.ts';
 import {
   machineHeartbeatLine,
@@ -120,12 +120,12 @@ export function MachineDetailView(): React.JSX.Element {
           <dt className="text-text-3">版本</dt>
           <dd className="font-mono text-xs" data-testid="detail-versions">
             {machineVersionLine(machine.info)}
-            {claudeUpdateHint(machine.info) !== '' && (
-              <span className="text-amber" data-testid="detail-claude-update-hint">
+            {engineUpdateHints(machine.info).map((hint) => (
+              <span key={hint} className="text-amber" data-testid="detail-engine-update-hint">
                 {' · '}
-                {claudeUpdateHint(machine.info)}
+                {hint}
               </span>
-            )}
+            ))}
           </dd>
           <dt className="text-text-3">会话</dt>
           <dd>

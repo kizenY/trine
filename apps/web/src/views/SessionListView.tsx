@@ -11,7 +11,8 @@
  */
 import { useEffect, useMemo } from 'react';
 import { NavLink } from 'react-router';
-import { MonitorIcon, PlusIcon, RefreshCwIcon, SettingsIcon } from 'lucide-react';
+import { PlusIcon, RefreshCwIcon, SettingsIcon } from 'lucide-react';
+import { MachinesNavButton } from '@/components/machines/MachinesNavButton.tsx';
 import { Button } from '@/components/ui/button.tsx';
 import { AppHead } from '@/components/shell/AppHead.tsx';
 import { MachineFilterChips } from '@/components/list/MachineFilterChips.tsx';
@@ -96,11 +97,7 @@ export function SessionListView(): React.JSX.Element {
             >
               <RefreshCwIcon className={cn(refreshing && 'motion-safe:animate-spin')} />
             </Button>
-            <Button size="icon-sm" variant="ghost" asChild title="机器">
-              <NavLink to="/machines" aria-label="机器">
-                <MonitorIcon />
-              </NavLink>
-            </Button>
+            <MachinesNavButton testId="list-machines" />
             <Button size="icon-sm" variant="ghost" asChild title="设置">
               <NavLink to="/settings" aria-label="设置">
                 <SettingsIcon />

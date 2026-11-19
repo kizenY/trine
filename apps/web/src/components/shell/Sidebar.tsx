@@ -8,9 +8,10 @@
  */
 import { useMemo, useRef } from 'react';
 import { NavLink } from 'react-router';
-import { MonitorIcon, PanelLeftCloseIcon, PanelLeftOpenIcon, PlusIcon, RefreshCwIcon, SettingsIcon } from 'lucide-react';
+import { PanelLeftCloseIcon, PanelLeftOpenIcon, PlusIcon, RefreshCwIcon, SettingsIcon } from 'lucide-react';
 import { Button } from '@/components/ui/button.tsx';
 import { ScrollArea } from '@/components/ui/scroll-area.tsx';
+import { MachinesNavButton } from '@/components/machines/MachinesNavButton.tsx';
 import { MachineFilterChips } from '@/components/list/MachineFilterChips.tsx';
 import { SessionList } from '@/components/list/SessionList.tsx';
 import { SidebarListControls } from '@/components/list/ListControls.tsx';
@@ -169,11 +170,7 @@ function SidebarFooterActions({ vertical = false }: { vertical?: boolean }): Rea
       >
         <RefreshCwIcon className={cn(refreshing && 'motion-safe:animate-spin')} />
       </Button>
-      <Button size="icon-sm" variant="ghost" asChild title="机器">
-        <NavLink to="/machines" aria-label="机器">
-          <MonitorIcon />
-        </NavLink>
-      </Button>
+      <MachinesNavButton testId="sidebar-machines" />
       <Button size="icon-sm" variant="ghost" asChild title="设置">
         <NavLink to="/settings" aria-label="设置">
           <SettingsIcon />
