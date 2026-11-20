@@ -12,6 +12,7 @@
 import { useEffect, useMemo, useState } from 'react';
 import { useNavigate, useParams } from 'react-router';
 import { toast } from 'sonner';
+import { CLAUDE_ENGINE_ID } from '@trine/core';
 import { Button } from '@/components/ui/button.tsx';
 import { Input } from '@/components/ui/input.tsx';
 import { Separator } from '@/components/ui/separator.tsx';
@@ -19,9 +20,9 @@ import { AppHead } from '@/components/shell/AppHead.tsx';
 import { StatusDot } from '@/components/shell/StatusDot.tsx';
 import { ConfirmDialog } from '@/components/machines/ConfirmDialog.tsx';
 import { AgentRestartSection } from '@/components/machines/AgentRestartSection.tsx';
-import { EngineCards } from '@/components/machines/EngineCards.tsx';
+import { autoUpdateProps, EngineCards } from '@/components/machines/EngineCards.tsx';
 import { EngineUpdateSection } from '@/components/machines/EngineUpdateSection.tsx';
-import { claudeLatestView, claudeUpdateHint, supportsClaudeUpdate } from '@/components/machines/claude-update.ts';
+import { claudeLatestView, engineUpdateHints, supportsClaudeUpdate } from '@/components/machines/claude-update.ts';
 import { supportsAgentRestart } from '@/components/machines/agent-restart.ts';
 import {
   machineHeartbeatLine,
@@ -34,13 +35,16 @@ import { SessionList } from '@/components/list/SessionList.tsx';
 import { countActiveSessions, countLiveSessions, liveSessionsLine } from '@/components/list/sorting.ts';
 import { countArchived, DEFAULT_LIST_QUERY, type ListQuery } from '@/components/list/filtering.ts';
 import { useNow } from '@/components/list/use-session-refresh.ts';
-import { EngineUsageLines, PlanUsageLine, PlanUsageRefreshButton } from '@/components/usage/PlanUsage.tsx';
-import { enginesOf, hasMultipleEngines } from '@/lib/engine-model.ts';
+import { MachineUsageRows, PlanUsageRefreshButton } from '@/components/usage/PlanUsage.tsx';
+import { enginesOf, enginesWithLimits, hasMultipleEngines } from '@/lib/engine-model.ts';
 import { supportsUsageRefresh } from '@/components/usage/usage-model.ts';
 import { useSessionActions } from '@/components/list/use-session-actions.ts';
-import { useListShowTemp } from '@/components/list/use-list-query.ts';
+import { useListGroupBy, useListShowTemp } from '@/components/list/use-list-query.ts';
+import { NewSessionSheetRoute, useNewSessionSheet } from '@/components/sheets/new-session-route.tsx';
+import { useIsDesktop } from '@/components/shell/use-media-query.ts';
 import { useClient, useTrine } from '@/app/runtime.ts';
 import { MachineStatsSection } from '@/components/machines/MachineStats.tsx';
+import { TrustedDirsSection } from '@/components/files/TrustedDirsSection.tsx';
 import { DETAIL_STATS_INTERVAL_MS, supportsMachineStats } from '@/components/machines/stats-model.ts';
 import { useListStatsInterval, useMachineStatsWatch } from '@/components/machines/use-machine-stats.ts';
 
@@ -60,10 +64,14 @@ export function MachineDetailView(): React.JSX.Element {
   // 稳定引用：SessionList 内 useMemo 以 query 为依赖，每次渲染新建对象会让它失效（评审 minor 7）。
   // 放在早退之前（hooks 规则）
   const [showTemp, setShowTemp] = useListShowTemp();
+  // 跟列表页同一个分组偏好：按工作空间分组时组头有「+」、置顶的空目录也在（plan §2 / §3）
+  const [groupBy] = useListGroupBy();
   const listQuery: ListQuery = useMemo(
-    () => ({ ...DEFAULT_LIST_QUERY, machine: machineId, groupBy: 'none', showTemp }),
-    [machineId, showTemp],
+    () => ({ ...DEFAULT_LIST_QUERY, machine: machineId, groupBy, showTemp }),
+    [machineId, groupBy, showTemp],
   );
+  const isDesktop = useIsDesktop();
+  const [, , openNewSessionIn] = useNewSessionSheet();
   // 资源数据：详情页打开时 5 秒一次；设置里关了自动刷新就只在打开时取一次
   const statsOff = useListStatsInterval() === null;
   const statsInterval = statsOff ? null : DETAIL_STATS_INTERVAL_MS;
@@ -113,12 +121,12 @@ export function MachineDetailView(): React.JSX.Element {
           <dt className="text-text-3">版本</dt>
           <dd className="font-mono text-xs" data-testid="detail-versions">
             {machineVersionLine(machine.info)}
-            {claudeUpdateHint(machine.info) !== '' && (
-              <span className="text-amber" data-testid="detail-claude-update-hint">
+            {engineUpdateHints(machine.info).map((hint) => (
+              <span key={hint} className="text-amber" data-testid="detail-engine-update-hint">
                 {' · '}
-                {claudeUpdateHint(machine.info)}
+                {hint}
               </span>
-            )}
+            ))}
           </dd>
           <dt className="text-text-3">会话</dt>
           <dd>
@@ -134,16 +142,12 @@ export function MachineDetailView(): React.JSX.Element {
               </dd>
             </>
           )}
-          {(machine.info?.rateLimits !== undefined || supportsUsageRefresh(machine.info)) && (
+          {(machine.info?.rateLimits !== undefined || supportsUsageRefresh(machine.info) || enginesWithLimits(machine.info).length > 0) && (
             <>
               <dt className="text-text-3">用量</dt>
-              <dd className="flex items-center gap-2" data-testid="detail-usage">
-                {machine.info?.rateLimits === undefined ? (
-                  <span className="text-text-3 text-xs">暂无数据，会话活动后更新</span>
-                ) : (
-                  <PlanUsageLine rateLimits={machine.info.rateLimits} now={now} />
-                )}
-                <EngineUsageLines info={machine.info} now={now} />
+              {/* 每个引擎一行（图标 + 名字一列），刷新按钮在整块右上 */}
+              <dd className="flex min-w-0 items-start gap-2" data-testid="detail-usage">
+                <MachineUsageRows info={machine.info} now={now} className="min-w-0 flex-1" />
                 <PlanUsageRefreshButton machine={machine} />
               </dd>
             </>
@@ -223,6 +227,7 @@ export function MachineDetailView(): React.JSX.Element {
               update={() => client.updateClaude(machine.machineId)}
               latest={claudeLatestView(machine.info)}
               check={() => client.checkClaude(machine.machineId)}
+              autoUpdate={autoUpdateProps(client, machine.machineId, machine.info?.engines?.find((e) => e.id === CLAUDE_ENGINE_ID))}
               now={now}
             />
           </>
@@ -240,6 +245,13 @@ export function MachineDetailView(): React.JSX.Element {
           </>
         )}
 
+        {machine.info?.files?.roots !== undefined && (
+          <>
+            <Separator />
+            <TrustedDirsSection machineId={machine.machineId} online={machine.online === true} roots={machine.info.files.roots} />
+          </>
+        )}
+
         <Separator />
 
         <section className="flex flex-col gap-2">
@@ -250,9 +262,12 @@ export function MachineDetailView(): React.JSX.Element {
             query={listQuery}
             actions={sessionActions}
             onShowTemp={setShowTemp}
+            onNewSessionIn={openNewSessionIn}
             variant="compact"
             now={now}
           />
+          {/* PC 的新建 sheet 挂在侧栏；移动端没有侧栏，这一页自己挂 */}
+          {!isDesktop && <NewSessionSheetRoute />}
         </section>
 
         <Separator />

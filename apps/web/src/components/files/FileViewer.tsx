@@ -57,11 +57,13 @@ export function FileBody({
   );
 }
 
-function useText(blob: Blob): string | undefined {
+/** Blob 解码成文本；blob 省略 = 不解码 */
+export function useText(blob: Blob | undefined): string | undefined {
   const [text, setText] = useState<string | undefined>(undefined);
   useEffect(() => {
     let alive = true;
     setText(undefined);
+    if (blob === undefined) return;
     void blob.text().then((t) => {
       if (alive) setText(t);
     });
@@ -84,7 +86,8 @@ function TextBody({ opened, mode, wrap }: { opened: OpenedFile; mode: 'rendered'
   if (text === '') return <div className="text-text-3 p-4 text-[13px]">（空文件）</div>;
   if (file.kind === 'markdown' && mode === 'rendered' && small) {
     return (
-      <div data-testid="file-markdown" className="px-4 py-3 sm:px-6">
+      // data-file-preview：目录与锚点定位从这里读标题（MarkdownToc 的 PREVIEW_ROOT_ATTR）
+      <div data-testid="file-markdown" data-file-preview="" className="min-w-0 px-4 py-3 sm:px-6">
         <Markdown text={text} streaming={false} fileBase={file.path} />
       </div>
     );
@@ -96,12 +99,13 @@ function TextBody({ opened, mode, wrap }: { opened: OpenedFile; mode: 'rendered'
         data-testid="file-code"
         className={cn(
           '[&_[data-streamdown=code-block-header]]:hidden [&_div:has(>[data-streamdown=code-block-actions])]:hidden',
-          '[&_[data-streamdown=code-block]]:my-0 [&_[data-streamdown=code-block]]:rounded-none [&_[data-streamdown=code-block]]:border-0 [&_[data-streamdown=code-block]]:p-0',
-          '[&_[data-streamdown=code-block-body]]:rounded-none [&_[data-streamdown=code-block-body]]:border-0 [&_[data-streamdown=code-block-body]]:bg-transparent [&_[data-streamdown=code-block-body]]:p-0',
+          '[&_[data-streamdown=code-block]]:!my-0 [&_[data-streamdown=code-block]]:!rounded-none [&_[data-streamdown=code-block]]:border-0 [&_[data-streamdown=code-block]]:!bg-transparent [&_[data-streamdown=code-block]]:p-0',
+          '[&_[data-streamdown=code-block-body]]:rounded-none [&_[data-streamdown=code-block-body]]:border-0 [&_[data-streamdown=code-block-body]]:!bg-code-bg [&_[data-streamdown=code-block-body]]:!p-0',
           '[&_pre]:!m-0 [&_pre]:!rounded-none [&_pre]:!border-0 [&_pre]:px-4 [&_pre]:py-3',
         )}
       >
-        <Markdown text={fenced} streaming={false} fullHeightCode />
+        {/* 看源码：`.mmd` 文件包成 ```mermaid 围栏后不能被渲染成图 */}
+        <Markdown text={fenced} streaming={false} fullHeightCode diagrams={false} />
       </div>
     );
   }

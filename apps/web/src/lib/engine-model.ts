@@ -121,17 +121,25 @@ export function engineModeLabel(engine: EngineSummary | undefined, modeId: strin
 
 /**
  * 这个引擎、这个模型能选的推理强度；不能选时为 undefined（不显示这一节）。
- * 引擎目录里没有的模型（手填的名字）也不知道支持什么，同样不显示。
+ * 有模型目录的引擎按模型给选项；无目录的引擎可以提供统一选项。
  */
 export function effortOptions(
-  engine: Pick<EngineSummary, 'capabilities' | 'models'> | undefined,
+  engine: Pick<EngineSummary, 'capabilities' | 'models' | 'efforts'> | undefined,
   model: string | undefined,
 ): { efforts: readonly string[]; defaultEffort?: string | undefined } | undefined {
   if (engine?.capabilities.effort !== true) return undefined;
+  if (engine.models === undefined && engine.efforts !== undefined && engine.efforts.length > 0) {
+    return { efforts: engine.efforts };
+  }
   const entry =
     model === undefined || model === '' || model === ENGINE_DEFAULT_MODEL
       ? engine.models?.find((m) => m.isDefault === true)
       : engine.models?.find((m) => m.id === model);
   if (entry?.efforts === undefined || entry.efforts.length === 0) return undefined;
   return { efforts: entry.efforts, defaultEffort: entry.defaultEffort };
+}
+
+/** 保存的默认强度要经过当前机器 / 模型的能力检查；不支持时跟随引擎配置。 */
+export function preferredEffort(engine: EngineSummary | undefined, model: string, preferred: string | undefined): string | undefined {
+  return preferred !== undefined && effortOptions(engine, model)?.efforts.includes(preferred) === true ? preferred : undefined;
 }

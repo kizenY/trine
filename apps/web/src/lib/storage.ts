@@ -37,6 +37,7 @@ import {
   ATTACHMENTS_DEFAULT_MAX_TOTAL_BYTES,
   ATTACHMENTS_MAX_COUNT,
   MachineInfoSchema,
+  EngineEffortSchema,
   PermissionModeSchema,
   SessionMetaSchema,
   type MachineInfo,
@@ -47,6 +48,8 @@ import { z } from 'zod';
 import type { DocStore, KvAdapter } from './adapters.ts';
 import type { HistoryState, MachineCwd, Timeline, TimelineEntry, ToolEntry } from './reducer.ts';
 import { dropPending, isSubagentTool, type PendingChildren } from './tool-tree.ts';
+import { BOOKMARKS_MAX, FileBookmarkSchema } from './file-bookmarks.ts';
+import { ContentWidthSchema, SIDEBAR_MAX_WIDTH, SIDEBAR_MIN_WIDTH, WORKSPACE_MAX_STORED_WIDTH, WORKSPACE_MIN_WIDTH } from './layout-prefs.ts';
 import { BgTasksSchema, HistoryStateSchema, isHistoryEntry, isPendingEntry, PendingChildrenSchema, TimelineEntrySchema } from './reducer.ts';
 
 export const KV_IDENTITY = 'trine.identity';
@@ -151,11 +154,15 @@ export const PrefsSchema = z.object({
   /** 新建会话预选的引擎；省略 = Claude Code，或机器上第一个能用的 */
   defaultEngine: z.string().min(1).optional().catch(undefined),
   /**
-   * 非 Claude 引擎的新会话默认（Claude 的是上面两项）。model 省略 = 跟随引擎自己的配置，
-   * mode 省略 = 目录标的默认
+   * 各引擎的新会话默认（Claude 的模型 / 权限仍用上面两项）。model 省略 = 跟随配置，
+   * mode 省略 = 目录标的默认，effort 省略 = 跟随引擎配置。
    */
   engineDefaults: z
-    .record(z.string(), z.object({ model: z.string().min(1).optional(), mode: z.string().min(1).optional() }))
+    .record(z.string(), z.object({
+      model: z.string().min(1).optional(),
+      mode: z.string().min(1).optional(),
+      effort: EngineEffortSchema.optional().catch(undefined),
+    }))
     .catch({}),
   /**
    * PC 上的发送键（见 components/composer/composer-keys.ts）：`enter` = Enter 发送、
@@ -178,6 +185,20 @@ export const PrefsSchema = z.object({
   machineStatsIntervalMs: z
     .union([z.literal(0), z.literal(5_000), z.literal(10_000), z.literal(30_000), z.literal(60_000)])
     .catch(60_000),
+  /** PC 侧栏宽度（px）；null = 响应式默认。见 lib/layout-prefs.ts。`.catch` 同 listGroupBy */
+  sidebarWidth: z.number().int().min(SIDEBAR_MIN_WIDTH).max(SIDEBAR_MAX_WIDTH).nullable().catch(null),
+  /** PC 侧栏折叠成图标栏 */
+  sidebarCollapsed: z.boolean().catch(false),
+  /** 会话页内容最大宽度（全局默认） */
+  contentWidth: ContentWidthSchema.catch('standard'),
+  /** 单个会话覆盖的内容宽度，键为 timelineKey（machineId/sessionId）；坏的条目整张表丢弃 */
+  sessionContentWidth: z.record(z.string(), ContentWidthSchema).catch({}),
+  /** PC 会话页文件工作区的宽度（px）；null = 主区一半。见 lib/layout-prefs.ts。`.catch` 同 listGroupBy */
+  workspaceWidth: z.number().int().min(WORKSPACE_MIN_WIDTH).max(WORKSPACE_MAX_STORED_WIDTH).nullable().catch(null),
+  /** 后台任务条隐藏已结束的任务（全局；条上「隐藏已结束 / 显示」切换） */
+  bgHideEnded: z.boolean().catch(false),
+  /** 文件书签，键为 machineId（见 lib/file-bookmarks.ts）；坏的条目整张表丢弃 */
+  fileBookmarks: z.record(z.string(), z.array(FileBookmarkSchema).max(BOOKMARKS_MAX)).catch({}),
 });
 export type Prefs = z.infer<typeof PrefsSchema>;
 
@@ -232,6 +253,13 @@ export function defaultPrefs(): Prefs {
     machineStatsIntervalMs: 60_000,
     attachMaxCount: ATTACHMENTS_DEFAULT_MAX_COUNT,
     imageCompressMb: 0,
+    sidebarWidth: null,
+    sidebarCollapsed: false,
+    contentWidth: 'standard',
+    sessionContentWidth: {},
+    workspaceWidth: null,
+    bgHideEnded: false,
+    fileBookmarks: {},
   };
 }
 
@@ -490,6 +518,8 @@ const MachineDocFrameSchema = z.object({
       favorites: z.array(z.string()),
       defaultCwd: z.string(),
       pinned: z.record(z.string(), z.number()).optional(),
+      /** 置顶工作区的手动顺序；形状不对只丢它自己（退回时间序），不连带丢整份快照 */
+      pinOrder: z.array(z.string()).optional().catch(undefined),
     })
     .nullable(),
   /** sessionId → 完整 SessionMeta（来源 session.list.response / created / updated） */

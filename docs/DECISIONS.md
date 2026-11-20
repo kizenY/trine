@@ -116,7 +116,9 @@ context 用量是会话级的，在每轮结束后借同一个 SDK query 调 `ge
 按工作区分组时，组序只看置顶与工作区创建时间（新的在上），不看组内状态与最后活动：
 组随会话开始运行、等待批准而跳位置，比「急的排上面」更打扰；待批准靠组头角标、组强制展开与推送提示。
 组内仍按状态排。工作区不是实体，创建时间从该目录下全部会话（含已归档）推出，筛选不改变组位置。
-不做手动拖拽排序。
+非置顶组不做手动排序。置顶组可以手动排（组菜单上移 / 下移 / 移到本机最前，桌面另有拖柄），顺序存在
+agent `cwd.json` 的 `pinOrder`，同一台机器的各设备一致；「全部机器」视图下置顶区按机器分段，只能在
+同一台机器的段内调整——顺序本来就是按机器存的，跨机器拖动没有可存的含义。
 
 置顶与归档一样是用户意图，存在 agent（会话：`sessions.json`；工作区：`cwd.json`），各设备一致；
 不放 web 的本设备偏好。归档清掉会话置顶，免得取消归档后它突然出现在最上面。
@@ -187,8 +189,17 @@ Codex，否则 Codex 会话的标记过 30 天会被当成失效清掉。
 **Codex 补齐能力（agent 0.22.0）。** 回退复用 `session.rewind`，但定位和执行都交给引擎（`thread/revert`），因为 Codex 没有 Claude 那样的转录链；
 只回对话，不还原文件，对话框写明。压缩和 skill 不加帧：Claude 的斜杠命令本来就是文本，Codex 也走这条路，由引擎把 `/compact`、`/name` 转成对应接口，
 旧标签页不用改。推理强度不用枚举：实测取值随模型变（有 `max`、`ultra`），按模型目录校验。`turn/start` 的 `effort` 对后续轮次一直生效，不传撤销不了，
-所以「默认」要写成模型默认值。最新版本查 GitHub release：Codex 自己的 `version.json` 只在运行 TUI 时刷新，可能过期。子 agent 的 item 只显示成卡片，
-不展开子 thread；这部分按协议类型实现，没有实测触发过。子 thread 的审批不会转到浏览器。
+所以「默认」要写成模型默认值。最新版本查 GitHub release：Codex 自己的 `version.json` 只在运行 TUI 时刷新，可能过期。
+
+**子 agent 卡片。** 启动子 agent 的工具调用返回，不等于子 agent 跑完：SDK 下 Claude 的 Agent 默认在后台跑，工具在启动时就返回了。
+所以 `tool.end` 语义不变，另在 tool 帧和历史条目上带可选的 `subagent`（类型、前台/后台、目标状态、Codex 的昵称和模型），client 按字段合并。
+Claude 后台子 agent 的运行状态由 client 从后台任务快照派生，快照陈旧时显示「状态未知」；历史里用转录中系统来源的 task-notification 回填最终状态，
+找不到结束证据也显示「状态未知」。SDK 的 `getSessionMessages` 不带行的来源，所以另读原始转录取 `origin`；取不到时要求通知里的 tool-use-id
+是本转录里更早的工具调用，不只看文本前缀。这些通知行不显示成用户消息，也不能被选为回退目标。
+Codex 的子 agent 是独立 thread，通知和审批走同一个连接，但不发 `thread/started`。agent 维护「子 thread → 根会话」关系表：
+主要来自派生 item 里的子 thread id，其次是子 turn 的 `rootTurnId`，再查不到就限时 `thread/read` 逐级找 `parentThreadId`；不猜最近活跃的会话。
+子 thread 的审批卡挂在根会话上并标明来源，回复和撤销按请求所属的 thread 和 turn 处理；子 thread 的 `turn/completed` 不会结束父会话的轮。
+子 thread 的完整过程还不展开，只把它的状态反映到派生卡上。
 
 **包管理器安装（agent 0.23.0）。** `claude update` 遇到 Homebrew、apt 只打印提示，退出码还是 0，不能靠它。所以 agent 按可执行文件的真实路径和 `dpkg-query` 识别安装方式，
 更新和版本检查都走包管理器：能装上什么版本由 cask 和 apt 源决定，按发布源比较会一直提示「有新版本」。apt 用 `sudo -n`，不等密码，也不做提权配置；没有免密 sudo 时把命令告诉用户。

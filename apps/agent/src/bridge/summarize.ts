@@ -8,7 +8,7 @@
  * 未知工具（MCP 工具、未来新增内置工具）必须优雅降级，绝不抛错——
  * 这里的失败只该导致「摘要不好看」，不该中断事件流。
  */
-import type { ToolResultStatus } from '@trine/core';
+import { SUBAGENT_LABEL_MAX, TOOL_ARG_DETAIL_MAX, type SubagentInfo, type SubagentState, type ToolResultStatus } from '@trine/core';
 
 /** CSI（颜色、光标）与 OSC（标题、超链接）转义序列 */
 const ANSI_RE = /\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[@-Z\\-_]/g;
@@ -83,6 +83,94 @@ export function toolFilePath(toolName: string, input: unknown): string | undefin
 export function withFilePath(toolName: string, input: unknown): { filePath?: string } {
   const filePath = toolFilePath(toolName, input);
   return filePath === undefined ? {} : { filePath };
+}
+
+/** 完整参数的原文来源：Bash 的命令、URL / 查询 / 模式（摘要会压成单行、截断的那些字段） */
+function argDetailSource(toolName: string, input: unknown): string | undefined {
+  switch (toolName) {
+    case 'Bash':
+      return str(input, 'command');
+    case 'WebFetch':
+      return str(input, 'url');
+    case 'WebSearch':
+      return str(input, 'query');
+    case 'Glob':
+    case 'Grep':
+      return str(input, 'pattern');
+    // 子 agent：摘要是 description，展开看写给它的 prompt
+    case 'Agent':
+    case 'Task':
+      return str(input, 'prompt');
+    default:
+      return undefined;
+  }
+}
+
+/** Claude 的子 agent 工具（会有子工具、后台任务的那两个） */
+export function isClaudeSubagentTool(toolName: string): boolean {
+  return toolName === 'Agent' || toolName === 'Task';
+}
+
+/**
+ * Agent/Task 启动时的子 agent 信息（tool.start / history 的 `subagent`）：`subagent_type` 与
+ * input 里显式的 `run_in_background`。注意 SDK（非交互）下不带 run_in_background 的 Agent
+ * 也可能在后台跑（spike S1），真实的前台 / 后台以启动结果为准（见 isAsyncLaunch）。
+ */
+export function subagentStartInfo(toolName: string, input: unknown): SubagentInfo | undefined {
+  if (!isClaudeSubagentTool(toolName)) return undefined;
+  const type = str(input, 'subagent_type')?.trim();
+  const info: SubagentInfo = {
+    ...(type === undefined || type === '' ? {} : { agentType: type.slice(0, SUBAGENT_LABEL_MAX) }),
+    ...(flag(input, 'run_in_background') ? { background: true } : {}),
+  };
+  return Object.keys(info).length === 0 ? undefined : info;
+}
+
+/** 展开进 tool.start / history tool 条目：Agent/Task 才带 subagent 字段 */
+export function withSubagentStart(toolName: string, input: unknown): { subagent?: SubagentInfo } {
+  const subagent = subagentStartInfo(toolName, input);
+  return subagent === undefined ? {} : { subagent };
+}
+
+/**
+ * Agent/Task 的结果是不是「后台已启动」的回执：结构化输出 `isAsync:true` /
+ * `status:'async_launched'`（实时流），或回执文本（转录里只有文本）。
+ */
+export function isAsyncLaunch(structured: unknown, text: string): boolean {
+  if (typeof structured === 'object' && structured !== null) {
+    const rec = structured as Record<string, unknown>;
+    if (rec['isAsync'] === true || rec['status'] === 'async_launched') return true;
+  }
+  return AGENT_BACKGROUND_RESULT.test(text);
+}
+
+/** 限长：超出 TOOL_ARG_DETAIL_MAX 时截断并在尾部写明原长 */
+export function capArgDetail(text: string): string {
+  if (text.length <= TOOL_ARG_DETAIL_MAX) return text;
+  return `${text.slice(0, TOOL_ARG_DETAIL_MAX)}\n…（已截断，原文共 ${text.length} 字符）`;
+}
+
+/**
+ * 工具调用的完整参数（tool.start / history 的 `argDetail`）。只在摘要看不全原文时给：
+ * 原文有换行、多余空白或超出摘要长度。不需要时返回 undefined。
+ */
+export function toolArgDetail(toolName: string, input: unknown, summary: string): string | undefined {
+  const raw = argDetailSource(toolName, input);
+  if (raw === undefined || raw.trim() === '') return undefined;
+  return detailIfHidden(raw, summary);
+}
+
+/** 原文在摘要里看不全（截断 / 压成单行）时给出限长后的原文 */
+export function detailIfHidden(raw: string, summary: string): string | undefined {
+  const text = raw.replace(/\s+$/, '');
+  if (text === '' || summary.endsWith(text)) return undefined;
+  return capArgDetail(text);
+}
+
+/** 展开进 tool.start / history tool 条目：需要时才带 argDetail 字段 */
+export function withArgDetail(toolName: string, input: unknown, summary: string): { argDetail?: string } {
+  const argDetail = toolArgDetail(toolName, input, summary);
+  return argDetail === undefined ? {} : { argDetail };
 }
 
 /**
@@ -371,6 +459,15 @@ export interface SubagentEnd {
   durationMs: number;
   resultSummary: string;
   outputPreview?: string;
+  /** 后台子 agent 的最终状态（client 据此不再从后台任务快照派生「运行中」） */
+  subagent: SubagentInfo;
+}
+
+/** task_notification / task-notification 的 status → 子 agent 最终状态 */
+export function subagentEndState(status: unknown): SubagentState {
+  if (status === 'failed') return 'failed';
+  if (status === 'stopped' || status === 'killed') return 'stopped';
+  return 'completed';
 }
 
 /**
@@ -387,13 +484,15 @@ export function backgroundSubagentEnd(status: unknown, usage: unknown, summary: 
   const calls = toolUses === undefined ? '' : `${Math.max(0, Math.round(toolUses))} 次工具调用`;
   const preview = typeof summary === 'string' ? outputPreview(summary) : undefined;
   const withPreview = preview === undefined ? {} : { outputPreview: preview };
-  if (status === 'failed') {
-    return { status: 'error', durationMs, resultSummary: `✗ 子 agent 失败${calls === '' ? '' : ` · ${calls}`}${took}`, ...withPreview };
+  const state = subagentEndState(status);
+  const subagent: SubagentInfo = { background: true, state };
+  if (state === 'failed') {
+    return { status: 'error', durationMs, resultSummary: `✗ 子 agent 失败${calls === '' ? '' : ` · ${calls}`}${took}`, ...withPreview, subagent };
   }
-  if (status === 'stopped' || status === 'killed') {
-    return { status: 'warn', durationMs, resultSummary: `⏹ 子 agent 已停止${calls === '' ? '' : ` · ${calls}`}${took}`, ...withPreview };
+  if (state === 'stopped') {
+    return { status: 'warn', durationMs, resultSummary: `⏹ 子 agent 已停止${calls === '' ? '' : ` · ${calls}`}${took}`, ...withPreview, subagent };
   }
-  return { status: 'ok', durationMs, resultSummary: calls === '' ? `✓ 子 agent 已完成${took}` : `✓ ${calls}${took}`, ...withPreview };
+  return { status: 'ok', durationMs, resultSummary: calls === '' ? `✓ 子 agent 已完成${took}` : `✓ ${calls}${took}`, ...withPreview, subagent };
 }
 
 /** 尾部截断的输出预览；空结果返回 undefined（协议里该字段 optional） */

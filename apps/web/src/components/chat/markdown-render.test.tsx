@@ -15,7 +15,7 @@
 import { describe, expect, test } from 'bun:test';
 import { renderToStaticMarkup } from 'react-dom/server';
 import { Markdown } from './Markdown.tsx';
-import { FileLinksContext, type FileLinks } from '@/components/files/file-links.ts';
+import { FileDocAnchorContext, FileLinksContext, type FileLinks } from '@/components/files/file-links.ts';
 
 const EVIL = 'evil.example';
 
@@ -111,7 +111,7 @@ describe('Markdown restricted（扩展详情）：更严的一档', () => {
 });
 
 describe('Markdown 文件链接（FileLinksContext）：路径可点，外连拦截不变', () => {
-  const links: FileLinks = { open: () => {}, browse: () => {} };
+  const links: FileLinks = { open: () => {} };
   const renderLinked = (text: string, fileBase?: string): string =>
     renderToStaticMarkup(
       <FileLinksContext.Provider value={links}>
@@ -157,5 +157,126 @@ describe('Markdown 文件链接（FileLinksContext）：路径可点，外连拦
 
   test('没有 provider：不出现文件链接', () => {
     expect(render('`docs/plan.md` [x](docs/a.md)')).not.toContain('file-link');
+  });
+});
+
+describe('Markdown 文件预览：标题 slug 与锚点（§6）', () => {
+  const links: FileLinks = { open: () => {} };
+  const BASE = '/w/repo/docs/a.md';
+  const DOC = '# Hello, World!\n\n## 安装步骤\n\n## 用法\n\n## 用法\n\n见 [安装](#安装步骤)、[编码](#%E7%94%A8%E6%B3%95-1)、[部署](./b.md#%E9%83%A8%E7%BD%B2)、[本文](./a.md#用法)';
+  const renderDoc = (text: string, ns?: string): string =>
+    renderToStaticMarkup(
+      <FileLinksContext.Provider value={links}>
+        {ns === undefined ? (
+          <Markdown text={text} streaming={false} fileBase={BASE} />
+        ) : (
+          <FileDocAnchorContext.Provider value={{ ns, jump: () => true }}>
+            <Markdown text={text} streaming={false} fileBase={BASE} />
+          </FileDocAnchorContext.Provider>
+        )}
+      </FileLinksContext.Provider>,
+    );
+  const renderChat = (text: string): string =>
+    renderToStaticMarkup(
+      <FileLinksContext.Provider value={links}>
+        <Markdown text={text} streaming={false} />
+      </FileLinksContext.Provider>,
+    );
+  const slugs = (html: string): string[] => [...html.matchAll(/data-heading-slug="([^"]*)"/g)].map((m) => m[1]!);
+
+  test('中文、标点、重复标题的 slug；有预览实例时 id 带命名空间', () => {
+    const html = renderDoc(DOC, 'p1');
+    expect(slugs(html)).toEqual(['hello-world', '安装步骤', '用法', '用法-1']);
+    expect(html).toContain('id="p1-安装步骤"');
+    expect(html).toContain('id="p1-用法-1"');
+    // 没有预览实例：只有 slug，不出 id
+    expect(renderDoc(DOC)).not.toContain(' id="');
+  });
+
+  test('同文件锚点保护下来（不被 harden 拦），百分号编码解码；跨文件锚点单独带上', () => {
+    const html = renderDoc(DOC, 'p1');
+    expect(html).not.toContain('[blocked]');
+    expect(html).toContain('data-testid="file-anchor-link" data-fragment="安装步骤"');
+    expect(html).toContain('data-fragment="用法-1"');
+    expect(html).toMatch(/data-path="\/w\/repo\/docs\/b.md" data-fragment="部署"/);
+    expect(html).toMatch(/data-path="\/w\/repo\/docs\/a.md" data-fragment="用法"/);
+  });
+
+  test('交替渲染聊天与预览：处理器不串、每次转换 slug 重新编号', () => {
+    const first = slugs(renderDoc(DOC));
+    const chat = renderChat(DOC);
+    expect(chat).not.toContain('data-heading-slug');
+    expect(chat).not.toContain('file-anchor-link');
+    expect(slugs(renderDoc(DOC))).toEqual(first);
+    expect(slugs(renderDoc('## 用法\n\n## 用法'))).toEqual(['用法', '用法-1']);
+  });
+
+  test('块级元素带文件里的源码行号（data-src-line）；聊天里没有', () => {
+    const md = ['# 标题', '', '第一段', '跨两行', '', '- 项一', '- 项二', '', '> 引用', '', '```ts', 'const x = 1;', '```', '', '## 尾'].join('\n');
+    const html = renderDoc(md, 'p1');
+    const lines = (tag: string): string[] => [...html.matchAll(new RegExp(`<${tag}[^>]*data-src-line="(\\d+)"`, 'g'))].map((m) => m[1]!);
+    expect(lines('h1')).toEqual(['1']);
+    expect(lines('p')).toContain('3');
+    expect(lines('li')).toEqual(['6', '7']);
+    expect(lines('blockquote')).toEqual(['9']);
+    expect(lines('h2')).toEqual(['15']);
+    expect(renderChat(md)).not.toContain('data-src-line');
+  });
+
+  test('开头的 front matter：剥成元数据块，不出分隔线 / 粗体标题，不进 slug，行号仍是文件行号', () => {
+    const md = ['---', 'status: active', 'created: 2026-11-01', 'title: "带引号 <b>x</b>"', '---', '# 任务', '', '正文', '', '## 下一步'].join('\n');
+    const html = renderDoc(md, 'p1');
+    expect(html).toContain('data-testid="file-front-matter"');
+    expect([...html.matchAll(/data-testid="file-front-matter-row"/g)]).toHaveLength(3);
+    expect(html).toContain('2026-11-01');
+    // 值按纯文本：尖括号被转义，不成标签
+    expect(html).toContain('带引号 &lt;b&gt;x&lt;/b&gt;');
+    expect(html).not.toContain('<hr');
+    expect(html).not.toMatch(/<h2[^>]*>[^<]*status/);
+    expect(slugs(html)).toEqual(['任务', '下一步']);
+    const lines = (tag: string): string[] => [...html.matchAll(new RegExp(`<${tag}[^>]*data-src-line="(\\d+)"`, 'g'))].map((m) => m[1]!);
+    expect(lines('h1')).toEqual(['6']);
+    expect(lines('p')).toEqual(['8']);
+    expect(lines('h2')).toEqual(['10']);
+  });
+
+  test('front matter 认不出 key: value 时原样显示；聊天消息不处理', () => {
+    const md = ['---', 'tags:', '  - a', '  - b', '...', '# 标题'].join('\n');
+    const html = renderDoc(md, 'p1');
+    expect(html).toContain('data-testid="file-front-matter-raw"');
+    expect(html).toContain('  - a');
+    expect(slugs(html)).toEqual(['标题']);
+    const chat = renderChat(['---', 'status: active', '---', '正文'].join('\n'));
+    expect(chat).not.toContain('file-front-matter');
+  });
+
+  test('raw HTML 标题照样有 slug；sanitize 不放宽（脚本仍被剥掉）', () => {
+    const html = renderDoc('<h2 id="x" onclick="alert(1)">原始 <b>标题</b></h2>\n\n<script>alert(1)</script>', 'p1');
+    expect(slugs(html)).toEqual(['原始-标题']);
+    expect(html).not.toContain('onclick');
+    expect(html).not.toContain('<script');
+  });
+});
+
+describe('mermaid 代码块', () => {
+  const SRC = '```mermaid\ngraph TD\n  A --> B\n```';
+  const BLOCK = 'data-streamdown="mermaid-block"';
+
+  test('回复结束后走图表渲染（图表组件是 lazy 的，SSR 里只有 Suspense 占位，不出源码）', () => {
+    const html = renderToStaticMarkup(<Markdown text={SRC} streaming={false} />);
+    expect(html).not.toContain('graph TD');
+    expect(html).not.toContain('data-streamdown="code-block"');
+  });
+
+  test('流式中、扩展输出、看源码时只显示代码', () => {
+    for (const el of [
+      <Markdown key="s" text={SRC} streaming />,
+      <Markdown key="r" text={SRC} streaming={false} restricted />,
+      <Markdown key="d" text={SRC} streaming={false} diagrams={false} />,
+    ]) {
+      const html = renderToStaticMarkup(el);
+      expect(html).not.toContain(BLOCK);
+      expect(html).toContain('graph TD');
+    }
   });
 });

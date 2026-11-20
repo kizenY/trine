@@ -3,9 +3,12 @@ import type { ExtPlan, ExtRecord } from '@trine/core';
 import {
   applyLocalEffects,
   ExtCatalogCache,
+  executeLocalAction,
   extensionsFor,
+  filesOpenTarget,
   isNewer,
   mergeRecords,
+  missingLocalHandler,
   placeRecords,
   readKey,
   recordText,
@@ -13,6 +16,7 @@ import {
   runTokenAction,
   supportsExtensions,
   supportsExtRecords,
+  webExtFeatures,
   type ExtActionDeps,
   type ExtActionPlanEvent,
   type ExtActionResult,
@@ -75,6 +79,29 @@ describe('runTokenAction', () => {
     expect(d.calls.filter((c) => c === 'confirm')).toHaveLength(2);
   });
 
+  test('确认时带了修改：commit 带上 edits；没改动（true）不带', async () => {
+    const seen: unknown[] = [];
+    const edits = [{ step: 0, prompt: '改过' }];
+    const d = deps({
+      prepare: async () => planEvent('p1'),
+      confirm: async () => ({ edits }),
+      commit: async (_planId, _inv, e) => {
+        seen.push(e);
+        return result();
+      },
+    });
+    expect(await runTokenAction('t', d)).toMatchObject({ kind: 'done' });
+    const plain = deps({
+      prepare: async () => planEvent('p1'),
+      commit: async (_planId, _inv, e) => {
+        seen.push(e);
+        return result();
+      },
+    });
+    await runTokenAction('t', plain);
+    expect(seen).toEqual([edits, undefined]);
+  });
+
   test('用户取消：发 cancel，不 commit', async () => {
     const d = deps({ prepare: async () => planEvent('p1'), confirm: async () => false });
     const out = await runTokenAction('t', d);
@@ -116,6 +143,110 @@ describe('applyLocalEffects', () => {
       },
     );
     expect(calls).toEqual(['insert:a', 'copy:b', 'refresh']);
+  });
+
+  test('files.open 交给 filesOpen；没有处理器时忽略', async () => {
+    const opened: unknown[] = [];
+    const handlers = { insert: () => {}, copy: async () => true, refresh: () => {} };
+    await applyLocalEffects([{ type: 'files.open', path: '/w/t', dir: true }], { ...handlers, filesOpen: (e) => opened.push(e) });
+    expect(opened).toEqual([{ type: 'files.open', path: '/w/t', dir: true }]);
+    await applyLocalEffects([{ type: 'files.open', path: '/w/a.md' }], handlers);
+    expect(opened).toHaveLength(1);
+  });
+});
+
+describe('特性声明与会话绑定', () => {
+  test('只有会话面板、有 filesOpen 处理器、agent 列出 files.open 时声明', () => {
+    const fn = (): void => {};
+    const agent = ['files.open'];
+    expect(webExtFeatures('sessionPanel', { filesOpen: fn }, agent)).toEqual(['files.open']);
+    expect(webExtFeatures('sessionPanel', {}, agent)).toEqual([]);
+    // 旧 agent：machine.info.extensions 没有 features
+    expect(webExtFeatures('sessionPanel', { filesOpen: fn }, undefined)).toEqual([]);
+    for (const point of ['workspacePanel', 'composerAction', 'newSession', 'linkPicker'] as const) {
+      expect(webExtFeatures(point, { filesOpen: fn }, agent)).toEqual([]);
+    }
+  });
+
+  test('readKey 按特性集区分；应答按它带回的 features 落到同一个键', () => {
+    const t = { machineId: 'm', ext: 'tasks', op: 'view' as const, point: 'sessionPanel' as const, targetSessionId: 's1' };
+    expect(readKey({ ...t, features: ['files.open'] })).not.toBe(readKey(t));
+    expect(readKey({ ...t, features: [] })).toBe(readKey(t));
+    const res = (features?: string[]): ExtReadResponse =>
+      ({ type: 'ext.read.response', ...base, ext: 'tasks', op: 'view', point: 'sessionPanel', targetSessionId: 's1', rev: 1, ok: true, ...(features === undefined ? {} : { features }) }) as ExtReadResponse;
+    expect(responseKey('m', res(['files.open']))).toBe(readKey({ ...t, features: ['files.open'] }));
+    // 旧 agent 不回 features：与不声明时的键一致
+    expect(responseKey('m', res())).toBe(readKey(t));
+  });
+
+  describe('executeLocalAction', () => {
+    const make = (state: { here: boolean; filesOpen: boolean; onCopy?: () => void }) => {
+      const calls: string[] = [];
+      const deps = {
+        handlers: () => ({
+          insert: (t: string) => calls.push(`insert:${t}`),
+          copy: async (t: string) => {
+            calls.push(`copy:${t}`);
+            await Promise.resolve();
+            state.onCopy?.();
+            return true;
+          },
+          refresh: () => calls.push('refresh'),
+          ...(state.filesOpen ? { filesOpen: (e: { path: string }) => calls.push(`open:${e.path}`) } : {}),
+        }),
+        stillHere: () => state.here,
+        blocked: (reason: string, detail?: string) => calls.push(`blocked:${reason}${detail === undefined ? '' : `:${detail}`}`),
+      };
+      return { calls, deps };
+    };
+
+    test('正常：复制、打开（最后一个）、插入合并', async () => {
+      const { calls, deps } = make({ here: true, filesOpen: true });
+      await executeLocalAction(
+        [
+          { type: 'copy', text: 'c' },
+          { type: 'files.open', path: '/a' },
+          { type: 'prompt.insert', text: 'x' },
+          { type: 'files.open', path: '/b' },
+          { type: 'prompt.insert', text: 'y' },
+        ],
+        deps,
+      );
+      expect(calls).toEqual(['copy:c', 'open:/b', 'insert:x\ny']);
+    });
+
+    test('复制等待期间切到别的会话：丢弃剩余效果，不打开', async () => {
+      const state = { here: true, filesOpen: true, onCopy: () => (state.here = false) };
+      const { calls, deps } = make(state);
+      await executeLocalAction([{ type: 'copy', text: 'c' }, { type: 'files.open', path: '/a' }, { type: 'prompt.insert', text: 'x' }], deps);
+      expect(calls).toEqual(['copy:c', 'blocked:left']);
+    });
+
+    test('等待期间处理器没了：按当前能力判断，不调用旧的', async () => {
+      const state = { here: true, filesOpen: true, onCopy: () => (state.filesOpen = false) };
+      const { calls, deps } = make(state);
+      await executeLocalAction([{ type: 'copy', text: 'c' }, { type: 'files.open', path: '/a' }], deps);
+      expect(calls).toEqual(['copy:c', 'blocked:missing:files.open']);
+    });
+
+    test('一开始就缺处理器：整条不执行（插入也不做）', async () => {
+      const { calls, deps } = make({ here: true, filesOpen: false });
+      await executeLocalAction([{ type: 'prompt.insert', text: 'x' }, { type: 'files.open', path: '/a' }], deps);
+      expect(calls).toEqual(['blocked:missing:files.open']);
+    });
+  });
+
+  test('整条动作检查：带 files.open 但本页没有处理器 → 整条不执行', () => {
+    const effects = [{ type: 'prompt.insert' as const, text: 'x' }, { type: 'files.open' as const, path: '/w/a.md' }];
+    expect(missingLocalHandler(effects, {})).toBe('files.open');
+    expect(missingLocalHandler(effects, { filesOpen: () => {} })).toBeUndefined();
+    expect(missingLocalHandler([{ type: 'copy', text: 'x' }], {})).toBeUndefined();
+  });
+
+  test('迟到的 files.open：浏览器已换到别的会话就丢掉', () => {
+    expect(filesOpenTarget('/s/m1/s1', '/s/m1/s1')).toBe('open');
+    expect(filesOpenTarget('/s/m1/s1', '/s/m1/s2')).toBe('drop');
+    expect(filesOpenTarget('/s/m1/s1', '/')).toBe('drop');
   });
 });
 

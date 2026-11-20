@@ -5,13 +5,15 @@
 import { useCallback, useEffect, useMemo, useState, useSyncExternalStore } from 'react';
 import { useNavigate } from 'react-router';
 import { toast } from 'sonner';
-import type { ExtCatalogItem, ExtLocalEffect, ExtPlan, ExtPoint, ExtRecord } from '@trine/core';
+import type { ExtCatalogItem, ExtFeature, ExtFilesOpenEffect, ExtLocalEffect, ExtPlan, ExtPoint, ExtRecord } from '@trine/core';
 import { useClient, useTrine } from '@/app/runtime.ts';
 import { copyText } from '@/lib/clipboard.ts';
 import type { TrineClient } from '@/lib/client.ts';
 import {
-  applyLocalEffects,
+  EXT_CLIENT_INSTANCE,
   ExtCatalogCache,
+  executeLocalAction,
+  filesOpenTarget,
   isNewer,
   mergeRecords,
   readKey,
@@ -21,6 +23,7 @@ import {
   supportsExtRecords,
   type ExtActionPlanEvent,
   type ExtActionResult,
+  type ConfirmOutcome,
   type ExtReadResponse,
   type ReadTarget,
 } from '@/lib/ext-model.ts';
@@ -145,6 +148,10 @@ export function useExtRead(target: ReadTarget | null, options: { watch?: boolean
   const visible = usePageVisible();
   const watch = options.watch === true && visible;
   const query = options.query;
+  // 特性随读取与每次续租发出（agent 的订阅键也按它分，readKey 里也有它）；变了就是另一份结果，
+  // 重读、重建订阅。页面实例一并带上：同一设备换了页面时 agent 作废旧实例的订阅
+  const features = target?.features ?? [];
+  const featureField = { client: EXT_CLIENT_INSTANCE, ...(features.length === 0 ? {} : { features: [...features] }) };
   // agent 重启 / 扩展变更时 rev 会变：重新读取、重建订阅（旧进程的订阅随进程没了）
   const catalogRev = useTrine((s) => (target === null ? undefined : s.machines[target.machineId]?.info?.extensions?.rev));
 
@@ -164,6 +171,7 @@ export function useExtRead(target: ReadTarget | null, options: { watch?: boolean
             ...(target.cwd === undefined ? {} : { cwd: target.cwd }),
             ...(query === undefined || query === '' ? {} : { args: { query } }),
             locale: 'zh-CN',
+            ...featureField,
             ...(extra.force === true ? { force: true } : {}),
             ...(extra.watchTtl === undefined ? {} : { watch: { ttlMs: extra.watchTtl } }),
           } as never,
@@ -196,6 +204,7 @@ export function useExtRead(target: ReadTarget | null, options: { watch?: boolean
           ...(target.cwd === undefined ? {} : { cwd: target.cwd }),
           ...(query === undefined || query === '' ? {} : { args: { query } }),
           locale: 'zh-CN',
+          ...featureField,
           watch: { ttlMs: 0 },
         } as never);
       }
@@ -255,7 +264,9 @@ function usePageVisible(): boolean {
 
 interface ConfirmRequest {
   plan: ExtPlan;
-  resolve: (ok: boolean) => void;
+  /** 计划来自哪台机器（确认框按它的引擎目录给编辑选项） */
+  machineId: string;
+  resolve: (outcome: ConfirmOutcome) => void;
 }
 
 export interface LinkPickerRequest {
@@ -292,16 +303,16 @@ export function useExtUi(): ExtUiState {
   );
 }
 
-export function requestConfirm(plan: ExtPlan): Promise<boolean> {
+export function requestConfirm(plan: ExtPlan, machineId: string): Promise<ConfirmOutcome> {
   // 同时只有一个确认：前一个视为取消
   uiState.confirm?.resolve(false);
-  return new Promise((resolve) => setUi({ confirm: { plan, resolve } }));
+  return new Promise((resolve) => setUi({ confirm: { plan, machineId, resolve } }));
 }
 
-export function settleConfirm(ok: boolean): void {
+export function settleConfirm(outcome: ConfirmOutcome): void {
   const pending = uiState.confirm;
   setUi({ confirm: null });
-  pending?.resolve(ok);
+  pending?.resolve(outcome);
 }
 
 export function openLinkPicker(request: LinkPickerRequest): void {
@@ -331,6 +342,13 @@ export interface ActionContext {
   /** 本地插入到输入框；不在会话页时为 undefined（插入类动作退化为复制） */
   insert?: (text: string) => void;
   refresh: () => void;
+  /** 本设备在这个位置声明的特性（webExtFeatures）；缺省 = 不声明 */
+  features?: readonly ExtFeature[];
+  /**
+   * 取**当前**的 files.open 执行器（只有会话面板、agent 支持文件查看时给）。是 getter：结果可能
+   * 在处理器已经没了之后才回来，执行时按那一刻的能力判断。
+   */
+  filesOpen?: () => ((effect: ExtFilesOpenEffect) => void) | undefined;
 }
 
 /** 执行一个视图动作（local 或 token） */
@@ -349,19 +367,28 @@ export function useExtAction(): (action: { local?: readonly ExtLocalEffect[]; to
       // 迟到的跳转 / 插入不作用到别的页面
       const origin = window.location.pathname;
       const stillHere = (): boolean => window.location.pathname === origin;
-      const apply = async (effects: readonly ExtLocalEffect[]): Promise<void> => {
-        // 同一个动作的多段插入合成一次（逐段插入会被 React 合批成只剩最后一段）
-        const inserts: string[] = [];
-        await applyLocalEffects(effects, {
-          insert: (text) => inserts.push(text),
-          copy: copyWithToast,
-          refresh: ctx.refresh,
+      const features = ctx.features ?? [];
+      const apply = (effects: readonly ExtLocalEffect[]): Promise<void> =>
+        executeLocalAction(effects, {
+          // 每一步都取当前的处理器（ctx.filesOpen 是 getter）：等待期间处理器没了就不再调用旧的
+          handlers: () => {
+            const filesOpen = ctx.filesOpen?.();
+            return {
+              insert: (text) => {
+                if (ctx.insert !== undefined && stillHere()) ctx.insert(text);
+                else void copyWithToast(text);
+              },
+              copy: copyWithToast,
+              refresh: ctx.refresh,
+              ...(filesOpen === undefined ? {} : { filesOpen }),
+            };
+          },
+          stillHere: () => filesOpenTarget(origin, window.location.pathname) === 'open',
+          blocked: (reason, detail) => {
+            if (reason === 'missing') toast.error(`「${action.label}」需要 ${detail ?? '新特性'}，当前页面不支持，没有执行`);
+            else toast.info(`已离开发起「${action.label}」的会话，剩下的没有执行`);
+          },
         });
-        if (inserts.length === 0) return;
-        const text = inserts.join('\n');
-        if (ctx.insert !== undefined && stillHere()) ctx.insert(text);
-        else void copyWithToast(text);
-      };
       if (action.local !== undefined && action.token === undefined) {
         await apply(action.local);
         return;
@@ -370,14 +397,22 @@ export function useExtAction(): (action: { local?: readonly ExtLocalEffect[]; to
       const outcome = await runTokenAction(action.token, {
         uuid: () => crypto.randomUUID(),
         newSessionDefaults: () => newSession,
-        confirm: requestConfirm,
+        confirm: (plan) => requestConfirm(plan, ctx.machineId),
         prepare: (token, invocationId, ns) =>
-          client.extRequest(ctx.machineId, { type: 'ext.action.prepare', token, invocationId, newSession: ns } as never, [
-            'ext.action.plan',
-            'ext.action.result',
-          ]) as Promise<ExtActionPlanEvent | ExtActionResult>,
-        commit: (planId, invocationId) =>
-          client.extRequest(ctx.machineId, { type: 'ext.action.commit', planId, invocationId } as never, [
+          client.extRequest(
+            ctx.machineId,
+            {
+              type: 'ext.action.prepare',
+              token,
+              invocationId,
+              newSession: ns,
+              client: EXT_CLIENT_INSTANCE,
+              ...(features.length === 0 ? {} : { features: [...features] }),
+            } as never,
+            ['ext.action.plan', 'ext.action.result'],
+          ) as Promise<ExtActionPlanEvent | ExtActionResult>,
+        commit: (planId, invocationId, edits) =>
+          client.extRequest(ctx.machineId, { type: 'ext.action.commit', planId, invocationId, ...(edits === undefined ? {} : { edits }) } as never, [
             'ext.action.result',
             'ext.action.plan',
           ]) as Promise<ExtActionResult>,
@@ -399,7 +434,9 @@ export function useExtAction(): (action: { local?: readonly ExtLocalEffect[]; to
         client.adoptAgentSentInput(ctx.machineId, result.sent.targetSessionId, result.sent.clientMsgId, result.sent.text);
       }
       if (result.local !== undefined) await apply(result.local);
-      if (result.message !== undefined) toast.success(result.message);
+      // 扩展已执行、返回的效果被丢弃：警示「勿直接重试」，不当作普通成功提示
+      if (result.effectsDropped === true) toast.warning(result.message ?? `「${action.label}」已执行，但后续效果当前页面不支持，已丢弃，请勿直接重试`);
+      else if (result.message !== undefined) toast.success(result.message);
       ctx.refresh();
       if (result.createdSessionId !== undefined) {
         const path = `/s/${encodeURIComponent(ctx.machineId)}/${encodeURIComponent(result.createdSessionId)}`;

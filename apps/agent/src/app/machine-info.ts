@@ -66,7 +66,27 @@ import type {
 //   支持 machine.engine.update.request / machine.engine.check.request
 // - 0.23.0 起引擎由 Homebrew、apt 安装时更新和版本检查走包管理器；MachineInfo.claudeLatest、
 //   EngineSummary 带 install（实际的更新命令）
-export const AGENT_VERSION = '0.23.0';
+// - 0.24.0 起支持信任目录（files.trust.add / remove，`~/.trine/files.json`）：MachineInfo.files 带
+//   roots / home（web 按 roots 有无判断）；fs.* 的 denied 带 reason；/proc /sys /dev 一律拒绝
+// - 0.25.0 起 tool.start / history tool 条目带 argDetail（长命令原文）；MachineInfo.rateLimits 带
+//   models（按模型计的周限额，如 Fable）。都是可选字段，web 按有无判断
+// - 0.26.0 起置顶工作区可调顺序（cwd.json pinOrder、cwd.pin.move，MachineInfo.cwd.pinOrder 能力位）；
+//   tool.start / tool.end / history tool 条目带 subagent（子 agent 类型、前后台、状态），permission.request
+//   可带 subagentId，Codex 子 agent 的审批路由到父会话；扩展特性协商（ext.read / ext.action.prepare 的
+//   features、client，MachineInfo.extensions.features）与本地效果 files.open。web 都按字段 / 能力位判断
+// - 0.27.0 起支持新建会话前检查 / 创建工作目录（cwd.prepare.request，MachineInfo.cwd.create 能力位）
+// - 0.28.0 起支持重启引擎的后台进程（machine.engine.restart.request，EngineCapabilities.restart；
+//   Codex：换掉 trine 的 app-server、常驻 daemon 在跑时一并重启，换账号后重新读登录）
+// - 0.29.0 起引擎自动起的会话标题随 session.updated 推送（Claude Code 轮末查转录里的 aiTitle，
+//   Codex 接 thread/name/updated），不用重新列会话。协议不变
+// - 0.29.1 起历史读取出错时 session.history.response 带 error 回给请求方（不再发会话级 error.fatal）；
+//   Codex 新会话首轮落盘前拉历史返回空页，不再撞上 rollout 空文件的内部错误
+// - 0.30.0 起文件书签存在 agent（files.bookmark.add / remove，`~/.trine/bookmarks.json`），
+//   MachineInfo.files 带 bookmarks，所有已配对设备同步（web 按 bookmarks 有无判断，旧 agent 退回本设备存储）
+// - 0.31.0 起引擎可自动更新（machine.engine.autoupdate.set，`~/.trine/engine-auto-update.json`，
+//   EngineSummary.autoUpdate 有无即能力位）；扩展执行计划确认时可改新会话的引擎配置与首条消息
+//   （ext.action.commit.edits，MachineInfo.extensions.planEdit），扩展建会话可走 Codex
+export const AGENT_VERSION = '0.31.0';
 
 export function buildMachineInfo(input: {
   name: string;
@@ -94,5 +114,8 @@ export function buildMachineInfo(input: {
     ...(input.claudeLatest === undefined ? {} : { claudeLatest: input.claudeLatest }),
     ...(input.files === undefined ? {} : { files: input.files }),
     ...(input.engines === undefined ? {} : { engines: input.engines }),
+    // 置顶工作区的手动顺序（cwd.pin.move、cwd 快照带 pinOrder）；web 按这一位判断，不按版本号
+    // create：认识 cwd.prepare.request（新建会话前检查 / 创建工作目录）
+    cwd: { pinOrder: true, create: true },
   };
 }

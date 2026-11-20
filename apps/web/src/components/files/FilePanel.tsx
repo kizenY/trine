@@ -1,87 +1,47 @@
 /**
- * 文件面板：桌面右侧宽抽屉、手机全屏。两种视图——目录（FileList）与文件（FileBody）——
- * 由调用方（聊天页，经 URL 查询参数）决定，面板只负责加载与渲染。
+ * 文件抽屉：桌面右侧宽抽屉、手机全屏。两种视图——目录（FileDirView）与文件（FileDocView）——
+ * 由调用方（聊天页，经 URL 查询参数）决定；视图本身与容器无关（工作区 tab 也用），
+ * 这里只提供 Dialog 外壳（SheetTitle / SheetDescription）与视图的内容状态。
  *
  * 加载经 client.listFiles / client.openFile（agent 读、加密上传 blob、这里解密）。
  * 同一文件第二次打开用缓存，「刷新」重新向 agent 要。
  */
-import { useCallback, useEffect, useState } from 'react';
-import {
-  ArrowLeftIcon,
-  DownloadIcon,
-  EyeIcon,
-  EyeOffIcon,
-  FolderOpenIcon,
-  RefreshCwIcon,
-  WrapTextIcon,
-  XIcon,
-} from 'lucide-react';
-import { useClient } from '@/app/runtime.ts';
-import { FsRequestError, RequestTimeoutError, type FsListing, type OpenedFile } from '@/lib/client.ts';
-import { formatBytes, formatDateTime } from '@/lib/format.ts';
-import { cn } from '@/lib/utils.ts';
+import { useRef, useState } from 'react';
+import { useLocation } from 'react-router';
+import { PanelRightOpenIcon } from 'lucide-react';
 import { Button } from '@/components/ui/button.tsx';
+import { lastInputWasPointer } from '@/lib/input-modality.ts';
+import { cn } from '@/lib/utils.ts';
 import { Sheet, SheetContent, SheetDescription, SheetTitle } from '@/components/ui/sheet.tsx';
 import { useIsDesktop } from '@/components/shell/use-media-query.ts';
-import { Breadcrumbs, FileList } from './FileBrowser.tsx';
-import { FileBody } from './FileViewer.tsx';
-import { displayPath, parentDir } from './file-model.ts';
+import { FileDirView } from './FileDirView.tsx';
+import { FileDocView, type FileDocCapture } from './FileDocView.tsx';
+import { useFileLinks, type FileOpenTarget } from './file-links.ts';
+import type { FileViewChrome } from './ViewHeader.tsx';
+import { DEFAULT_DIR_MODEL, DEFAULT_DOC_MODEL, type FileDirModel, type FileDocModel } from './view-model.ts';
 
-/**
- * 点开头的条目默认显示：`.local`、`.claude` 这类目录正是在 trine 里常看的；
- * 用户关掉后记在本设备（localStorage），下次打开沿用。
- */
-const SHOW_HIDDEN_KEY = 'trine.files.showHidden';
+export { fileErrorText } from './use-file-load.ts';
 
-function readShowHidden(): boolean {
-  try {
-    return globalThis.localStorage?.getItem(SHOW_HIDDEN_KEY) !== '0';
-  } catch {
-    return true;
-  }
+/** 抽屉当前显示什么；`fragment` 是打开文件后要定位的锚点（不进 URL 查询参数） */
+export type FileView = { kind: 'dir'; path?: string } | { kind: 'file'; path: string; fragment?: string };
+
+/** 抽屉的标题 / 说明：用 Sheet 的，提供 Dialog 的可访问名称与描述 */
+function DrawerTitle({ className, children }: { className?: string; children?: React.ReactNode }): React.JSX.Element {
+  return <SheetTitle className={className}>{children}</SheetTitle>;
 }
 
-function writeShowHidden(value: boolean): void {
-  try {
-    globalThis.localStorage?.setItem(SHOW_HIDDEN_KEY, value ? '1' : '0');
-  } catch {
-    // 隐私模式等写不了：只影响下次的默认值
-  }
+function DrawerDescription({ className, children }: { className?: string; children?: React.ReactNode }): React.JSX.Element {
+  return (
+    <SheetDescription asChild>
+      <div className={className}>{children}</div>
+    </SheetDescription>
+  );
 }
 
-export type FileView = { kind: 'dir'; path?: string } | { kind: 'file'; path: string };
-
-type Load<T> = { state: 'loading' } | { state: 'ok'; value: T } | { state: 'error'; message: string };
-
-/** 错误给人看的话：agent 的原话已经是中文，补上该怎么办 */
-export function fileErrorText(err: unknown): string {
-  if (err instanceof FsRequestError) {
-    if (err.code === 'unavailable') return `${err.message}（agent 设置了 TRINE_FILES=off，或还没连上 relay）`;
-    return err.message;
-  }
-  if (err instanceof RequestTimeoutError) return 'agent 没有应答（可能离线或版本过旧）';
-  return err instanceof Error ? err.message : String(err);
-}
-
-/** 按 deps 加载；reload() 强制再跑一次（「刷新」由调用方在 fn 里决定要不要绕过缓存） */
-function useLoad<T>(fn: (() => Promise<T>) | null, deps: readonly unknown[]): [Load<T>, () => void] {
-  const [load, setLoad] = useState<Load<T>>({ state: 'loading' });
-  const [tick, setTick] = useState(0);
-  useEffect(() => {
-    if (fn === null) return;
-    let alive = true;
-    setLoad({ state: 'loading' });
-    fn().then(
-      (value) => alive && setLoad({ state: 'ok', value }),
-      (err: unknown) => alive && setLoad({ state: 'error', message: fileErrorText(err) }),
-    );
-    return () => {
-      alive = false;
-    };
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- fn 每次渲染都是新的，按 deps 与 tick 触发
-  }, [...deps, tick]);
-  const reload = useCallback(() => setTick((t) => t + 1), []);
-  return [load, reload];
+/** 抽屉交给工作区的内容：当前视图 + 内容状态（模式、换行、滚动） */
+export interface DrawerHandoff {
+  view: FileView;
+  state: Partial<FileDocModel> & Partial<FileDirModel>;
 }
 
 export function FilePanel({
@@ -90,6 +50,7 @@ export function FilePanel({
   view,
   onNavigate,
   onClose,
+  onHandoff,
 }: {
   machineId: string;
   sessionId: string;
@@ -97,239 +58,151 @@ export function FilePanel({
   view: FileView | null;
   onNavigate: (view: FileView) => void;
   onClose: () => void;
+  /** 「在工作区打开」（桌面且工作区可用时给） */
+  onHandoff?: ((handoff: DrawerHandoff) => void) | undefined;
 }): React.JSX.Element {
   const desktop = useIsDesktop();
+  const location = useLocation();
+  const stateKey = view === null ? '' : `${machineId}|${sessionId}|${location.key}|${view.kind}|${view.path ?? ''}`;
+  // 视图此刻的内容状态（交接时同步读：滚动上报有防抖，记忆里的可能是旧的）
+  const captureRef = useRef<(() => FileDocCapture | FileDirModel) | null>(null);
+  const handoff = (target: FileView): DrawerHandoff => {
+    const captured = captureRef.current?.() ?? drawerState.get(stateKey) ?? {};
+    const { fragmentPending, ...state } = captured as Partial<FileDocCapture>;
+    // 锚点还没定位完：保留 fragment（交给工作区去定位），只带模式 / 换行；
+    // 定位完了：当前滚动位置已包含定位结果，用它代替 fragment
+    if (target.kind === 'file' && target.fragment !== undefined && fragmentPending === true) {
+      return { view: target, state: { ...(state.mode === undefined ? {} : { mode: state.mode }), ...(state.wrap === undefined ? {} : { wrap: state.wrap }) } };
+    }
+    return { view: target.kind === 'file' ? { kind: 'file', path: target.path } : target, state };
+  };
+  const chrome: FileViewChrome = {
+    Title: DrawerTitle,
+    Description: DrawerDescription,
+    onClose,
+    ...(onHandoff === undefined || view === null
+      ? {}
+      : {
+          actions: (
+            <Button
+              size="icon-sm"
+              variant="ghost"
+              data-testid="file-to-workspace"
+              aria-label="在工作区打开"
+              title="在工作区打开（保留为 tab，可与聊天并排）"
+              // 点的这一刻抓内容状态（同步读滚动容器，读不到才用记忆）
+              onClick={() => onHandoff(handoff(view))}
+            >
+              <PanelRightOpenIcon />
+            </Button>
+          ),
+        }),
+  };
+  const links = useFileLinks();
+  // 抽屉内普通点击就地导航（push 历史）；显式 side（Alt+点击）走完整打开 intent，由路由决定去处
+  const browse = (dir?: string, target?: FileOpenTarget): void => {
+    if (target === 'side' && links !== null) links.open(dir === undefined ? { dir: true, target } : { dir: true, path: dir, target });
+    else onNavigate(dir === undefined ? { kind: 'dir' } : { kind: 'dir', path: dir });
+  };
+  const openFile = (path: string, target: FileOpenTarget): void => {
+    if (target === 'side' && links !== null) links.open({ path, target });
+    else onNavigate({ kind: 'file', path });
+  };
   return (
     <Sheet open={view !== null} onOpenChange={(open) => !open && onClose()}>
       <SheetContent
         side="right"
         showCloseButton={false}
         data-testid="file-panel"
+        // 指针打开：焦点落在抽屉容器上（不给第一个按钮套焦点框）；键盘打开：沿用默认（第一个可聚焦元素）
+        onOpenAutoFocus={(e) => {
+          if (!lastInputWasPointer()) return;
+          e.preventDefault();
+          (e.currentTarget as HTMLElement | null)?.focus({ preventScroll: true });
+        }}
         // Sheet 自带 data-[side=right]:w-3/4 / sm:max-w-sm，要用同样的 data 变体才压得住
         className={cn(
-          'gap-0',
+          'gap-0 outline-none',
           desktop
             ? 'data-[side=right]:w-[min(56rem,92vw)] data-[side=right]:sm:max-w-none'
             : 'data-[side=right]:w-full data-[side=right]:max-w-none data-[side=right]:border-l-0 data-[side=right]:sm:max-w-none',
         )}
       >
         {view?.kind === 'file' && (
-          <FilePane key={view.path} machineId={machineId} sessionId={sessionId} path={view.path} onNavigate={onNavigate} onClose={onClose} />
+          <DrawerDoc
+            // 换文件或换锚点都重挂：每次打开从头定位（内容走缓存，不会重新下载）
+            key={`${view.path}#${view.fragment ?? ''}`}
+            cacheKey={`${machineId}|${sessionId}|${location.key}|file|${view.path}`}
+            machineId={machineId}
+            sessionId={sessionId}
+            path={view.path}
+            fragment={view.fragment}
+            onBrowse={browse}
+            chrome={chrome}
+            captureRef={captureRef as React.RefObject<(() => FileDocCapture) | null>}
+          />
         )}
         {view?.kind === 'dir' && (
-          <DirPane key={view.path ?? ''} machineId={machineId} sessionId={sessionId} path={view.path} onNavigate={onNavigate} onClose={onClose} />
+          <DrawerDir
+            key={view.path ?? ''}
+            cacheKey={`${machineId}|${sessionId}|${location.key}|dir|${view.path ?? ''}`}
+            machineId={machineId}
+            sessionId={sessionId}
+            path={view.path}
+            onBrowse={browse}
+            onOpenFile={openFile}
+            chrome={chrome}
+            captureRef={captureRef as React.RefObject<(() => FileDirModel) | null>}
+          />
         )}
       </SheetContent>
     </Sheet>
   );
 }
 
-function PanelHeader({
-  title,
-  description,
-  children,
-  onBack,
-  backTitle,
-  onClose,
-}: {
-  title: React.ReactNode;
-  description?: React.ReactNode;
-  children?: React.ReactNode;
-  onBack?: () => void;
-  backTitle?: string;
-  onClose: () => void;
-}): React.JSX.Element {
-  return (
-    <div className="border-border flex shrink-0 items-start gap-2 border-b px-3 pt-[max(0.75rem,env(safe-area-inset-top))] pb-2">
-      {onBack !== undefined && (
-        <Button size="icon-sm" variant="ghost" aria-label={backTitle} title={backTitle} onClick={onBack} data-testid="file-panel-up">
-          <ArrowLeftIcon />
-        </Button>
-      )}
-      <div className="min-w-0 flex-1 pt-0.5">
-        <SheetTitle className="truncate text-[14px] font-semibold">{title}</SheetTitle>
-        <SheetDescription asChild>
-          <div className="text-text-3 mt-0.5 text-[12px]">{description}</div>
-        </SheetDescription>
-      </div>
-      <div className="flex shrink-0 items-center gap-0.5">
-        {children}
-        <Button size="icon-sm" variant="ghost" aria-label="关闭" title="关闭" onClick={onClose} data-testid="file-panel-close">
-          <XIcon />
-        </Button>
-      </div>
-    </div>
-  );
+/**
+ * 抽屉的内容状态（模式、换行、滚动）按「历史条目 + 视图」记在内存里：
+ * 外壳在 900px 断点切换桌面 / 手机布局时整个聊天页（连同抽屉）会重挂，没有这层记忆滚动位置就归零；
+ * 返回到某条历史时也回到当时的位置。只存小字段，不存内容；不持久化（刷新页面即清空）。
+ */
+const DRAWER_STATE_MAX = 40;
+const drawerState = new Map<string, FileDocModel | FileDirModel>();
+
+function rememberDrawer(key: string, model: FileDocModel | FileDirModel): void {
+  drawerState.delete(key);
+  drawerState.set(key, model);
+  while (drawerState.size > DRAWER_STATE_MAX) drawerState.delete(drawerState.keys().next().value!);
 }
 
-function ErrorBox({ message, onRetry }: { message: string; onRetry: () => void }): React.JSX.Element {
-  return (
-    <div data-testid="file-error" className="flex flex-col items-center gap-3 p-10 text-center text-[13px]">
-      <div className="text-danger">{message}</div>
-      <Button size="sm" variant="outline" onClick={onRetry}>
-        重试
-      </Button>
-    </div>
-  );
+/** 测试用：清空抽屉的内容状态记忆 */
+export function resetDrawerState(): void {
+  drawerState.clear();
 }
 
-function FilePane({
-  machineId,
-  sessionId,
-  path,
-  onNavigate,
-  onClose,
-}: {
-  machineId: string;
-  sessionId: string;
-  path: string;
-  onNavigate: (view: FileView) => void;
-  onClose: () => void;
-}): React.JSX.Element {
-  const client = useClient();
-  const [refresh, setRefresh] = useState(false);
-  const [mode, setMode] = useState<'rendered' | 'source'>('rendered');
-  const [wrap, setWrap] = useState(false);
-  const [load, reload] = useLoad<OpenedFile>(
-    client === null ? null : () => client.openFile(machineId, sessionId, path, { refresh }),
-    [client, machineId, sessionId, path],
-  );
-  const opened = load.state === 'ok' ? load.value : undefined;
-  const file = opened?.file;
-  const doRefresh = (): void => {
-    setRefresh(true);
-    reload();
+function useDrawerModel<T extends FileDocModel | FileDirModel>(cacheKey: string, initial: T): [T, (patch: Partial<T>) => void, boolean] {
+  const [restored] = useState(() => drawerState.has(cacheKey));
+  const [model, setModel] = useState<T>(() => (drawerState.get(cacheKey) as T | undefined) ?? initial);
+  const update = (patch: Partial<T>): void => {
+    // 卸载时视图还会补报最后的滚动位置：直接写进记忆，不依赖 setState
+    const next = { ...((drawerState.get(cacheKey) as T | undefined) ?? model), ...patch };
+    rememberDrawer(cacheKey, next);
+    setModel(next);
   };
-  return (
-    <>
-      <PanelHeader
-        title={file?.name ?? path.slice(path.lastIndexOf('/') + 1)}
-        description={
-          file === undefined ? (
-            <span className="font-mono break-all">{path}</span>
-          ) : (
-            <span className="flex flex-col gap-0.5">
-              <Breadcrumbs path={parentDir(file.path)} root={file.root} onBrowse={(dir) => onNavigate({ kind: 'dir', path: dir })} />
-              <span>
-                {formatBytes(file.size)} · 修改于 {formatDateTime(file.mtime)}
-              </span>
-            </span>
-          )
-        }
-        onBack={() => onNavigate({ kind: 'dir', ...(file === undefined ? {} : { path: parentDir(file.path) }) })}
-        backTitle="所在目录"
-        onClose={onClose}
-      >
-        {file?.kind === 'markdown' && (
-          <Button
-            size="icon-sm"
-            variant="ghost"
-            data-testid="file-toggle-source"
-            aria-pressed={mode === 'source'}
-            title={mode === 'rendered' ? '查看源码' : '查看渲染效果'}
-            onClick={() => setMode((m) => (m === 'rendered' ? 'source' : 'rendered'))}
-          >
-            {mode === 'rendered' ? <EyeOffIcon /> : <EyeIcon />}
-          </Button>
-        )}
-        {(file?.kind === 'text' || (file?.kind === 'markdown' && mode === 'source')) && (
-          <Button size="icon-sm" variant="ghost" aria-pressed={wrap} title="自动换行" onClick={() => setWrap((w) => !w)} className={cn(wrap && 'text-brand')}>
-            <WrapTextIcon />
-          </Button>
-        )}
-        <Button size="icon-sm" variant="ghost" title="刷新" aria-label="刷新" onClick={doRefresh} disabled={load.state === 'loading'} data-testid="file-refresh">
-          <RefreshCwIcon className={cn(load.state === 'loading' && 'motion-safe:animate-spin')} />
-        </Button>
-        {opened !== undefined && (
-          <Button asChild size="icon-sm" variant="ghost" title="下载">
-            <a href={opened.url} download={opened.file.name} aria-label="下载" data-testid="file-download">
-              <DownloadIcon />
-            </a>
-          </Button>
-        )}
-      </PanelHeader>
-      <div className="min-h-0 flex-1 overflow-auto pb-[env(safe-area-inset-bottom)]">
-        {load.state === 'loading' && <div className="text-text-3 p-6 text-[13px]">正在读取…</div>}
-        {load.state === 'error' && <ErrorBox message={load.message} onRetry={doRefresh} />}
-        {opened !== undefined && <FileBody opened={opened} mode={mode} wrap={wrap} />}
-      </div>
-    </>
-  );
+  return [model, update, restored];
 }
 
-function DirPane({
-  machineId,
-  sessionId,
-  path,
-  onNavigate,
-  onClose,
-}: {
-  machineId: string;
-  sessionId: string;
-  path: string | undefined;
-  onNavigate: (view: FileView) => void;
-  onClose: () => void;
-}): React.JSX.Element {
-  const client = useClient();
-  const [showHidden, setShowHidden] = useState(readShowHidden);
-  const toggleHidden = (): void =>
-    setShowHidden((v) => {
-      writeShowHidden(!v);
-      return !v;
-    });
-  const [load, reload] = useLoad<FsListing>(
-    client === null ? null : () => client.listFiles(machineId, sessionId, path),
-    [client, machineId, sessionId, path],
-  );
-  const listing = load.state === 'ok' ? load.value : undefined;
-  const atRoot = listing === undefined || listing.path === listing.root;
-  return (
-    <>
-      <PanelHeader
-        title={
-          <span className="flex items-center gap-1.5">
-            <FolderOpenIcon className="text-brand size-4" />
-            {listing === undefined ? '文件' : displayPath(listing.path, listing.root) === '.' ? '会话目录' : listing.path.slice(listing.path.lastIndexOf('/') + 1)}
-          </span>
-        }
-        description={
-          listing === undefined ? (
-            <span className="font-mono break-all">{path ?? '会话目录'}</span>
-          ) : (
-            <Breadcrumbs path={listing.path} root={listing.root} onBrowse={(dir) => onNavigate({ kind: 'dir', path: dir })} />
-          )
-        }
-        {...(atRoot || listing === undefined ? {} : { onBack: () => onNavigate({ kind: 'dir', path: parentDir(listing.path) }), backTitle: '上一级' })}
-        onClose={onClose}
-      >
-        <Button
-          size="sm"
-          variant="ghost"
-          data-testid="file-toggle-hidden"
-          aria-pressed={showHidden}
-          title={showHidden ? '不显示点开头的文件和目录（.git、.env 等）' : '显示点开头的文件和目录'}
-          onClick={toggleHidden}
-          className="text-text-2 h-7 gap-1 px-2 text-[12px]"
-        >
-          {showHidden ? <EyeIcon /> : <EyeOffIcon />}
-          {showHidden ? '隐藏 .文件' : '显示 .文件'}
-        </Button>
-        <Button size="icon-sm" variant="ghost" title="刷新" aria-label="刷新" onClick={reload} disabled={load.state === 'loading'}>
-          <RefreshCwIcon className={cn(load.state === 'loading' && 'motion-safe:animate-spin')} />
-        </Button>
-      </PanelHeader>
-      <div className="min-h-0 flex-1 overflow-auto pb-[env(safe-area-inset-bottom)]">
-        {load.state === 'loading' && <div className="text-text-3 p-6 text-[13px]">正在读取…</div>}
-        {load.state === 'error' && <ErrorBox message={load.message} onRetry={reload} />}
-        {listing !== undefined && (
-          <FileList
-            listing={listing}
-            showHidden={showHidden}
-            onBrowse={(dir) => onNavigate({ kind: 'dir', path: dir })}
-            onOpen={(p) => onNavigate({ kind: 'file', path: p })}
-          />
-        )}
-      </div>
-    </>
-  );
+function DrawerDoc({
+  fragment,
+  cacheKey,
+  ...props
+}: Omit<React.ComponentProps<typeof FileDocView>, 'model' | 'onModelChange' | 'fragment'> & { fragment: string | undefined; cacheKey: string }): React.JSX.Element {
+  const [model, update, restored] = useDrawerModel<FileDocModel>(cacheKey, DEFAULT_DOC_MODEL);
+  // 重挂回来的（同一条历史）：回到当时的位置，不再按锚点重新跳
+  const effectiveFragment = restored ? undefined : fragment;
+  return <FileDocView {...props} {...(effectiveFragment === undefined ? {} : { fragment: effectiveFragment })} model={model} onModelChange={update} />;
+}
+
+function DrawerDir({ cacheKey, ...props }: Omit<React.ComponentProps<typeof FileDirView>, 'model' | 'onModelChange'> & { cacheKey: string }): React.JSX.Element {
+  const [model, update] = useDrawerModel<FileDirModel>(cacheKey, DEFAULT_DIR_MODEL);
+  return <FileDirView {...props} model={model} onModelChange={update} />;
 }

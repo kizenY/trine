@@ -45,6 +45,7 @@ import {
   EXT_RECORDS_PER_SESSION,
   ExtBadgeSchema,
   ExtErrorSchema,
+  ExtFeatureListSchema,
   ExtIdSchema,
   ExtLinkRefSchema,
   ExtLocalEffectSchema,
@@ -66,7 +67,9 @@ import {
   SessionMetaSchema,
   SessionStateSchema,
   SlashCommandSchema,
+  SubagentInfoSchema,
   TimestampSchema,
+  ToolArgDetailSchema,
   ToolResultStatusSchema,
 } from '../types/index.ts';
 
@@ -180,8 +183,15 @@ export const ToolStartSchema = z.object({
    * argSummary 会把长路径缩成 `…/a/b`，client 要打开文件预览得用这个。旧 client 忽略。
    */
   filePath: z.string().min(1).max(4096).optional(),
+  /** 完整参数（命令原文，保留换行）；只在 argSummary 被压成单行或截断时带，见 ToolArgDetailSchema */
+  argDetail: ToolArgDetailSchema.optional(),
   /** 子 agent 的工具调用：父 Agent/Task 工具的 toolUseId（见 ParentToolUseIdSchema） */
   parentToolUseId: ParentToolUseIdSchema.optional(),
+  /**
+   * 子 agent 卡的附加信息（类型、前台/后台、目标状态、昵称…，见 SubagentInfoSchema）。
+   * 同一 toolUseId 可重发 tool.start 只为更新它（client 原地合并，结果与子树保留）。
+   */
+  subagent: SubagentInfoSchema.optional(),
 });
 
 export const ToolEndSchema = z.object({
@@ -196,6 +206,11 @@ export const ToolEndSchema = z.object({
   outputPreview: z.string().optional(),
   /** 同 tool.start：子 agent 的工具调用带父 toolUseId */
   parentToolUseId: ParentToolUseIdSchema.optional(),
+  /**
+   * 同 tool.start 的 subagent。启动工具返回（tool.end）≠ 子 agent 结束：后台启动时带
+   * `background: true`；后台子 agent 结束时 agent 再发一帧同 id 的 tool.end 收尾并带 `state`
+   */
+  subagent: SubagentInfoSchema.optional(),
 });
 
 // ---------------------------------------------------------------------------
@@ -281,6 +296,11 @@ export const PermissionRequestSchema = z.object({
    * task_started 建的映射查得；查不到就不带。client 据此在卡片上标注来源。
    */
   parentToolUseId: ParentToolUseIdSchema.optional(),
+  /**
+   * 来自子 agent 但对不上派生卡时（Codex 子 thread 经 rootTurnId / thread/read 认亲）：子 thread 的 id，
+   * client 显示「来自子 agent · 短 id」，不让它看起来像父会话自己的审批。可选，旧 client 忽略
+   */
+  subagentId: z.string().min(1).max(128).optional(),
   options: z.array(PermissionOptionSchema).max(8).optional(),
 });
 
@@ -568,8 +588,8 @@ export const AttachmentFetchResponseSchema = z.object({
 /**
  * 在会话上下文里浏览 / 预览 agent 机器上的文件（只读）。
  *
- * 范围由 agent 决定：会话 cwd 及其子目录，加上 agent 环境变量 `TRINE_FILES_ALLOW`
- * 列出的目录；符号链接按真实路径判断；密钥类文件（`.env`、私钥、`.ssh`、`.git` 内部、
+ * 范围由 agent 决定：会话 cwd 及其子目录，加上信任目录（agent 环境变量 `TRINE_FILES_ALLOW`
+ * 与可远程增删的 `files.trust.*` 列表）；符号链接按真实路径判断；密钥类文件（`.env`、私钥、`.ssh`、`.git` 内部、
  * trine 自己的 home）一律拒绝。与 attachment.fetch 一样**不拉起会话进程**，只定向回请求方。
  *
  * `path` 可以是绝对路径、`~` 开头，或相对会话 cwd 的相对路径。
@@ -583,7 +603,15 @@ export const FS_READ_DEFAULT_MAX_BYTES = 20 * 1024 * 1024;
 export const FsErrorCodeSchema = z.enum(['not_found', 'denied', 'too_large', 'is_dir', 'not_dir', 'io', 'unavailable']);
 export type FsErrorCode = z.infer<typeof FsErrorCodeSchema>;
 
-const FsErrorSchema = z.object({ code: FsErrorCodeSchema, message: z.string().max(500) });
+/**
+ * `denied` 的细分（trusted-browse-dirs，agent ≥ 0.24.0；旧 agent 不带）：
+ * - `out_of_scope` 不在会话目录 / 信任目录之内（client 可以提供「信任此目录」入口）
+ * - `sensitive`    密钥类路径、系统伪文件系统等不可覆盖的拒绝（不提供信任入口）
+ */
+export const FsDeniedReasonSchema = z.enum(['out_of_scope', 'sensitive']);
+export type FsDeniedReason = z.infer<typeof FsDeniedReasonSchema>;
+
+const FsErrorSchema = z.object({ code: FsErrorCodeSchema, message: z.string().max(500), reason: FsDeniedReasonSchema.optional() });
 
 /** 预览方式：markdown 渲染 / 文本（含源码）/ pdf / 图片 / 其他（只能下载） */
 export const FsFileKindSchema = z.enum(['markdown', 'text', 'pdf', 'image', 'binary']);
@@ -615,7 +643,10 @@ export const FsListResponseSchema = z.object({
   ok: z.boolean(),
   /** 解析后的绝对路径 */
   path: z.string().max(FS_PATH_MAX).optional(),
-  /** 命中的根目录（会话 cwd 或白名单里的一项）；面包屑从这里开始，不能往上 */
+  /**
+   * 命中的根目录（会话 cwd、TRINE_FILES_ALLOW 或信任目录里的一项）。根之上能不能浏览由 agent
+   * 按请求判断（往上走到范围外回 denied + reason out_of_scope）。
+   */
   root: z.string().max(FS_PATH_MAX).optional(),
   entries: z.array(FsEntrySchema).max(FS_LIST_MAX_ENTRIES).optional(),
   truncated: z.boolean().optional(),
@@ -651,6 +682,90 @@ export const FsReadResponseSchema = z.object({
   ok: z.boolean(),
   file: FsFileSchema.optional(),
   error: FsErrorSchema.optional(),
+});
+
+/**
+ * 信任目录（trusted-browse-dirs，agent ≥ 0.24.0，client 按 machine.info.files.roots 有无判断）：
+ * 机器级、agent 端持久化的目录列表，除会话 cwd 外这些目录及其子目录也可浏览（密钥类照样拒绝）。
+ * 对这台机器的所有会话、所有已配对设备生效。增删成功后 agent 重发 `machine.info`。
+ *
+ * `path` 须为绝对路径或 `~` 开头；agent 校验存在且是目录、不是 `/`、不在密钥类路径里。
+ * remove 按 add 时存下的路径（machine.info.files.roots[].path）匹配。
+ */
+export const FILES_TRUSTED_MAX = 64;
+
+export const FilesTrustAddSchema = z.object({
+  type: z.literal('files.trust.add'),
+  ...c2aBase,
+  reqId: ReqIdSchema,
+  path: z.string().min(1).max(FS_PATH_MAX),
+});
+
+export const FilesTrustRemoveSchema = z.object({
+  type: z.literal('files.trust.remove'),
+  ...c2aBase,
+  reqId: ReqIdSchema,
+  path: z.string().min(1).max(FS_PATH_MAX),
+});
+
+/**
+ * 失败原因：
+ * - `invalid`   路径格式不对（相对路径、含 NUL）
+ * - `not_found` 不存在或不是目录
+ * - `denied`    `/`、密钥类路径、trine home 之内
+ * - `limit`     已到上限 FILES_TRUSTED_MAX
+ * - `not_trusted` remove 时不在列表里（含 TRINE_FILES_ALLOW 来源，网页不能删）
+ * - `failed`    其他错误（写文件失败）
+ */
+export const FilesTrustErrorCodeSchema = z.enum(['invalid', 'not_found', 'denied', 'limit', 'not_trusted', 'failed']);
+export type FilesTrustErrorCode = z.infer<typeof FilesTrustErrorCodeSchema>;
+
+export const FilesTrustResponseSchema = z.object({
+  type: z.literal('files.trust.response'),
+  ...a2cBase,
+  reqId: ReqIdSchema,
+  ok: z.boolean(),
+  /** 成功时：实际存下的路径（resolve 过、`~` 已展开） */
+  path: z.string().max(FS_PATH_MAX).optional(),
+  error: z.object({ code: FilesTrustErrorCodeSchema, message: z.string().max(500) }).optional(),
+});
+
+/**
+ * 文件书签（file-bookmarks，agent ≥ 0.30.0，client 按 machine.info.files.bookmarks 有无判断）：
+ * 机器级、agent 端持久化（`~/.trine/bookmarks.json`），所有已配对设备共享。增删成功后 agent
+ * 重发 `machine.info`。书签只是快捷入口，不扩大可浏览范围，agent 不检查路径是否存在。
+ *
+ * - add：`path` 须为绝对路径（不含 NUL），agent 规范化（去掉 `.`/`..`、末尾 `/`）后存下；
+ *   已存在则移到最前（kind 以这次为准）；超出 FILES_BOOKMARKS_MAX 丢最旧的
+ * - remove：按存下的路径匹配；不在列表里也算成功（多设备同时删不报错）
+ */
+export const FilesBookmarkAddSchema = z.object({
+  type: z.literal('files.bookmark.add'),
+  ...c2aBase,
+  reqId: ReqIdSchema,
+  path: z.string().min(1).max(FS_PATH_MAX),
+  kind: z.enum(['dir', 'file']),
+});
+
+export const FilesBookmarkRemoveSchema = z.object({
+  type: z.literal('files.bookmark.remove'),
+  ...c2aBase,
+  reqId: ReqIdSchema,
+  path: z.string().min(1).max(FS_PATH_MAX),
+});
+
+/** `invalid` 路径不是绝对路径或含 NUL；`failed` 其他（关闭了文件查看、写文件失败） */
+export const FilesBookmarkErrorCodeSchema = z.enum(['invalid', 'failed']);
+export type FilesBookmarkErrorCode = z.infer<typeof FilesBookmarkErrorCodeSchema>;
+
+export const FilesBookmarkResponseSchema = z.object({
+  type: z.literal('files.bookmark.response'),
+  ...a2cBase,
+  reqId: ReqIdSchema,
+  ok: z.boolean(),
+  /** 成功时：实际存下 / 删掉的路径（规范化过） */
+  path: z.string().max(FS_PATH_MAX).optional(),
+  error: z.object({ code: FilesBookmarkErrorCodeSchema, message: z.string().max(500) }).optional(),
 });
 
 // ---------------------------------------------------------------------------
@@ -1060,6 +1175,10 @@ export const SessionHistoryRequestSchema = z.object({
  * 整帧体积由 agent 封顶（会进服务端离线补发存储），超了就少给几条并置
  * `hasMore`；`hasMore` 时 `nextBefore` 即翻下一页用的游标。
  * 会话不存在 / 无转录 → 空 items、hasMore false，不报错。
+ *
+ * 读取出错（agent ≥ 0.29.1）：空 items、hasMore false，并带 `error`，只回给请求方；
+ * 不再走会话级 error.fatal（那会把正在跑的一轮误显示成出错 / 已停止）。旧 agent
+ * 出错时不应答，client 只能等超时。
  */
 export const SessionHistoryResponseSchema = z.object({
   type: z.literal('session.history.response'),
@@ -1068,6 +1187,7 @@ export const SessionHistoryResponseSchema = z.object({
   items: z.array(HistoryItemSchema),
   hasMore: z.boolean(),
   nextBefore: z.string().min(1).optional(),
+  error: z.object({ message: z.string().max(300) }).optional(),
 });
 
 /**
@@ -1216,6 +1336,79 @@ export const MachineEngineCheckResponseSchema = z.object({
   currentVersion: z.string().max(64).optional(),
   latest: z.object({ version: z.string().max(64) }).optional(),
   error: z.object({ code: z.enum(['failed']), message: z.string().max(300) }).optional(),
+});
+
+// --- §3.1b' 引擎自动更新开关（agent 0.31.0 起，EngineSummary.autoUpdate 存在才发） ---
+//
+// 开关存在 agent（机器级，所有已配对设备共享），新状态随 machine.info 广播后再回应答。
+// 打开时 agent 立即查一次最新版本，有新版就更新；之后每次版本检查查到新版都自动更新。
+
+/** client → agent：打开 / 关闭某个引擎的自动更新（机器级帧） */
+export const MachineEngineAutoUpdateSetSchema = z.object({
+  type: z.literal('machine.engine.autoupdate.set'),
+  ...c2aBase,
+  reqId: ReqIdSchema,
+  engine: EngineIdSchema,
+  enabled: z.boolean(),
+});
+
+/**
+ * - `not_found` 这台机器不能自动更新这个引擎
+ * - `failed`    保存设置失败
+ */
+export const MachineEngineAutoUpdateResponseSchema = z.object({
+  type: z.literal('machine.engine.autoupdate.response'),
+  ...a2cBase,
+  reqId: ReqIdSchema,
+  engine: EngineIdSchema,
+  ok: z.boolean(),
+  /** 应答时的开关状态（失败时是原来的状态） */
+  enabled: z.boolean(),
+  error: z.object({ code: z.enum(['not_found', 'failed']), message: z.string().max(300) }).optional(),
+});
+
+// --- §3.1c 重启引擎的后台进程（agent 0.28.0 起，capabilities.restart 为真才发） ---
+//
+// 语义：换掉 trine 自己的引擎进程（Codex 是 `codex app-server`），下次调用起新进程、重新读登录；
+// 机器上的 Codex 常驻 daemon（本机 Codex TUI 用的那个）在跑时一并重启。用途：换账号后旧进程
+// 不重新加载登录（Codex 认账号 id 不同就不热加载）。有会话在回复时拒绝（busy），不打断轮次；
+// 空闲的已加载会话下一条消息自动 resume。
+
+/** client → agent：重启引擎的后台进程（机器级帧） */
+export const MachineEngineRestartRequestSchema = z.object({
+  type: z.literal('machine.engine.restart.request'),
+  ...c2aBase,
+  reqId: ReqIdSchema,
+  engine: EngineIdSchema,
+});
+
+/**
+ * - `busy`         有会话在回复或有排队消息，没有重启
+ * - `unavailable`  这台机器不能重启这个引擎
+ * - `failed`       重启出错
+ */
+export const EngineRestartErrorCodeSchema = z.enum(['busy', 'unavailable', 'failed']);
+export type EngineRestartErrorCode = z.infer<typeof EngineRestartErrorCodeSchema>;
+
+/**
+ * 机器上的常驻 daemon：`restarted` 已重启；`not_running` 没在跑（不替用户拉起）；
+ * `failed` 重启失败（`daemonMessage` 带原因）。trine 自己的进程已经换掉，ok 仍为 true。
+ */
+export const EngineDaemonRestartSchema = z.enum(['restarted', 'not_running', 'failed']);
+export type EngineDaemonRestart = z.infer<typeof EngineDaemonRestartSchema>;
+
+/** agent → client：`machine.engine.restart.request` 的应答（机器级，reqId 关联） */
+export const MachineEngineRestartResponseSchema = z.object({
+  type: z.literal('machine.engine.restart.response'),
+  ...a2cBase,
+  reqId: ReqIdSchema,
+  engine: EngineIdSchema,
+  ok: z.boolean(),
+  /** ok 时：机器上常驻 daemon 的处理结果；引擎没有 daemon 时省略 */
+  daemon: EngineDaemonRestartSchema.optional(),
+  daemonMessage: z.string().max(300).optional(),
+  /** ok 为 false 时必带 */
+  error: z.object({ code: EngineRestartErrorCodeSchema, message: z.string().max(300) }).optional(),
 });
 
 // --- §3.1a 检查 claude 最新版本（claude-latest，agent 0.19.0 起） ---
@@ -1390,6 +1583,9 @@ export const MachineStatsEventSchema = z.object({
 //
 // 互操作：machine.info.extensions 缺失 = agent 不支持，client 不发这些帧。
 
+/** 页面实例 id（ext.read / ext.action.prepare 的 client） */
+const ExtClientInstanceSchema = z.string().min(1).max(64);
+
 /** 读取订阅（租约）上限 */
 export const EXT_WATCH_MAX_TTL_MS = 10 * 60_000;
 
@@ -1431,6 +1627,16 @@ export const ExtReadSchema = z.object({
   watch: z.object({ ttlMs: z.number().int().min(0).max(EXT_WATCH_MAX_TTL_MS) }).optional(),
   /** force：绕过缓存（手动刷新） */
   force: z.boolean().optional(),
+  /**
+   * 本 web 能执行的特性（如 `files.open`）。agent 取与自己支持、贡献点可执行的交集，
+   * 作为 context.features 给扩展，并过滤输出；缺省 = 空（旧 web）。旧 agent 忽略此字段。
+   */
+  features: ExtFeatureListSchema.optional(),
+  /**
+   * 发起页面实例（每次加载页面生成）。同一设备换了实例（另一个标签页接管、旧版页面接管）时，
+   * agent 废弃旧实例的订阅，带特性的在途结果也不再投递。旧 web 不带 = 空实例。
+   */
+  client: ExtClientInstanceSchema.optional(),
 });
 
 /** agent → 请求设备：读取结果（带 reqId = 应答；订阅期间的推送不带） */
@@ -1450,6 +1656,8 @@ export const ExtReadResponseSchema = z.object({
   badge: ExtBadgeSchema.nullable().optional(),
   items: z.array(ExtWirePickItemSchema).max(EXT_LIMITS.pickItems).optional(),
   error: ExtErrorSchema.optional(),
+  /** 这份结果的有效特性集（空时省略）：client 按它区分缓存，不同特性集的结果互不顶替 */
+  features: ExtFeatureListSchema.optional(),
 });
 
 /** 新会话默认值：session.create 效果用发起设备的设置，扩展不能指定 */
@@ -1464,6 +1672,10 @@ export const ExtActionPrepareSchema = z.object({
   invocationId: z.string().min(1).max(64),
   token: z.string().min(1).max(128),
   newSession: NewSessionDefaultsSchema.optional(),
+  /** 发起设备此刻能执行的特性：与 token 签发时的有效集再取交集（见 ext.read.features） */
+  features: ExtFeatureListSchema.optional(),
+  /** 发起页面实例（见 ext.read.client） */
+  client: ExtClientInstanceSchema.optional(),
 });
 
 /** agent → 请求设备：需要用户确认的执行计划（确认的就是这里的内容，commit 不会重新计算） */
@@ -1477,6 +1689,25 @@ export const ExtActionPlanSchema = z.object({
   expiresAt: TimestampSchema,
 });
 
+/**
+ * 确认时对计划里一个 session.create 步骤的修改（用户在确认框里改的，agent 校验后按它执行）。
+ * 只能改新会话的配置与首条消息；目录、标题、关联仍按计划。省略的字段不变。
+ * 换引擎时 model / permissionMode / engineMode 应一并给出（另一个引擎的模型名没有意义）。
+ */
+export const ExtPlanEditSchema = z.object({
+  /** plan.steps 的下标，必须是 session.create */
+  step: z.number().int().nonnegative().max(16),
+  prompt: z.string().min(1).max(EXT_LIMITS.prompt).optional(),
+  /** 引擎；Claude Code 写 `claude` */
+  engine: EngineIdSchema.optional(),
+  model: z.string().min(1).max(128).optional(),
+  permissionMode: PermissionModeSchema.optional(),
+  engineMode: EngineModeSchema.optional(),
+  /** null = 跟随引擎配置 */
+  effort: EngineEffortSchema.nullable().optional(),
+});
+export type ExtPlanEdit = z.infer<typeof ExtPlanEditSchema>;
+
 /** client → agent：确认执行 */
 export const ExtActionCommitSchema = z.object({
   type: z.literal('ext.action.commit'),
@@ -1484,6 +1715,8 @@ export const ExtActionCommitSchema = z.object({
   reqId: ReqIdSchema,
   invocationId: z.string().min(1).max(64),
   planId: z.string().min(1).max(64),
+  /** 用户在确认框里的修改（MachineExtensionsSummary.planEdit 为真才发）；省略 = 按原计划 */
+  edits: z.array(ExtPlanEditSchema).max(EXT_LIMITS.effectsPerAction + 1).optional(),
 });
 
 /** client → agent：放弃确认（不应答） */
@@ -1528,6 +1761,11 @@ export const ExtActionResultSchema = z.object({
   /** ext.action.status 的应答：还在执行 / 等待确认（此时带 plan）时 ok 为 false 且无 error */
   state: z.enum(['running', 'awaiting_confirmation', 'done']).optional(),
   pending: z.object({ planId: z.string().min(1), plan: ExtPlanSchema, expiresAt: TimestampSchema }).optional(),
+  /**
+   * invoke 已经执行（扩展的副作用已发生），但它返回的效果用到了发起设备执行不了的特性，
+   * 全部丢弃（ok 仍为 true，message 说明原因）。client 应提示「请勿直接重试」。
+   */
+  effectsDropped: z.boolean().optional(),
 });
 
 /** client → agent：启用 / 停用扩展、改权限（本机器、全部设备生效） */
@@ -1616,6 +1854,13 @@ export const CwdListRequestSchema = z.object({
  */
 export const PinnedCwdsSchema = z.record(z.string(), TimestampSchema);
 
+/**
+ * 置顶工作区的手动顺序（pin-order，`machine.info.cwd.pinOrder` 为真的 agent 才带）：pinned 的键，
+ * 越前越靠上。agent 保证它与 pinned 的键一一对应（去重、只含置顶的、缺的按置顶时间倒序补齐）；
+ * 缺省 = 旧 agent，client 按置顶时间倒序排。
+ */
+export const PinOrderSchema = z.array(z.string());
+
 export const CwdListResponseSchema = z.object({
   type: z.literal('cwd.list.response'),
   ...a2cBase,
@@ -1623,6 +1868,7 @@ export const CwdListResponseSchema = z.object({
   favorites: z.array(z.string()),
   defaultCwd: z.string(),
   pinned: PinnedCwdsSchema.optional(),
+  pinOrder: PinOrderSchema.optional(),
 });
 
 export const CwdAddSchema = z.object({
@@ -1654,6 +1900,85 @@ export const CwdPinSchema = z.object({
   pinned: z.boolean(),
 });
 
+/**
+ * client → agent：调整置顶工作区的顺序（pin-order，只发给 `machine.info.cwd.pinOrder` 为真的 agent；
+ * 旧 agent 会判 schema_invalid）。把 `path` 移到 `before` 之前；`before = null` = 移到末尾。
+ * 两者都必须已置顶且不相同，否则应答错误——不隐式置顶。重复请求幂等。
+ * 应答 `cwd.pin.move.response`，成功另广播 `cwd.updated`（带新的 pinOrder）。
+ */
+export const CwdPinMoveSchema = z.object({
+  type: z.literal('cwd.pin.move'),
+  ...c2aBase,
+  reqId: ReqIdSchema,
+  path: z.string().min(1),
+  before: z.string().min(1).nullable(),
+});
+
+/**
+ * 失败原因：
+ * - `not_pinned`        path 没有置顶
+ * - `before_not_pinned` before 没有置顶
+ * - `invalid`           path 与 before 相同
+ * - `failed`            其他错误（写文件失败）
+ */
+export const CwdPinMoveErrorCodeSchema = z.enum(['not_pinned', 'before_not_pinned', 'invalid', 'failed']);
+export type CwdPinMoveErrorCode = z.infer<typeof CwdPinMoveErrorCodeSchema>;
+
+export const CwdPinMoveResponseSchema = z.object({
+  type: z.literal('cwd.pin.move.response'),
+  ...a2cBase,
+  reqId: ReqIdSchema,
+  ok: z.boolean(),
+  error: z.object({ code: CwdPinMoveErrorCodeSchema, message: z.string().max(500) }).optional(),
+});
+
+/**
+ * client → agent：检查（`create: false`）或创建（`create: true`）新会话要用的工作目录（cwd-create，只发给
+ * `machine.info.cwd.create` 为真的 agent；旧 agent 会判 schema_invalid）。
+ *
+ * `path` 须为绝对路径或 `~` 开头。创建 = `mkdir -p`，已存在算成功（`status: 'exists'`）。拒绝 `/`、密钥类路径
+ * （`.ssh`、`.git` 等目录段）、trine 自己的 home 与系统伪文件系统（`/proc` 等），按字面路径和最深已存在祖先的
+ * 真实路径各判一次。不改 session.create：新建会话仍按原样发，cwd 不存在时由 client 先走这里。
+ * 应答只回请求方，不广播。
+ */
+export const CwdPrepareRequestSchema = z.object({
+  type: z.literal('cwd.prepare.request'),
+  ...c2aBase,
+  reqId: ReqIdSchema,
+  path: z.string().min(1).max(FS_PATH_MAX),
+  create: z.boolean(),
+});
+
+/**
+ * 失败原因：
+ * - `invalid`  路径格式不对（相对路径、含 NUL）
+ * - `denied`   `/`、密钥类路径、trine home 之内、系统伪文件系统
+ * - `not_dir`  路径本身或某级祖先是文件
+ * - `failed`   其他错误（没有权限、只读文件系统、磁盘满……message 说明）
+ */
+export const CwdPrepareErrorCodeSchema = z.enum(['invalid', 'denied', 'not_dir', 'failed']);
+export type CwdPrepareErrorCode = z.infer<typeof CwdPrepareErrorCodeSchema>;
+
+/** 一次最多新建的目录层数（`missing` 的上限），防止手误的长路径一口气建出一串目录 */
+export const CWD_CREATE_MAX_DEPTH = 16;
+
+export const CwdPrepareStatusSchema = z.enum(['exists', 'missing', 'created']);
+export type CwdPrepareStatus = z.infer<typeof CwdPrepareStatusSchema>;
+
+export const CwdPrepareResponseSchema = z.object({
+  type: z.literal('cwd.prepare.response'),
+  ...a2cBase,
+  reqId: ReqIdSchema,
+  ok: z.boolean(),
+  /** 成功时：解析后的绝对路径（`~` 已展开）；新建会话用它 */
+  path: z.string().max(FS_PATH_MAX).optional(),
+  /** exists = 已是目录；missing = 不存在（只在 create: false 时）；created = 本次新建 */
+  status: CwdPrepareStatusSchema.optional(),
+  /** missing / created 时：要新建（已新建）的各级目录，从浅到深 */
+  missing: z.array(z.string().max(FS_PATH_MAX)).max(CWD_CREATE_MAX_DEPTH).optional(),
+  error: z.object({ code: CwdPrepareErrorCodeSchema, message: z.string().max(500) }).optional(),
+});
+
 /** agent → client：目录变更广播，多客户端设备保持一致 */
 export const CwdUpdatedSchema = z.object({
   type: z.literal('cwd.updated'),
@@ -1661,6 +1986,7 @@ export const CwdUpdatedSchema = z.object({
   favorites: z.array(z.string()),
   defaultCwd: z.string(),
   pinned: PinnedCwdsSchema.optional(),
+  pinOrder: PinOrderSchema.optional(),
 });
 
 // ---------------------------------------------------------------------------
@@ -1724,12 +2050,16 @@ export const AgentToClientEventSchema = z.discriminatedUnion('type', [
   AttachmentFetchResponseSchema,
   FsListResponseSchema,
   FsReadResponseSchema,
+  FilesTrustResponseSchema,
+  FilesBookmarkResponseSchema,
   SessionCapabilitiesSchema,
   MachineInfoEventSchema,
   MachineClaudeUpdateResponseSchema,
   MachineClaudeCheckResponseSchema,
   MachineEngineUpdateResponseSchema,
   MachineEngineCheckResponseSchema,
+  MachineEngineAutoUpdateResponseSchema,
+  MachineEngineRestartResponseSchema,
   MachineUsageResponseSchema,
   MachineAgentRestartResponseSchema,
   MachineStatsEventSchema,
@@ -1743,6 +2073,8 @@ export const AgentToClientEventSchema = z.discriminatedUnion('type', [
   ExtRecordsResponseSchema,
   CwdListResponseSchema,
   CwdUpdatedSchema,
+  CwdPinMoveResponseSchema,
+  CwdPrepareResponseSchema,
   ErrorTransientSchema,
   ErrorFatalSchema,
 ]);
@@ -1777,12 +2109,18 @@ export const ClientToAgentEventSchema = z.discriminatedUnion('type', [
   AttachmentFetchRequestSchema,
   FsListRequestSchema,
   FsReadRequestSchema,
+  FilesTrustAddSchema,
+  FilesTrustRemoveSchema,
+  FilesBookmarkAddSchema,
+  FilesBookmarkRemoveSchema,
   MachineRenameSchema,
   MachineUnpairSchema,
   MachineClaudeUpdateRequestSchema,
   MachineClaudeCheckRequestSchema,
   MachineEngineUpdateRequestSchema,
   MachineEngineCheckRequestSchema,
+  MachineEngineAutoUpdateSetSchema,
+  MachineEngineRestartRequestSchema,
   MachineUsageRequestSchema,
   MachineAgentRestartRequestSchema,
   MachineStatsRequestSchema,
@@ -1800,6 +2138,8 @@ export const ClientToAgentEventSchema = z.discriminatedUnion('type', [
   CwdRemoveSchema,
   CwdSetDefaultSchema,
   CwdPinSchema,
+  CwdPinMoveSchema,
+  CwdPrepareRequestSchema,
 ]);
 export type ClientToAgentEvent = z.infer<typeof ClientToAgentEventSchema>;
 

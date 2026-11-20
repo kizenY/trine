@@ -60,6 +60,9 @@ export function agentPaths(home: string): {
   recipients: string;
   state: string;
   cwd: string;
+  filesTrust: string;
+  fileBookmarks: string;
+  engineAutoUpdate: string;
   sessions: string;
   uploads: string;
   extensions: string;
@@ -72,6 +75,12 @@ export function agentPaths(home: string): {
     recipients: join(home, 'recipients.json'),
     state: join(home, 'state.json'),
     cwd: join(home, 'cwd.json'),
+    /** 信任目录（文件浏览，见 files/trust-store.ts） */
+    filesTrust: join(home, 'files.json'),
+    /** 文件书签（见 files/bookmark-store.ts） */
+    fileBookmarks: join(home, 'bookmarks.json'),
+    /** 引擎自动更新开关（见 app/engine-auto-update.ts） */
+    engineAutoUpdate: join(home, 'engine-auto-update.json'),
     sessions: join(home, 'sessions.json'),
     /** 用户消息附件（见 bridge/attachments.ts） */
     uploads: join(home, 'uploads'),
@@ -109,8 +118,9 @@ export const USAGE = `用法：trine-agent [--enroll] [--pair] [--server URL] [-
   ext remove ID   移除扩展（它写下的会话关联保留）
   ext reload [ID] 扩展升级后重读 manifest
   ext validate DIR  只校验 manifest 与入口，不运行
-  ext test ID OP [--point P] [--cwd DIR] [--session ID] [--args JSON] [--allow-write]
-                  用合成上下文跑一次扩展（OP：view / badge / pick / action；action 需 --allow-write）
+  ext test ID OP [--point P] [--cwd DIR] [--session ID] [--args JSON] [--features LIST] [--allow-write]
+                  用合成上下文跑一次扩展（OP：view / badge / pick / action；action 需 --allow-write；
+                  --features 模拟 web 声明的特性，逗号分隔，如 files.open）
   restart         预检工作区代码，等全部会话空闲后重启 agent（需由 systemd 等 supervisor 托管）。
                   在 trine 会话里运行也安全：命令立即返回，本轮结束后才重启
     --now           预检通过即重启，不等会话空闲（进行中的轮次会被打断）
@@ -121,7 +131,7 @@ export const USAGE = `用法：trine-agent [--enroll] [--pair] [--server URL] [-
   selfcheck       加载全部代码后退出（重启预检用）
 
 env：TRINE_DEFAULT_MODEL  TRINE_MAX_SESSIONS  TRINE_IDLE_TIMEOUT_MS
-     TRINE_FILES=off（关闭文件查看）  TRINE_FILES_ALLOW=DIR[:DIR...]（会话目录之外允许查看的目录）
+     TRINE_FILES=off（关闭文件查看）  TRINE_FILES_ALLOW=DIR[:DIR...]（会话目录之外允许查看的目录；也可在浏览器里信任，存 files.json）
      TRINE_ENGINES=claude（不启用 Codex；默认 claude,codex）  TRINE_CODEX_BIN=PATH`;
 
 export interface SubcommandInvocation {
@@ -160,7 +170,7 @@ export function parseSubcommand(
       allowWrite = true;
       continue;
     }
-    if (isExtTest && ['--point', '--cwd', '--session', '--args'].includes(arg)) {
+    if (isExtTest && ['--point', '--cwd', '--session', '--args', '--features'].includes(arg)) {
       const value = argv[++i];
       if (value === undefined) throw new ConfigError(`${arg} 需要一个值`);
       extFlags[arg.slice(2)] = value;
@@ -223,6 +233,7 @@ export function parseSubcommand(
         ...(extFlags.cwd === undefined ? {} : { cwd: resolve(extFlags.cwd) }),
         ...(extFlags.session === undefined ? {} : { session: extFlags.session }),
         ...(extFlags.args === undefined ? {} : { args: extFlags.args }),
+        ...(extFlags.features === undefined ? {} : { features: extFlags.features }),
       };
     }
   }

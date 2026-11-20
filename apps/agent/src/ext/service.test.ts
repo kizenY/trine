@@ -2,13 +2,13 @@ import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
 import { chmod, mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import type { ExtRawView, SessionMeta } from '@trine/core';
+import type { ExtPlanStep, ExtRawView, SessionMeta } from '@trine/core';
 import type { EventBody } from '../bridge/types.ts';
 import { SessionLinksStore } from './links-store.ts';
 import { recordLinkChanges, SessionRecordsStore } from './records-store.ts';
 import { ExtensionRegistry, MANIFEST_FILE } from './registry.ts';
 import type { RunRequest, RunResult } from './runner.ts';
-import { ExtensionService, REFRESH_DEBOUNCE_MS, type ExtHost } from './service.ts';
+import { applyPlanEdits, ExtensionService, REFRESH_DEBOUNCE_MS, type ExtHost } from './service.ts';
 
 let root: string;
 
@@ -315,6 +315,59 @@ describe('读取', () => {
 });
 
 describe('动作', () => {
+  test('新会话接续的确认：commit 带修改时按修改后的引擎配置与首条消息建会话', async () => {
+    const h = await harness();
+    h.outputs.set('view', { view: VIEW });
+    await read(h);
+    await prepare(h, tokenOf(h, 'resume-new'));
+    const plan = h.last('ext.action.plan');
+    expect(plan.plan.steps[0]).toMatchObject({ type: 'session.create', model: 'opus', permissionMode: 'bypassPermissions' });
+    await h.service.commit('d1', {
+      type: 'ext.action.commit',
+      ts: 1,
+      seq: 1,
+      dir: 'c2a',
+      reqId: 'c',
+      invocationId: 'inv-1',
+      planId: plan.planId,
+      edits: [{ step: 0, prompt: '改过的接续', engine: 'codex', model: 'gpt-5', permissionMode: 'default', engineMode: 'auto', effort: 'high' }],
+    } as never);
+    expect(h.last('ext.action.result')).toMatchObject({ ok: true, createdSessionId: 'new1' });
+    expect(h.created.map(({ precheck: _p, ...rest }) => rest)).toEqual([
+      {
+        cwd: '/work/repo',
+        model: 'gpt-5',
+        permissionMode: 'default',
+        engine: 'codex',
+        engineMode: 'auto',
+        effort: 'high',
+        ext: 'tasks',
+        links: [{ ref: 'task-a', label: 'Task A' }],
+        prompt: '改过的接续',
+      },
+    ]);
+  });
+
+  test('确认的修改只能落在 session.create 步骤上', async () => {
+    const h = await harness();
+    h.outputs.set('view', { view: VIEW });
+    await read(h);
+    await prepare(h, tokenOf(h, 'resume-here'));
+    const plan = h.last('ext.action.plan');
+    await h.service.commit('d1', {
+      type: 'ext.action.commit',
+      ts: 1,
+      seq: 1,
+      dir: 'c2a',
+      reqId: 'c',
+      invocationId: 'inv-1',
+      planId: plan.planId,
+      edits: [{ step: 0, prompt: '偷换的文字' }],
+    } as never);
+    expect(h.last('ext.action.result')).toMatchObject({ ok: false, error: { code: 'denied' } });
+    expect(h.prompts).toEqual([]);
+  });
+
   test('全托管：新会话接续直接执行，用发起设备的默认值，自动关联', async () => {
     const h = await harness({}, { trust: 'full' });
     h.outputs.set('view', { view: VIEW });
@@ -654,5 +707,340 @@ describe('评审回归（Codex 代码 review）', () => {
     await Bun.sleep(0);
     await Bun.sleep(0);
     expect(h.runs).toHaveLength(2);
+  });
+});
+
+describe('特性协商（files.open）', () => {
+  /** 不看 context.features、总是给 files.open 的扩展：过滤只能靠 agent 的输出边界 */
+  const FILES_VIEW: ExtRawView = {
+    sections: [
+      {
+        id: 's',
+        items: [
+          {
+            id: 'task-a',
+            title: 'Task A',
+            actions: [
+              { id: 'browse', label: '浏览任务目录', effects: [{ type: 'files.open', path: '/work/repo/.margin/tasks/task-a', dir: true }] },
+              { id: 'readme', label: '打开 README', effects: [{ type: 'files.open', path: '/work/repo/.margin/tasks/task-a/README.md' }] },
+              // 混合：一个能执行、一个不能 → 整条动作都不给
+              { id: 'mixed', label: '插入并打开', effects: [{ type: 'prompt.insert', text: 'x' }, { type: 'files.open', path: '/work/repo/a.md' }] },
+              { id: 'insert', label: '插入', effects: [{ type: 'prompt.insert', text: 'x' }] },
+              { id: 'archive', label: '归档', invoke: {} },
+            ],
+          },
+        ],
+      },
+    ],
+  };
+  const ids = (h: Harness): string[] => actions(h).map((a) => a.id);
+  const inputFeatures = (h: Harness, i = -1): unknown => (h.runs.at(i)!.input as { context: { features: unknown } }).context.features;
+
+  test('新 web 在会话面板声明 files.open：扩展拿到 context.features，动作原样作为本地效果给出', async () => {
+    const h = await harness();
+    h.outputs.set('view', { view: FILES_VIEW });
+    await read(h, 'd1', { features: ['files.open', 'future.thing'] });
+    expect(inputFeatures(h)).toEqual(['files.open']);
+    expect(ids(h)).toEqual(['browse', 'readme', 'mixed', 'insert', 'archive']);
+    expect(actions(h)[0]!.local).toEqual([{ type: 'files.open', path: '/work/repo/.margin/tasks/task-a', dir: true }]);
+    expect(actions(h)[0]!.token).toBeUndefined();
+  });
+
+  test('旧 web（不声明）：context.features 为空，含 files.open 的动作整条过滤', async () => {
+    const h = await harness();
+    h.outputs.set('view', { view: FILES_VIEW });
+    await read(h);
+    expect(inputFeatures(h)).toEqual([]);
+    expect(ids(h)).toEqual(['insert', 'archive']);
+    expect(JSON.stringify(h.last('ext.read.response'))).not.toContain('files.open');
+  });
+
+  test('workspacePanel 不可执行 files.open：即使 web 声明也是空集', async () => {
+    const h = await harness({ contributes: { workspacePanel: { title: 'T' } } });
+    h.outputs.set('view', { view: FILES_VIEW });
+    await read(h, 'd1', { point: 'workspacePanel', targetSessionId: undefined, cwd: '/work/repo', features: ['files.open'] });
+    expect(inputFeatures(h)).toEqual([]);
+    expect(ids(h)).toEqual(['insert', 'archive']);
+  });
+
+  test('composerAction / newSession 的 pick 项带 files.open 不可选', async () => {
+    const h = await harness({ contributes: { composerAction: { label: 'T' }, newSession: { title: 'T' } } });
+    h.outputs.set('pick', { items: [{ id: 'a', title: 'A', effects: [{ type: 'files.open', path: '/x' }] }] });
+    await read(h, 'd1', { op: 'pick', point: 'composerAction', features: ['files.open'] });
+    expect(inputFeatures(h)).toEqual([]);
+    expect(h.last('ext.read.response').items![0]!.local).toBeUndefined();
+    await read(h, 'd1', { op: 'pick', point: 'newSession', targetSessionId: undefined, cwd: '/work/repo', features: ['files.open'] });
+    expect(h.last('ext.read.response').items![0]!.local).toBeUndefined();
+  });
+
+  test('缓存按特性集隔离：声明不同的两次读取各起一次进程', async () => {
+    const h = await harness();
+    h.outputs.set('view', { view: FILES_VIEW });
+    await read(h, 'd1', { features: ['files.open'] });
+    await read(h);
+    expect(h.runs).toHaveLength(2);
+    expect(ids(h)).toEqual(['insert', 'archive']);
+    await read(h, 'd1', { features: ['files.open'] });
+    expect(h.runs).toHaveLength(2);
+    expect(ids(h)).toContain('browse');
+  });
+
+  test('订阅按特性集分键，续租与推送沿用声明的特性', async () => {
+    const h = await harness();
+    h.outputs.set('view', { view: FILES_VIEW });
+    await read(h, 'd1', { features: ['files.open'], watch: { ttlMs: 60_000 } });
+    await read(h, 'd1', { watch: { ttlMs: 60_000 } });
+    expect(h.service.watchCount).toBe(2);
+    // 续租（同样的声明）不新增订阅
+    await read(h, 'd1', { features: ['files.open'], watch: { ttlMs: 60_000 } });
+    expect(h.service.watchCount).toBe(2);
+    h.service.onRunEnd('s1');
+    const before = h.sent.length;
+    h.timers.shift()!();
+    await Bun.sleep(0);
+    await Bun.sleep(0);
+    const pushed = h.sent.slice(before).map((s) => s.body as { view?: ExtRawView });
+    const withFiles = pushed.filter((b) => JSON.stringify(b.view).includes('files.open'));
+    expect(pushed).toHaveLength(2);
+    expect(withFiles).toHaveLength(1);
+    // 退订要带同样的声明才找得到那一份
+    await read(h, 'd1', { features: ['files.open'], watch: { ttlMs: 0 } });
+    expect(h.service.watchCount).toBe(1);
+  });
+
+  test('invoke：扩展输入带 token 的特性集；返回 files.open 时原样交给发起设备', async () => {
+    const h = await harness({}, { trust: 'full' });
+    h.outputs.set('view', { view: FILES_VIEW });
+    h.outputs.set('action', { ok: true, effects: [{ type: 'files.open', path: '/work/repo/b.md' }] });
+    await read(h, 'd1', { features: ['files.open'] });
+    await h.service.prepare('d1', {
+      type: 'ext.action.prepare',
+      ts: 1,
+      seq: 1,
+      dir: 'c2a',
+      reqId: 'p',
+      invocationId: 'inv-f',
+      token: tokenOf(h, 'archive'),
+      features: ['files.open'],
+    } as never);
+    expect(inputFeatures(h)).toEqual(['files.open']);
+    expect(h.last('ext.action.result')).toMatchObject({ ok: true, local: [{ type: 'files.open', path: '/work/repo/b.md' }] });
+  });
+
+  test('invoke 执行后才发现不兼容：返回的效果全部丢弃，但结果是「已执行、勿重试」而不是失败', async () => {
+    const h = await harness({}, { trust: 'full' });
+    h.outputs.set('view', { view: FILES_VIEW });
+    let sideEffects = 0;
+    h.outputs.set('action', () => {
+      sideEffects++;
+      return { ok: true, message: '已归档', effects: [{ type: 'prompt.insert', text: 'x' }, { type: 'files.open', path: '/work/repo/b.md' }] };
+    });
+    await read(h, 'd1', { features: ['files.open'] });
+    // 读取时声明了，点击时没声明：取交集后为空
+    await prepare(h, tokenOf(h, 'archive'));
+    expect(inputFeatures(h)).toEqual([]);
+    expect(sideEffects).toBe(1);
+    const res = h.last('ext.action.result');
+    expect(res.ok).toBe(true);
+    expect(res.effectsDropped).toBe(true);
+    expect(res.local).toBeUndefined();
+    expect(res.message).toContain('已归档');
+    expect(res.message).toContain('请勿直接重试');
+    expect(res.message).toContain('没有回滚');
+  });
+
+  test('invoke.requires：缺特性时视图不给、prepare 在启动扩展进程之前拒绝', async () => {
+    const h = await harness({}, { trust: 'full' });
+    const view: ExtRawView = {
+      sections: [{ id: 's', items: [{ id: 'i', title: 'I', actions: [{ id: 'go', label: '打开', invoke: { requires: ['files.open'] } }] }] }],
+    };
+    h.outputs.set('view', { view });
+    h.outputs.set('action', { ok: true, effects: [{ type: 'files.open', path: '/work/repo/b.md' }] });
+    await read(h);
+    expect(actions(h)).toEqual([]);
+    await read(h, 'd1', { features: ['files.open'], force: true });
+    const token = tokenOf(h, 'go');
+    // 点击时不再声明：不跑扩展，直接 unsupported
+    await prepare(h, token);
+    expect(h.runs.filter((r) => r.op === 'action')).toHaveLength(0);
+    expect(h.last('ext.action.result')).toMatchObject({ ok: false, error: { code: 'unsupported' } });
+  });
+
+  test('同一设备被不带特性的旧页面接管：旧实例的订阅作废，推送不再带 files.open', async () => {
+    const h = await harness();
+    h.outputs.set('view', { view: FILES_VIEW });
+    await read(h, 'd1', { features: ['files.open'], client: 'new-tab', watch: { ttlMs: 60_000 } });
+    expect(h.service.watchCount).toBe(1);
+    // 旧版页面（不带 client / features）接管同一 deviceId
+    await read(h, 'd1', { watch: { ttlMs: 60_000 } });
+    expect(h.service.watchCount).toBe(1);
+    h.service.onRunEnd('s1');
+    const before = h.sent.length;
+    h.timers.shift()!();
+    await Bun.sleep(0);
+    await Bun.sleep(0);
+    const pushed = h.sent.slice(before);
+    expect(pushed).toHaveLength(1);
+    expect(JSON.stringify(pushed[0]!.body)).not.toContain('files.open');
+    // 新页面卸载时迟到的退订不会把实例切回去
+    await read(h, 'd1', { features: ['files.open'], client: 'new-tab', watch: { ttlMs: 0 } });
+    expect(h.service.watchCount).toBe(1);
+  });
+
+  test('接管：在途的带特性读取结果不再投递；旧实例的 token 作废', async () => {
+    const h = await harness();
+    let release!: () => void;
+    h.outputs.set('view', () => new Promise((r) => (release = () => r({ view: FILES_VIEW }))));
+    const slow = read(h, 'd1', { features: ['files.open'], client: 'new-tab', reqId: 'slow' });
+    await Bun.sleep(0);
+    h.outputs.set('view', { view: FILES_VIEW });
+    await read(h, 'd1', { reqId: 'old', force: true });
+    release();
+    await slow;
+    const bodies = h.sent.map((s) => s.body as { reqId?: string });
+    expect(bodies.map((b) => b.reqId)).toEqual(['old']);
+    expect(JSON.stringify(h.sent)).not.toContain('files.open');
+  });
+
+  test('接管：带特性的动作结果迟到时去掉本地效果与新视图', async () => {
+    const h = await harness({}, { trust: 'full' });
+    h.outputs.set('view', { view: FILES_VIEW });
+    let release!: () => void;
+    h.outputs.set('action', () => new Promise((r) => (release = () => r({ ok: true, effects: [{ type: 'files.open', path: '/work/repo/b.md' }], view: FILES_VIEW }))));
+    await read(h, 'd1', { features: ['files.open'], client: 'new-tab' });
+    const pending = h.service.prepare('d1', {
+      type: 'ext.action.prepare',
+      ts: 1,
+      seq: 1,
+      dir: 'c2a',
+      reqId: 'p',
+      invocationId: 'inv-t',
+      token: tokenOf(h, 'archive'),
+      features: ['files.open'],
+      client: 'new-tab',
+    } as never);
+    await Bun.sleep(0);
+    h.outputs.set('view', { view: VIEW });
+    await read(h, 'd1', { reqId: 'old', force: true });
+    release();
+    await pending;
+    const res = h.last('ext.action.result');
+    expect(res.ok).toBe(true);
+    expect(res.local).toBeUndefined();
+    expect(res.view).toBeUndefined();
+  });
+
+  test('租约归属：旧实例迟到的退订不删新实例同键的租约', async () => {
+    const h = await harness();
+    h.outputs.set('view', { view: FILES_VIEW });
+    await read(h, 'd1', { features: ['files.open'], client: 'A', watch: { ttlMs: 60_000 } });
+    await read(h, 'd1', { features: ['files.open'], client: 'B', watch: { ttlMs: 60_000 } });
+    expect(h.service.watchCount).toBe(1);
+    await read(h, 'd1', { features: ['files.open'], client: 'A', watch: { ttlMs: 0 } });
+    expect(h.service.watchCount).toBe(1);
+    // 本实例自己的退订照常生效
+    await read(h, 'd1', { features: ['files.open'], client: 'B', watch: { ttlMs: 0 } });
+    expect(h.service.watchCount).toBe(0);
+  });
+
+  test('空实例（旧 web）与非空实例互相切换都会清理旧租约', async () => {
+    const h = await harness();
+    h.outputs.set('view', { view: FILES_VIEW });
+    await read(h, 'd1', { watch: { ttlMs: 60_000 } });
+    await read(h, 'd1', { features: ['files.open'], client: 'B', watch: { ttlMs: 60_000 } });
+    expect(h.service.watchCount).toBe(1);
+    await read(h, 'd1', { watch: { ttlMs: 60_000 } });
+    expect(h.service.watchCount).toBe(1);
+  });
+
+  test('token 只认签发实例：同设备另一个实例拿来 prepare → stale，不执行', async () => {
+    const h = await harness({}, { trust: 'full' });
+    h.outputs.set('view', { view: FILES_VIEW });
+    h.outputs.set('action', { ok: true });
+    await read(h, 'd1', { client: 'A' });
+    const token = tokenOf(h, 'archive');
+    await h.service.prepare('d1', { type: 'ext.action.prepare', ts: 1, seq: 1, dir: 'c2a', reqId: 'p', invocationId: 'inv-x', token, client: 'B' } as never);
+    expect(h.last('ext.action.result')).toMatchObject({ ok: false, error: { code: 'stale' } });
+    expect(h.runs.filter((r) => r.op === 'action')).toHaveLength(0);
+  });
+
+  test('迟到的读取不给已被接管的旧实例签发 token', async () => {
+    const h = await harness({}, { trust: 'full' });
+    let release!: () => void;
+    h.outputs.set('view', () => new Promise((r) => (release = () => r({ view: FILES_VIEW }))));
+    const slow = read(h, 'd1', { client: 'A', reqId: 'slow' });
+    await Bun.sleep(0);
+    h.outputs.set('view', { view: VIEW });
+    await read(h, 'd1', { client: 'B', reqId: 'new', force: true });
+    const before = h.service.tokenCount;
+    release();
+    await slow;
+    expect(h.service.tokenCount).toBe(before);
+    const late = h.sent.map((s) => s.body as { reqId?: string; view?: ExtRawView }).find((b) => b.reqId === 'slow');
+    expect(JSON.stringify(late?.view ?? {})).not.toContain('"token"');
+  });
+
+  test('effectsDropped：扩展 message 很长时先截断它，固定警告完整保留', async () => {
+    const h = await harness({}, { trust: 'full' });
+    h.outputs.set('view', { view: FILES_VIEW });
+    h.outputs.set('action', { ok: true, message: '长'.repeat(500), effects: [{ type: 'files.open', path: '/work/repo/b.md' }] });
+    await read(h);
+    await prepare(h, tokenOf(h, 'archive'));
+    const res = h.last('ext.action.result');
+    expect(res.effectsDropped).toBe(true);
+    expect(res.message!.length).toBeLessThanOrEqual(500);
+    expect(res.message).toContain('没有回滚');
+    expect(res.message).toContain('请勿直接重试');
+    expect(res.message!.startsWith('长')).toBe(true);
+  });
+
+  test('应答带有效特性集（结果身份的一部分）；空集时省略', async () => {
+    const h = await harness();
+    h.outputs.set('view', { view: FILES_VIEW });
+    await read(h, 'd1', { features: ['files.open'] });
+    expect(h.last('ext.read.response').features).toEqual(['files.open']);
+    await read(h);
+    expect(h.last('ext.read.response').features).toBeUndefined();
+  });
+
+  test('旧扩展（不看 features、也不给 files.open）在新 web 下照常工作', async () => {
+    const h = await harness();
+    h.outputs.set('view', { view: VIEW });
+    await read(h, 'd1', { features: ['files.open'] });
+    expect(actions(h).map((a) => a.id)).toEqual(['resume-new', 'resume-here', 'insert', 'archive']);
+  });
+
+  test('路径校验：NUL 或超长 → 整份输出无效', async () => {
+    const h = await harness();
+    const bad = (path: string): ExtRawView => ({
+      sections: [{ id: 's', items: [{ id: 'i', title: 'I', actions: [{ id: 'a', label: 'a', effects: [{ type: 'files.open', path }] }] }] }],
+    });
+    h.outputs.set('view', { view: bad('/work/a\0b') });
+    await read(h, 'd1', { features: ['files.open'] });
+    expect(h.last('ext.read.response')).toMatchObject({ ok: false, error: { code: 'invalid_output' } });
+    h.outputs.set('view', { view: bad(`/${'a'.repeat(5000)}`) });
+    await read(h, 'd1', { features: ['files.open'], force: true });
+    expect(h.last('ext.read.response')).toMatchObject({ ok: false, error: { code: 'invalid_output' } });
+  });
+});
+
+describe('applyPlanEdits', () => {
+  const base: ExtPlanStep = { type: 'session.create', cwd: '/w', prompt: 'p', model: 'gpt-5', permissionMode: 'default', links: [], engine: 'codex', engineMode: 'auto', effort: 'high' };
+  test('不给修改：原样', () => {
+    expect(applyPlanEdits([{ view: base }], undefined)).toEqual([{ view: base }]);
+  });
+  test('换回 Claude：去掉 engine / engineMode，强度不带过去', () => {
+    expect(applyPlanEdits([{ view: base }], [{ step: 0, engine: 'claude', model: 'opus', permissionMode: 'plan' }])[0]!.view).toEqual({
+      type: 'session.create', cwd: '/w', prompt: 'p', model: 'opus', permissionMode: 'plan', links: [],
+    });
+  });
+  test('同引擎只改强度：null = 跟随配置；其余不变', () => {
+    expect(applyPlanEdits([{ view: base }], [{ step: 0, effort: null }])[0]!.view).toEqual({ ...base, effort: undefined } as never);
+    expect(applyPlanEdits([{ view: base }], [{ step: 0, effort: null }])[0]!.view).not.toHaveProperty('effort');
+  });
+  test('换引擎不给模型、下标越界、重复下标：拒绝', () => {
+    expect(() => applyPlanEdits([{ view: base }], [{ step: 0, engine: 'claude' }])).toThrow('模型');
+    expect(() => applyPlanEdits([{ view: base }], [{ step: 1, prompt: 'x' }])).toThrow();
+    expect(() => applyPlanEdits([{ view: base }], [{ step: 0, prompt: 'x' }, { step: 0, prompt: 'y' }])).toThrow();
   });
 });

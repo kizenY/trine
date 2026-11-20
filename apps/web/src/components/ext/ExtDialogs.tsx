@@ -5,15 +5,18 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { useLocation } from 'react-router';
 import { toast } from 'sonner';
-import type { ExtPlan, ExtPlanStep } from '@trine/core';
+import type { EngineSummary, ExtPlan, ExtPlanEdit, ExtPlanStep } from '@trine/core';
 import { Button } from '@/components/ui/button.tsx';
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from '@/components/ui/dialog.tsx';
 import { Input } from '@/components/ui/input.tsx';
 import { useClient, useTrine } from '@/app/runtime.ts';
-import { extensionsFor, permissionModeLabel } from '@/lib/ext-model.ts';
+import { extensionsFor, permissionModeLabel, supportsPlanEdit } from '@/lib/ext-model.ts';
+import { creatableEngines, engineModeLabel } from '@/lib/engine-model.ts';
 import { cn } from '@/lib/utils.ts';
 import { ExtBadgeChip } from './ExtView.tsx';
 import { ExtPanelSheet } from './ExtPanel.tsx';
+import { PlanSessionEditor } from './PlanSessionEditor.tsx';
+import { draftBlocked, draftToEdit, initialDraft, type SessionCreateStep, type SessionDraft } from './plan-edit.ts';
 import { closeLinkPicker, closeWorkspacePanel, settleConfirm, updateLinks, useExtCatalog, useExtRead, useExtUi, type LinkPickerRequest } from './use-ext.ts';
 
 export function ExtDialogsHost(): React.JSX.Element {
@@ -23,7 +26,7 @@ export function ExtDialogsHost(): React.JSX.Element {
   useEffect(() => closeWorkspacePanel(), [location.pathname]);
   return (
     <>
-      <PlanConfirmDialog plan={ui.confirm?.plan ?? null} />
+      <PlanConfirmDialog plan={ui.confirm?.plan ?? null} machineId={ui.confirm?.machineId ?? ''} />
       {ui.linkPicker !== null && <LinkPickerDialog request={ui.linkPicker} />}
       {ui.workspacePanel !== null && (
         <ExtPanelSheet
@@ -41,36 +44,85 @@ export function ExtDialogsHost(): React.JSX.Element {
 // 计划确认
 // ---------------------------------------------------------------------------
 
-function PlanConfirmDialog({ plan }: { plan: ExtPlan | null }): React.JSX.Element {
-  const destructive = plan?.steps.some((s) => s.type === 'invoke' && s.destructive) === true;
+function PlanConfirmDialog({ plan, machineId }: { plan: ExtPlan | null; machineId: string }): React.JSX.Element {
   return (
     <Dialog open={plan !== null} onOpenChange={(open) => !open && settleConfirm(false)}>
-      <DialogContent data-testid="ext-confirm" className="max-w-[min(32rem,calc(100vw-2rem))]">
-        {plan !== null && (
-          <>
-            <DialogHeader>
-              <DialogTitle>确认：{plan.actionLabel}</DialogTitle>
-              <DialogDescription className="text-text-3 text-[12px]">
-                来自扩展「{plan.extName}」{plan.extVersion === '' ? '' : ` ${plan.extVersion}`}。确认后按下面的内容执行，不会再改变。
-              </DialogDescription>
-            </DialogHeader>
-            <div className="flex max-h-[55dvh] flex-col gap-3 overflow-y-auto text-[13px]">
-              {plan.steps.map((step, i) => (
-                <PlanStepView key={i} step={step} />
-              ))}
-            </div>
-            <DialogFooter>
-              <Button variant="ghost" onClick={() => settleConfirm(false)}>
-                取消
-              </Button>
-              <Button variant={destructive ? 'destructive' : 'default'} data-testid="ext-confirm-ok" onClick={() => settleConfirm(true)}>
-                确认执行
-              </Button>
-            </DialogFooter>
-          </>
-        )}
+      <DialogContent data-testid="ext-confirm" resizable="ext-confirm" className="max-w-[min(34rem,calc(100vw-2rem))]">
+        {/* 每个计划一份草稿：来了新计划就从它的值重新开始 */}
+        {plan !== null && <PlanConfirmBody key={JSON.stringify(plan)} plan={plan} machineId={machineId} />}
       </DialogContent>
     </Dialog>
+  );
+}
+
+function PlanConfirmBody({ plan, machineId }: { plan: ExtPlan; machineId: string }): React.JSX.Element {
+  const info = useTrine((s) => s.machines[machineId]?.info);
+  // 旧 agent 会丢掉 edits、按原计划执行：只在它声明支持时开放编辑
+  const editable = supportsPlanEdit(info);
+  const engines = creatableEngines(info);
+  const [drafts, setDrafts] = useState<ReadonlyMap<number, SessionDraft>>(() => {
+    const map = new Map<number, SessionDraft>();
+    plan.steps.forEach((step, i) => {
+      if (step.type === 'session.create') map.set(i, initialDraft(step));
+    });
+    return map;
+  });
+  const destructive = plan.steps.some((s) => s.type === 'invoke' && s.destructive);
+  const blocked = editable ? ([...drafts.values()].map(draftBlocked).find((b) => b !== null) ?? null) : null;
+
+  const confirm = (): void => {
+    if (!editable) {
+      settleConfirm(true);
+      return;
+    }
+    const edits: ExtPlanEdit[] = [];
+    for (const [i, draft] of drafts) {
+      const edit = draftToEdit(i, plan.steps[i] as SessionCreateStep, draft, engines.find((e) => e.id === draft.engine));
+      if (edit !== undefined) edits.push(edit);
+    }
+    settleConfirm(edits.length === 0 ? true : { edits });
+  };
+
+  return (
+    <>
+      <DialogHeader>
+        <DialogTitle>确认：{plan.actionLabel}</DialogTitle>
+        <DialogDescription className="text-text-3 text-[12px]">
+          来自扩展「{plan.extName}」{plan.extVersion === '' ? '' : ` ${plan.extVersion}`}。
+          {editable && drafts.size > 0 ? '新会话的引擎配置和首条消息可以修改，确认后按下面的内容执行。' : '确认后按下面的内容执行，不会再改变。'}
+        </DialogDescription>
+      </DialogHeader>
+      <div className="flex max-h-[60dvh] flex-col gap-3 overflow-y-auto text-[13px]">
+        {plan.steps.map((step, i) => {
+          const draft = drafts.get(i);
+          if (editable && step.type === 'session.create' && draft !== undefined) {
+            return (
+              <PlanSessionEditor
+                key={i}
+                step={step}
+                draft={draft}
+                engines={engines}
+                onChange={(next) => setDrafts((cur) => new Map(cur).set(i, next))}
+              />
+            );
+          }
+          return <PlanStepView key={i} step={step} engines={engines} />;
+        })}
+      </div>
+      {blocked !== null && (
+        <p data-testid="ext-confirm-blocked" className="text-amber text-[12px]">
+          {blocked}
+        </p>
+      )}
+      <DialogFooter>
+        <Button variant="ghost" onClick={() => settleConfirm(false)}>
+          取消
+        </Button>
+        <Button variant={destructive ? 'destructive' : 'default'} data-testid="ext-confirm-ok" disabled={blocked !== null} onClick={confirm}>
+          确认执行
+        </Button>
+      </DialogFooter>
+    </>
   );
 }
 
@@ -89,22 +141,26 @@ function PromptBox({ text }: { text: string }): React.JSX.Element {
   );
 }
 
-function PlanStepView({ step }: { step: ExtPlanStep }): React.JSX.Element {
+function PlanStepView({ step, engines }: { step: ExtPlanStep; engines: readonly EngineSummary[] }): React.JSX.Element {
   switch (step.type) {
-    case 'session.create':
+    case 'session.create': {
+      const engine = step.engine === undefined ? undefined : engines.find((e) => e.id === step.engine);
       return (
         <div className="border-border flex flex-col gap-1 rounded-xl border p-3" data-testid="plan-session-create">
           <div className="font-medium">新建会话并发送</div>
           <Row label="目录">{step.cwd}</Row>
           {step.title !== undefined && <Row label="标题">{step.title}</Row>}
+          {step.engine !== undefined && <Row label="引擎">{engine?.displayName ?? step.engine}</Row>}
           <Row label="模型">{step.model}</Row>
-          <Row label="权限" warn={step.permissionMode === 'bypassPermissions'}>
-            {permissionModeLabel(step.permissionMode)}
+          {step.effort !== undefined && <Row label="强度">{step.effort}</Row>}
+          <Row label="权限" warn={step.engineMode === undefined && step.permissionMode === 'bypassPermissions'}>
+            {step.engineMode === undefined ? permissionModeLabel(step.permissionMode) : engineModeLabel(engine, step.engineMode)}
           </Row>
           {step.links.length > 0 && <Row label="关联">{step.links.map((l) => l.label).join('、')}</Row>}
           <PromptBox text={step.prompt} />
         </div>
       );
+    }
     case 'prompt.send':
       return (
         <div className="border-border flex flex-col gap-1 rounded-xl border p-3" data-testid="plan-prompt-send">
@@ -142,7 +198,7 @@ function LinkPickerDialog({ request }: { request: LinkPickerRequest }): React.JS
   const ext = pickers.find((e) => e.id === extId) ?? pickers[0];
   return (
     <Dialog open onOpenChange={(open) => !open && closeLinkPicker()}>
-      <DialogContent data-testid="ext-link-picker" className="max-w-[min(30rem,calc(100vw-2rem))]">
+      <DialogContent data-testid="ext-link-picker" resizable="ext-link-picker" className="max-w-[min(30rem,calc(100vw-2rem))]">
         <DialogHeader>
           <DialogTitle>{ext?.contributes.linkPicker?.title ?? '关联'}</DialogTitle>
           <DialogDescription className="text-text-3 text-[12px]">
@@ -243,7 +299,7 @@ function LinkPickerBody({ request, ext, multiple }: { request: LinkPickerRequest
   };
 
   return (
-    <div className="flex flex-col gap-3">
+    <div className="flex min-w-0 flex-col gap-3">
       <Input value={query} onChange={(e) => setQuery(e.target.value)} placeholder="搜索" className="h-8" />
       <div className="flex max-h-[50dvh] flex-col gap-1 overflow-y-auto">
         {read.response?.ok === false && <p className="text-red text-[12.5px]">{read.response.error?.message}</p>}
@@ -262,10 +318,14 @@ function LinkPickerBody({ request, ext, multiple }: { request: LinkPickerRequest
               <input type={multiple ? 'checkbox' : 'radio'} checked={on} onChange={() => toggle(ref)} className="mt-1" />
               <span className="min-w-0 flex-1">
                 <span className="flex flex-wrap items-center gap-1.5">
-                  <span className="text-[13px]">{item.title}</span>
+                  <span className="min-w-0 text-[13px] break-words">{item.title}</span>
                   {item.badges?.map((b, i) => <ExtBadgeChip key={i} badge={b} />)}
                 </span>
-                {item.subtitle !== undefined && <span className="text-text-3 block truncate text-[12px]">{item.subtitle}</span>}
+                {item.subtitle !== undefined && (
+                  <span className="text-text-3 line-clamp-2 text-[12px] break-words" title={item.subtitle}>
+                    {item.subtitle}
+                  </span>
+                )}
               </span>
             </label>
           );

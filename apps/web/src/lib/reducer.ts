@@ -60,12 +60,14 @@ import {
   RunPhaseSchema,
   SessionStateSchema,
   SlashCommandSchema,
+  SubagentInfoSchema,
   ToolResultStatusSchema,
 } from '@trine/core/types';
 import {
   adoptPending,
   appendChildren,
   dropPending,
+  findTool,
   historyToolEntry,
   pendingFor,
   stashChild,
@@ -164,6 +166,7 @@ export interface ToolEntry {
   toolName: string;
   argSummary: string;
   filePath?: string;
+  argDetail?: string;
   status?: z.infer<typeof ToolResultStatusSchema>;
   durationMs?: number;
   resultSummary?: string;
@@ -171,6 +174,7 @@ export interface ToolEntry {
   children?: ToolEntry[];
   childCount?: number;
   childrenLoaded?: boolean;
+  subagent?: z.infer<typeof SubagentInfoSchema>;
   seq: number;
   ts: number;
 }
@@ -182,6 +186,8 @@ export const ToolEntrySchema = z.object({
   argSummary: z.string(),
   /** 文件类工具的完整路径（agent ≥ 0.20.0），点击打开文件预览 */
   filePath: z.string().optional(),
+  /** 完整参数（长命令原文，agent ≥ 0.25.0）；展开工具卡时显示 */
+  argDetail: z.string().optional(),
   status: ToolResultStatusSchema.optional(),
   durationMs: z.number().optional(),
   resultSummary: z.string().optional(),
@@ -198,8 +204,57 @@ export const ToolEntrySchema = z.object({
   childCount: z.number().int().nonnegative().optional(),
   /** 已向 agent 拉过子转录（subagent.history.response 到了，哪怕是空的） */
   childrenLoaded: z.boolean().optional(),
+  /**
+   * 子 agent 卡的附加信息（类型、前台/后台、目标状态、Codex 昵称/模型；加法字段）。
+   * tool.start / tool.end / 历史多次下发时按字段合并，后到的覆盖（见 mergeSubagent）
+   */
+  subagent: SubagentInfoSchema.optional(),
   ...entryBase,
 });
+
+/** 两份子 agent 信息按字段合并（`next` 的字段覆盖 `cur`）；都没有返回 undefined */
+export function mergeSubagent(
+  cur: ToolEntry['subagent'],
+  next: ToolEntry['subagent'],
+): ToolEntry['subagent'] {
+  if (next === undefined) return cur;
+  return cur === undefined ? next : { ...cur, ...next };
+}
+
+/** 明确的结果（成败已知）：到了就不再被任何历史状态改掉 */
+const EXPLICIT_SUBAGENT_STATES: ReadonlySet<string> = new Set(['completed', 'failed', 'stopped', 'interrupted', 'shutdown', 'not_found']);
+
+/**
+ * 历史对账已有卡片的子 agent 信息（评审 中7 / 复审 新中2）：历史是 agent 读权威存储得出的，能
+ * 修正本地缓存里因重启 / 掉线而永远「运行中」的卡。只允许升级、不允许降级：
+ * - 已是明确结果（完成 / 失败 / 停止…）→ 状态不动；
+ * - 已是「已结束 · 结果未知」→ 只能升级成明确结果；
+ * - 其余（运行中 / 等待 / 状态未知 / 没有）→ 以历史为准。
+ * 缺的字段补上。没有变化返回 undefined；`adoptResult` = 状态升级成了明确结果，卡上的结果摘要
+ * 也该跟着换成历史的（复审 新中3）。
+ */
+export function reconcileSubagent(
+  cur: ToolEntry['subagent'],
+  history: NonNullable<ToolEntry['subagent']>,
+): { subagent: NonNullable<ToolEntry['subagent']>; adoptResult: boolean } | undefined {
+  const merged = { ...history, ...cur };
+  const curState = cur?.state;
+  const histState = history.state;
+  let adoptResult = false;
+  if (histState !== undefined && curState !== histState) {
+    const curExplicit = curState !== undefined && EXPLICIT_SUBAGENT_STATES.has(curState);
+    const histExplicit = EXPLICIT_SUBAGENT_STATES.has(histState);
+    const allowed = !curExplicit && (curState !== 'ended' || histExplicit);
+    if (allowed) {
+      merged.state = histState;
+      adoptResult = histExplicit;
+    }
+  }
+  const before = cur ?? {};
+  const keys = new Set([...Object.keys(before), ...Object.keys(merged)]) as Set<keyof typeof merged>;
+  for (const k of keys) if (before[k] !== merged[k]) return { subagent: merged, adoptResult };
+  return undefined;
+}
 
 export const PermissionEntrySchema = z.object({
   kind: z.literal('permission'),
@@ -232,6 +287,8 @@ export const PermissionEntrySchema = z.object({
   reason: z.string().optional(),
   /** 子 agent 发起的请求：父 Agent/Task 工具的 toolUseId（agent ≥ 0.8.0；加法字段） */
   parentToolUseId: z.string().optional(),
+  /** 来自子 agent 但对不上派生卡（Codex）：子 thread id（加法字段） */
+  subagentId: z.string().optional(),
   ...entryBase,
 });
 
@@ -355,6 +412,8 @@ export interface MachineCwd {
   favorites: string[];
   defaultCwd: string;
   pinned?: Record<string, number>;
+  /** 置顶工作区的手动顺序（pinned 的键，越前越靠上）；`machine.info.cwd.pinOrder` 为真的 agent 才带 */
+  pinOrder?: string[];
 }
 
 export interface MachineState {
@@ -374,6 +433,8 @@ export interface MachineState {
   stats: MachineStats | null;
   /** 本次打开页面以来的资源快照（按时间升序，最多 STATS_HISTORY_MAX 条），画趋势用 */
   statsHistory: MachineStats[];
+  /** 有一个置顶重排（cwd.pin.move）在途；只在内存，不落盘。每台机器同时只允许一个 */
+  pinMoving?: true;
 }
 
 /** 资源快照保留条数（详情页 5 秒一次 ≈ 5 分钟） */
@@ -545,12 +606,18 @@ export function applyEvent(tl: Timeline, event: AgentToClientEvent): Timeline {
     case 'tool.start': {
       // 已有同 id 条目（重发 / 子条目先于 start 收到过 end）：原地更新名字与参数，
       // 结果与子树留着。顶层与任意深度的子条目都算
-      const updated = updateTool(tl.entries, event.toolUseId, (cur) => ({
-        ...cur,
-        toolName: event.toolName,
-        argSummary: event.argSummary,
-        ...(event.filePath === undefined ? {} : { filePath: event.filePath }),
-      }));
+      // 重发也用来只更新子 agent 信息（Codex 子 thread 的状态变化）
+      const updated = updateTool(tl.entries, event.toolUseId, (cur) => {
+        const subagent = mergeSubagent(cur.subagent, event.subagent);
+        return {
+          ...cur,
+          toolName: event.toolName,
+          argSummary: event.argSummary,
+          ...(event.filePath === undefined ? {} : { filePath: event.filePath }),
+          ...(event.argDetail === undefined ? {} : { argDetail: event.argDetail }),
+          ...(subagent === undefined ? {} : { subagent }),
+        };
+      });
       if (updated !== undefined) return withEntries(tl, updated, seq);
       const entry: ToolEntry = {
         kind: 'tool',
@@ -558,6 +625,8 @@ export function applyEvent(tl: Timeline, event: AgentToClientEvent): Timeline {
         toolName: event.toolName,
         argSummary: event.argSummary,
         ...(event.filePath === undefined ? {} : { filePath: event.filePath }),
+        ...(event.argDetail === undefined ? {} : { argDetail: event.argDetail }),
+        ...(event.subagent === undefined ? {} : { subagent: event.subagent }),
         seq,
         ts: event.ts,
       };
@@ -570,10 +639,22 @@ export function applyEvent(tl: Timeline, event: AgentToClientEvent): Timeline {
         resultSummary: event.resultSummary,
         ...(event.outputPreview === undefined ? {} : { outputPreview: event.outputPreview }),
       };
-      const updated = updateTool(tl.entries, event.toolUseId, (cur) => ({ ...cur, ...result }));
+      const updated = updateTool(tl.entries, event.toolUseId, (cur) => {
+        const subagent = mergeSubagent(cur.subagent, event.subagent);
+        return { ...cur, ...result, ...(subagent === undefined ? {} : { subagent }) };
+      });
       if (updated !== undefined) return withEntries(tl, updated, seq);
       // start 没收到（补发窗口外）：仍落一条，工具名未知
-      const entry: ToolEntry = { kind: 'tool', id: event.toolUseId, toolName: '?', argSummary: '', ...result, seq, ts: event.ts };
+      const entry: ToolEntry = {
+        kind: 'tool',
+        id: event.toolUseId,
+        toolName: '?',
+        argSummary: '',
+        ...result,
+        ...(event.subagent === undefined ? {} : { subagent: event.subagent }),
+        seq,
+        ts: event.ts,
+      };
       return placeTool(tl, entry, event.parentToolUseId, seq);
     }
     case 'permission.request': {
@@ -595,6 +676,7 @@ export function applyEvent(tl: Timeline, event: AgentToClientEvent): Timeline {
             requestedAt: event.requestedAt,
             state: 'pending',
             ...(event.parentToolUseId === undefined ? {} : { parentToolUseId: event.parentToolUseId }),
+            ...(event.subagentId === undefined ? {} : { subagentId: event.subagentId }),
             ...(event.options === undefined ? {} : { options: event.options }),
             seq,
             ts: event.ts,
@@ -750,6 +832,8 @@ export function applyEvent(tl: Timeline, event: AgentToClientEvent): Timeline {
     case 'attachment.fetch.response':
     // 文件查看由 client.listFiles / openFile 按 reqId 关联；这里只推进游标
     case 'fs.list.response':
+    case 'files.trust.response':
+    case 'files.bookmark.response':
     case 'fs.read.response':
     // 命令清单由 client.loadCommands 按 reqId 关联后写进 capabilities；这里只推进游标
     case 'session.commands.response':
@@ -771,11 +855,15 @@ export function applyEvent(tl: Timeline, event: AgentToClientEvent): Timeline {
     case 'machine.claude.check.response':
     case 'machine.engine.update.response':
     case 'machine.engine.check.response':
+    case 'machine.engine.restart.response':
+    case 'machine.engine.autoupdate.response':
     case 'machine.usage.response':
     case 'machine.agent.restart.response':
     case 'machine.stats':
     case 'cwd.list.response':
     case 'cwd.updated':
+    case 'cwd.pin.move.response':
+    case 'cwd.prepare.response':
     case 'ext.catalog.response':
     case 'ext.read.response':
     case 'ext.action.plan':
@@ -1125,10 +1213,12 @@ function historyToEntry(item: HistoryItem): TimelineEntry {
         toolName: item.toolName,
         argSummary: item.argSummary,
         ...(item.filePath === undefined ? {} : { filePath: item.filePath }),
+        ...(item.argDetail === undefined ? {} : { argDetail: item.argDetail }),
         ...(item.status === undefined ? {} : { status: item.status }),
         ...(item.durationMs === undefined ? {} : { durationMs: item.durationMs }),
         ...(item.resultSummary === undefined ? {} : { resultSummary: item.resultSummary }),
         ...(item.outputPreview === undefined ? {} : { outputPreview: item.outputPreview }),
+        ...(item.subagent === undefined ? {} : { subagent: item.subagent }),
         seq: 0,
         ts: item.ts,
       };
@@ -1163,9 +1253,32 @@ export function mergeHistory(
     if (e.kind === 'user' && e.uuid !== undefined) seen.add(`user:${e.uuid}`);
   }
   const fresh: TimelineEntry[] = [];
+  // 已有卡片的子 agent 状态以历史为准对账（agent 重启后实时帧补不回来，评审 中7）
+  let reconciled: TimelineEntry[] | undefined;
   for (const item of page.items) {
-    if (item.ts >= cutoff) continue;
     const key = `${item.kind}:${item.id}`;
+    if (item.kind === 'tool' && item.subagent !== undefined && seen.has(key)) {
+      const base = reconciled ?? tl.entries;
+      const cur = findTool(base, item.id);
+      const change = cur === undefined ? undefined : reconcileSubagent(cur.subagent, item.subagent);
+      if (change !== undefined) {
+        reconciled =
+          updateTool(base, item.id, (t) => ({
+            ...t,
+            subagent: change.subagent,
+            // 升级成明确结果：卡头摘要、报告、耗时与状态一起换成历史的，别留着「已启动」
+            ...(change.adoptResult
+              ? {
+                  ...(item.status === undefined ? {} : { status: item.status }),
+                  ...(item.resultSummary === undefined ? {} : { resultSummary: item.resultSummary }),
+                  ...(item.outputPreview === undefined ? {} : { outputPreview: item.outputPreview }),
+                  ...(item.durationMs === undefined ? {} : { durationMs: item.durationMs }),
+                }
+              : {}),
+          })) ?? reconciled;
+      }
+    }
+    if (item.ts >= cutoff) continue;
     if (seen.has(key)) continue;
     seen.add(key);
     fresh.push(historyToEntry(item));
@@ -1176,13 +1289,14 @@ export function mergeHistory(
     ...(page.hasMore && page.nextBefore !== undefined ? { cursor: page.nextBefore } : {}),
   };
   const sameHistory = tl.history?.hasMore === history.hasMore && tl.history.cursor === history.cursor;
-  if (fresh.length === 0 && sameHistory) return tl;
+  if (fresh.length === 0 && sameHistory && reconciled === undefined) return tl;
 
-  let entries = tl.entries;
+  const base = reconciled ?? tl.entries;
+  let entries = base;
   if (fresh.length > 0) {
     let head = 0;
-    while (head < tl.entries.length && isHistoryEntry(tl.entries[head]!)) head++;
-    const existing = tl.entries.slice(0, head);
+    while (head < base.length && isHistoryEntry(base[head]!)) head++;
+    const existing = base.slice(0, head);
     fresh.sort((a, b) => a.ts - b.ts);
     // 稳定归并：同 ts 时已有的在前（它来自更新的一页之前就已在场，顺序已定）
     const merged: TimelineEntry[] = [];
@@ -1192,7 +1306,7 @@ export function mergeHistory(
       if (j >= fresh.length || (i < existing.length && existing[i]!.ts <= fresh[j]!.ts)) merged.push(existing[i++]!);
       else merged.push(fresh[j++]!);
     }
-    entries = [...merged, ...tl.entries.slice(head)];
+    entries = [...merged, ...base.slice(head)];
   }
   // 历史页带进来的 Agent 条目可能正是暂存子条目在等的父
   const adopted = fresh.length > 0 ? adoptPending(entries, tl.pendingChildren) : { entries, pending: tl.pendingChildren };
@@ -1422,6 +1536,7 @@ export function applyMachineEvent(machine: MachineState, event: AgentToClientEve
           favorites: event.favorites,
           defaultCwd: event.defaultCwd,
           ...(event.pinned === undefined ? {} : { pinned: event.pinned }),
+          ...(event.pinOrder === undefined ? {} : { pinOrder: event.pinOrder }),
         },
       };
     case 'machine.stats': {

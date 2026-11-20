@@ -5,7 +5,7 @@
  * 假 ClaudeSession 工厂注入 SessionManager，不起真子进程。
  */
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
-import { chmod, mkdir, mkdtemp, rm } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, rm, stat } from 'node:fs/promises';
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -20,6 +20,8 @@ import { sodiumReady } from '@trine/core/crypto';
 import { AttachmentStore, type PreparedInput } from '../bridge/attachments.ts';
 import { FileAccess } from '../files/access.ts';
 import { FileService } from '../files/service.ts';
+import { TrustStore } from '../files/trust-store.ts';
+import { BookmarkStore } from '../files/bookmark-store.ts';
 import { EventEmitter } from '../bridge/emitter.ts';
 import { SessionManager, type CreateSessionArgs } from '../bridge/manager.ts';
 import type { PendingPermissionSnapshot, PermissionVerdict } from '../bridge/permission.ts';
@@ -32,6 +34,7 @@ import type { PlanUsageRefreshOutcome } from './plan-usage.ts';
 import type { ClaudeUpdateOutcome } from './claude-cli.ts';
 import type { ClaudeCheckOutcome } from './claude-latest.ts';
 import { CwdStore } from './cwd-store.ts';
+import { CwdPreparer } from './cwd-prepare.ts';
 import {
   CapabilitiesCache,
   COMMAND_DESCRIPTION_MAX,
@@ -234,6 +237,8 @@ async function makeHarness(options: {
   checkClaude?: () => Promise<ClaudeCheckOutcome>;
   updateEngine?: RouterDeps['updateEngine'];
   checkEngine?: RouterDeps['checkEngine'];
+  restartEngine?: RouterDeps['restartEngine'];
+  setAutoUpdate?: RouterDeps['setAutoUpdate'];
   /** 注入限额用量刷新；省略 = router 回「不支持」 */
   refreshUsage?: () => Promise<PlanUsageRefreshOutcome>;
   /** 注入资源订阅；省略 = router 忽略 machine.stats.request */
@@ -244,11 +249,15 @@ async function makeHarness(options: {
   attachments?: AttachmentStore;
   /** 文件查看；省略 = 关闭 */
   files?: FileService;
+  /** 工作目录检查 / 创建；省略 = 不支持 */
+  cwdPreparer?: CwdPreparer;
   /** 会话关联（扩展）；省略 = 不支持 */
   links?: SessionLinksStore;
   /** 时间线记录卡（扩展）；省略 = 不支持 */
   records?: SessionRecordsStore;
   codexEngine?: RouterCodexEngine;
+  /** 原始转录的来源信息；省略 = 不注入（注入了假转录时 router 不读真文件） */
+  readTranscriptOriginsFn?: RouterDeps['readTranscriptOriginsFn'];
 } = {}) {
   const probeCalls: string[] = [];
   const historyCalls: { sessionId: string; dir: string | undefined }[] = [];
@@ -327,6 +336,8 @@ async function makeHarness(options: {
     ...(options.checkClaude === undefined ? {} : { checkClaude: options.checkClaude }),
     ...(options.updateEngine === undefined ? {} : { updateEngine: options.updateEngine }),
     ...(options.checkEngine === undefined ? {} : { checkEngine: options.checkEngine }),
+    ...(options.restartEngine === undefined ? {} : { restartEngine: options.restartEngine }),
+    ...(options.setAutoUpdate === undefined ? {} : { setAutoUpdate: options.setAutoUpdate }),
     ...(options.machineStats === undefined ? {} : { machineStats: options.machineStats }),
     now,
     log: (l) => logs.push(l),
@@ -348,8 +359,10 @@ async function makeHarness(options: {
       subagentCalls.push({ sessionId, toolUseId, cwd: locator?.cwd });
       return options.subagentTranscripts?.[`${sessionId}/${toolUseId}`] ?? [];
     },
+    ...(options.readTranscriptOriginsFn === undefined ? {} : { readTranscriptOriginsFn: options.readTranscriptOriginsFn }),
     ...(options.attachments === undefined ? {} : { attachments: options.attachments }),
     ...(options.files === undefined ? {} : { files: options.files }),
+    ...(options.cwdPreparer === undefined ? {} : { cwdPreparer: options.cwdPreparer }),
     ...(options.links === undefined ? {} : { links: options.links, machineId: 'mbp-id' }),
     ...(options.records === undefined ? {} : { records: options.records }),
     ...(options.probeCommands === undefined
@@ -890,6 +903,23 @@ describe('Router · 路由表（机器级）', () => {
     expect(h.state.sessionParams(sid)).toEqual({ cwd: '/a', model: 'm', permissionMode: 'plan', started: false });
   });
 
+  test('Claude effort 在创建、切目录和回收后恢复时保留', async () => {
+    const h = await makeHarness();
+    await h.router.handle({ type: 'session.create', ...c2a(), reqId: 'q', cwd: '/example', model: 'opus', permissionMode: 'default', effort: 'max' }, phone);
+    const sid = h.created[0]!.sessionId;
+    expect(h.created[0]!.args.effort).toBe('max');
+    expect(h.state.sessionParams(sid)?.effort).toBe('max');
+    expect(h.byType('session.create.response')[0]).toMatchObject({ session: { effort: 'max' } });
+    // 假会话只在本用例模拟 effort（其余用例仍能测不支持 setEffort 的引擎）。
+    Object.defineProperty(h.created[0]!, 'effort', { value: 'max' });
+    await h.router.handle({ type: 'session.setCwd', ...c2a(sid), cwd: '/example-next' }, phone);
+    expect(h.created[1]!.args.effort).toBe('max');
+    expect(h.state.sessionParams(sid)?.effort).toBe('max');
+    await h.manager.release(sid, 'idle');
+    await h.router.handle({ type: 'session.status.request', ...c2a(sid), reqId: 'status' }, phone);
+    expect(h.created[2]!.args.effort).toBe('max');
+  });
+
   test('session.create 满额且都在忙 → 机器级 fatal(config)，无 response', async () => {
     const h = await makeHarness({ maxConcurrent: 1 });
     const create = (reqId: string) =>
@@ -927,6 +957,7 @@ describe('Router · 路由表（机器级）', () => {
       favorites: ['/repo/b'],
       defaultCwd: '/repo/b',
       pinned: {},
+      pinOrder: [],
     });
   });
 
@@ -940,6 +971,65 @@ describe('Router · 路由表（机器级）', () => {
     await h.router.handle({ type: 'cwd.pin', ...c2a(), path: '/repo/a', pinned: false }, phone);
     expect(h.byType('cwd.updated').at(-1)).toMatchObject({ pinned: {} });
     expect((await CwdStore.load(join(dir, 'cwd.json'))).snapshot().pinned).toEqual({});
+  });
+
+  test('cwd.pin.move：应答只回请求方，成功（含幂等重复）广播带 pinOrder 的 cwd.updated，失败不广播', async () => {
+    const h = await makeHarness();
+    for (const p of ['/repo/a', '/repo/b', '/repo/c']) {
+      await h.router.handle({ type: 'cwd.pin', ...c2a(), path: p, pinned: true }, phone);
+    }
+    // 新置顶插最前
+    expect(h.byType('cwd.updated').at(-1)).toMatchObject({ pinOrder: ['/repo/c', '/repo/b', '/repo/a'] });
+    await h.router.handle({ type: 'cwd.list.request', ...c2a(), reqId: 'q0' }, phone);
+    expect(h.byType('cwd.list.response')[0]).toMatchObject({ pinOrder: ['/repo/c', '/repo/b', '/repo/a'] });
+
+    const before = h.byType('cwd.updated').length;
+    const move = (reqId: string, path: string, to: string | null) =>
+      h.router.handle({ type: 'cwd.pin.move', ...c2a(), reqId, path, before: to }, phone);
+    await move('m1', '/repo/a', '/repo/c');
+    await move('m2', '/repo/a', '/repo/c');
+    await move('m3', '/repo/zzz', null);
+    await move('m4', '/repo/a', '/repo/zzz');
+    await move('m5', '/repo/a', '/repo/a');
+    await h.router.idle();
+    const resp = (reqId: string) => h.events.find((e) => e.event.type === 'cwd.pin.move.response' && 'reqId' in e.event && e.event.reqId === reqId)!;
+    expect(resp('m1').to).toBe('phone');
+    expect(resp('m1').event).toMatchObject({ ok: true });
+    expect(resp('m2').event).toMatchObject({ ok: true });
+    expect(resp('m3').event).toMatchObject({ ok: false, error: { code: 'not_pinned' } });
+    expect(resp('m4').event).toMatchObject({ ok: false, error: { code: 'before_not_pinned' } });
+    expect(resp('m5').event).toMatchObject({ ok: false, error: { code: 'invalid' } });
+    const updates = h.byType('cwd.updated');
+    expect(updates).toHaveLength(before + 2);
+    expect(updates.at(-1)).toMatchObject({ pinOrder: ['/repo/a', '/repo/c', '/repo/b'] });
+    expect((await CwdStore.load(join(dir, 'cwd.json'))).snapshot().pinOrder).toEqual(['/repo/a', '/repo/c', '/repo/b']);
+  });
+
+  test('cwd.prepare.request：检查 / 创建只回请求方，不广播；不支持时回 failed', async () => {
+    const home = join(dir, 'home');
+    await mkdir(home);
+    const h = await makeHarness({ cwdPreparer: new CwdPreparer({ osHome: home, trineHome: join(home, '.trine') }) });
+    const prepare = (reqId: string, path: string, create: boolean) =>
+      h.router.handle({ type: 'cwd.prepare.request', ...c2a(), reqId, path, create }, phone);
+    await prepare('p1', '~/work/new', false);
+    await prepare('p2', '~/work/new', true);
+    await prepare('p3', '~/work/new', false);
+    await prepare('p4', 'relative', false);
+    await h.router.idle();
+    const resp = (reqId: string) => h.events.find((e) => e.event.type === 'cwd.prepare.response' && 'reqId' in e.event && e.event.reqId === reqId)!;
+    const target = join(home, 'work', 'new');
+    expect(resp('p1').to).toBe('phone');
+    expect(resp('p1').event).toMatchObject({ ok: true, path: target, status: 'missing', missing: [join(home, 'work'), target] });
+    expect(resp('p2').event).toMatchObject({ ok: true, path: target, status: 'created' });
+    expect(resp('p3').event).toMatchObject({ ok: true, status: 'exists' });
+    expect(resp('p4').event).toMatchObject({ ok: false, error: { code: 'invalid' } });
+    expect((await stat(target)).isDirectory()).toBe(true);
+    expect(h.byType('cwd.updated')).toHaveLength(0);
+
+    const bare = await makeHarness();
+    await bare.router.handle({ type: 'cwd.prepare.request', ...c2a(), reqId: 'x', path: '/tmp', create: false }, phone);
+    await bare.router.idle();
+    expect(bare.byType('cwd.prepare.response')[0]).toMatchObject({ ok: false, error: { code: 'failed' } });
   });
 
   test('machine.rename → 落盘回调 + 广播 machine.info；machine.unpair 忽略', async () => {
@@ -2040,13 +2130,16 @@ describe('Router · session.history.request', () => {
     expect(p2!.nextBefore).toBe('u1');
   });
 
-  test('读取异常走命令链兜底：会话级 error.fatal，不拉起会话', async () => {
+  test('读取异常：空页带 error 只回给请求方，不发 error.fatal，不拉起会话', async () => {
     const h = await makeHarness({ historyThrows: true });
     await h.router.handle({ type: 'session.history.request', ...c2a('old'), reqId: 'h1' }, phone);
-    const fatals = h.byType('error.fatal');
-    expect(fatals).toHaveLength(1);
-    expect(fatals[0]).toMatchObject({ sessionId: 'old', kind: 'other' });
-    expect((fatals[0] as { message: string }).message).toContain('读转录炸了');
+    expect(h.byType('error.fatal')).toHaveLength(0);
+    const out = h.events.filter((e) => e.event.type === 'session.history.response');
+    expect(out).toHaveLength(1);
+    expect(out[0]!.to).toBe('phone');
+    const res = out[0]!.event as Extract<OutboundEvent['event'], { type: 'session.history.response' }>;
+    expect(res).toMatchObject({ reqId: 'h1', items: [], hasMore: false });
+    expect(res.error?.message).toContain('读转录炸了');
     expect(h.created).toHaveLength(0);
   });
 });
@@ -2340,6 +2433,36 @@ describe('Router · 回退', () => {
     expect(h.byType('error.fatal')).toHaveLength(0);
   });
 
+  test('系统来源的任务通知行：历史里不是用户消息，也不能选为回退目标（两处口径一致）', async () => {
+    const notice = '<task-notification>\n<task-id>t1</task-id>\n<tool-use-id>toolu_bg</tool-use-id>\n<status>completed</status>\n<result>r</result>\n</task-notification>';
+    const lines: SessionMessage[] = [
+      ...transcript(1),
+      tline('assistant', 'a-bg', { id: 'msg_bg', role: 'assistant', content: [{ type: 'tool_use', id: 'toolu_bg', name: 'Agent', input: { description: 'd' } }] }, 10),
+      tline('user', 'r-bg', { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'toolu_bg', content: 'Async agent launched successfully.' }] }, 11),
+      tline('user', 'n1', { role: 'user', content: notice }, 12),
+      tline('assistant', 'a-n', { id: 'msg_n', role: 'assistant', content: [{ type: 'text', text: 'ok' }] }, 13),
+    ];
+    const run = async (origins: RouterDeps['readTranscriptOriginsFn']) => {
+      const h = await makeHarness({ transcripts: { old: lines }, ...(origins === undefined ? {} : { readTranscriptOriginsFn: origins }) });
+      h.state.rememberSession('old', params);
+      await h.router.handle({ type: 'session.history.request', ...c2a('old'), reqId: 'h1' }, phone);
+      await h.router.handle({ type: 'session.rewind', ...c2a('old'), reqId: 'r1', targetMessageId: 'n1', mode: 'conversation' }, phone);
+      const history = (h.byType('session.history.response') as Ev<'session.history.response'>[])[0]!;
+      const rewind = (h.byType('session.rewind.response') as Ev<'session.rewind.response'>[])[0]!;
+      return { ids: history.items.map((i) => `${i.kind}:${i.id}`), tool: history.items.find((i) => i.id === 'toolu_bg'), rewind };
+    };
+    // 不注入来源：按结构 + 关联 id 认出
+    const plain = await run(undefined);
+    expect(plain.ids).not.toContain('user:n1');
+    expect(plain.tool).toMatchObject({ subagent: { background: true, state: 'completed' } });
+    expect(plain.rewind.error?.code).toBe('invalid');
+    // 原始转录说这行是人发的：照常是用户消息、可回退
+    const human = await run(async () => ({ origins: new Map([['n1', 'human']]), notices: [] }));
+    expect(human.ids).toContain('user:n1');
+    expect(human.tool).toMatchObject({ subagent: { state: 'unknown' } });
+    expect(human.rewind.ok).toBe(true);
+  });
+
   test('目标给 clientMsgId：映射回转录 uuid，广播带上两种 id', async () => {
     const h = await rewindHarness();
     await h.router.handle({ type: 'session.status.request', ...c2a('old'), reqId: 's' }, phone);
@@ -2549,15 +2672,81 @@ describe('Router · 文件查看', () => {
     const repo = join(dir, 'repo');
     mkdirSync(join(repo, 'docs'), { recursive: true });
     writeFileSync(join(repo, 'docs', 'a.md'), '# a');
+    const trust = TrustStore.memory();
+    const bookmarks = BookmarkStore.memory();
     const files = new FileService({
-      access: new FileAccess({ allow: [], osHome: dir, trineHome: join(dir, 'trine-home') }),
+      access: new FileAccess({ allow: [], trusted: () => trust.list().map((d) => d.path), osHome: dir, trineHome: join(dir, 'trine-home') }),
       maxBytes: 1024,
       blobs: () => blobs,
+      trust,
+      bookmarks,
     });
     const h = await makeHarness(withFiles ? { files } : {});
     h.state.rememberSession('s1', { ...params, cwd: repo });
-    return { ...h, repo, blobs };
+    return { ...h, repo, blobs, trust, bookmarks };
   }
+
+  test('files.bookmark.add / remove：存在 agent，应答只回请求方并重发 machine.info；非绝对路径拒绝', async () => {
+    const h = await setup();
+    await h.router.handle({ type: 'files.bookmark.add', ...c2a(), reqId: 'b1', path: `${h.repo}/docs/`, kind: 'dir' }, phone);
+    await h.router.handle({ type: 'files.bookmark.add', ...c2a(), reqId: 'b2', path: `${h.repo}/docs/a.md`, kind: 'file' }, phone);
+    await h.router.handle({ type: 'files.bookmark.add', ...c2a(), reqId: 'b3', path: 'docs', kind: 'dir' }, phone);
+    await h.router.idle();
+    const r = (reqId: string) => h.events.find((e) => e.event.type === 'files.bookmark.response' && 'reqId' in e.event && e.event.reqId === reqId);
+    expect(r('b1')?.to).toBe('phone');
+    expect(r('b1')?.event).toMatchObject({ ok: true, path: `${h.repo}/docs` });
+    expect(r('b3')?.event).toMatchObject({ ok: false, error: { code: 'invalid' } });
+    expect(h.bookmarks.list().map((b) => [b.path, b.kind])).toEqual([
+      [`${h.repo}/docs/a.md`, 'file'],
+      [`${h.repo}/docs`, 'dir'],
+    ]);
+    expect(h.byType('machine.info')).toHaveLength(2);
+
+    await h.router.handle({ type: 'files.bookmark.remove', ...c2a(), reqId: 'b4', path: `${h.repo}/docs` }, phone);
+    await h.router.handle({ type: 'files.bookmark.remove', ...c2a(), reqId: 'b5', path: '/nope' }, phone);
+    await h.router.idle();
+    expect(r('b4')?.event).toMatchObject({ ok: true });
+    expect(r('b5')?.event).toMatchObject({ ok: true });
+    expect(h.bookmarks.list().map((b) => b.path)).toEqual([`${h.repo}/docs/a.md`]);
+  });
+
+  test('关闭文件查看：files.bookmark.* 回 failed', async () => {
+    const h = await setup(false);
+    await h.router.handle({ type: 'files.bookmark.add', ...c2a(), reqId: 'b1', path: '/w', kind: 'dir' }, phone);
+    await h.router.idle();
+    expect(h.byType('files.bookmark.response')[0]).toMatchObject({ ok: false, error: { code: 'failed' } });
+    expect(h.byType('machine.info')).toHaveLength(0);
+  });
+
+  test('往上走到范围外：denied 带 reason；files.trust.add 后可浏览，应答只回请求方并重发 machine.info', async () => {
+    const h = await setup();
+    await h.router.handle({ type: 'fs.list.request', ...c2a('s1'), reqId: 'l1', path: '..' }, phone);
+    await h.router.idle();
+    expect(h.byType('fs.list.response')[0]).toMatchObject({ ok: false, error: { code: 'denied', reason: 'out_of_scope' } });
+
+    await h.router.handle({ type: 'files.trust.add', ...c2a(), reqId: 't1', path: dir }, phone);
+    await h.router.idle();
+    const resp = h.events.find((e) => e.event.type === 'files.trust.response')!;
+    expect(resp.to).toBe('phone');
+    expect(resp.event).toMatchObject({ reqId: 't1', ok: true, path: dir });
+    expect(h.byType('machine.info')).toHaveLength(1);
+    expect(h.trust.list().map((d) => d.path)).toEqual([dir]);
+
+    await h.router.handle({ type: 'fs.list.request', ...c2a('s1'), reqId: 'l2', path: '..' }, phone);
+    await h.router.idle();
+    expect(h.byType('fs.list.response')[1]).toMatchObject({ ok: true, path: dir, root: dir });
+
+    await h.router.handle({ type: 'files.trust.add', ...c2a(), reqId: 't2', path: '/' }, phone);
+    await h.router.handle({ type: 'files.trust.remove', ...c2a(), reqId: 't3', path: '/nope' }, phone);
+    await h.router.handle({ type: 'files.trust.remove', ...c2a(), reqId: 't4', path: dir }, phone);
+    await h.router.idle();
+    const r = (reqId: string) => h.byType('files.trust.response').find((e) => 'reqId' in e && e.reqId === reqId);
+    expect(r('t2')).toMatchObject({ ok: false, error: { code: 'denied' } });
+    expect(r('t3')).toMatchObject({ ok: false, error: { code: 'not_trusted' } });
+    expect(r('t4')).toMatchObject({ ok: true });
+    expect(h.byType('machine.info')).toHaveLength(2);
+    expect(h.trust.list()).toEqual([]);
+  });
 
   test('fs.list / fs.read：范围是会话 cwd，只回请求方，不拉起会话', async () => {
     const h = await setup();
@@ -2723,6 +2912,32 @@ describe('Router · Codex 引擎', () => {
     expect(h.state.sessionParams('codex-new')).toMatchObject({ effort: 'high' });
   });
 
+  test('extHost.createSession 换成 Codex：走 thread/start；机器没有该引擎就拒绝', async () => {
+    const h = await makeHarness({ codexEngine });
+    const host = h.router.extHost();
+    const created = await host.createSession({
+      cwd: '/a',
+      model: 'gpt-x',
+      permissionMode: 'default',
+      engine: 'codex',
+      engineMode: 'full',
+      effort: 'high',
+      ext: 'tasks',
+      links: [],
+      prompt: '接续',
+    });
+    expect(created.sessionId).toBe('codex-new');
+    expect(h.created[0]!.args).toMatchObject({ engine: 'codex', effort: 'high' });
+    // 不认识的模式：拒绝，不退回完全访问
+    await expect(
+      host.createSession({ cwd: '/a', model: 'm', permissionMode: 'default', engine: 'codex', engineMode: 'bogus', ext: 'tasks', links: [], prompt: 'x' }),
+    ).rejects.toThrow('不认识权限模式');
+    const bare = await makeHarness({});
+    await expect(
+      bare.router.extHost().createSession({ cwd: '/a', model: 'm', permissionMode: 'default', engine: 'codex', ext: 'tasks', links: [], prompt: 'x' }),
+    ).rejects.toThrow('不支持引擎');
+  });
+
   test('推理强度：记下用户的选择，换模型调整后的值也记；不支持的引擎不理', async () => {
     const h = await makeHarness({ codexEngine });
     await h.router.handle({ type: 'session.create', ...c2a(), reqId: 'q', cwd: '/a', model: 'default', permissionMode: 'default', engine: 'codex', effort: 'high' }, phone);
@@ -2785,6 +3000,52 @@ describe('Router · Codex 引擎', () => {
     const checks = h.byType('machine.engine.check.response');
     expect(checks).toContainEqual(expect.objectContaining({ reqId: 'k1', ok: true, latest: { version: '1.1.0' } }));
     expect(checks).toContainEqual(expect.objectContaining({ reqId: 'k2', ok: false, error: expect.objectContaining({ code: 'failed' }) }));
+  });
+
+  test('machine.engine.autoupdate.set：转交结果；没接上回 not_found，出错回 failed', async () => {
+    const seen: [string, boolean][] = [];
+    const h = await makeHarness({
+      setAutoUpdate: async (engine: string, enabled: boolean) => {
+        seen.push([engine, enabled]);
+        if (engine === 'boom') throw new Error('写不了');
+        return { ok: true as const, enabled };
+      },
+    });
+    await h.router.handle({ type: 'machine.engine.autoupdate.set', ...c2a(), reqId: 'a1', engine: 'codex', enabled: true }, phone);
+    await h.router.handle({ type: 'machine.engine.autoupdate.set', ...c2a(), reqId: 'a2', engine: 'boom', enabled: true }, phone);
+    await h.router.idle();
+    expect(seen).toEqual([['codex', true], ['boom', true]]);
+    const res = h.byType('machine.engine.autoupdate.response');
+    expect(res).toContainEqual(expect.objectContaining({ reqId: 'a1', engine: 'codex', ok: true, enabled: true }));
+    expect(res).toContainEqual(expect.objectContaining({ reqId: 'a2', ok: false, error: expect.objectContaining({ code: 'failed' }) }));
+
+    const bare = await makeHarness({});
+    await bare.router.handle({ type: 'machine.engine.autoupdate.set', ...c2a(), reqId: 'a3', engine: 'codex', enabled: true }, phone);
+    await bare.router.idle();
+    expect(bare.byType('machine.engine.autoupdate.response')[0]).toMatchObject({ ok: false, enabled: false, error: { code: 'not_found' } });
+  });
+
+  test('machine.engine.restart.request：转交结果；不支持的引擎回 unavailable，出错回 failed', async () => {
+    const h = await makeHarness({
+      restartEngine: async (engine: string) => {
+        if (engine === 'boom') throw new Error('炸了');
+        if (engine === 'busy') return { ok: false as const, error: { code: 'busy' as const, message: '1 个会话在忙' } };
+        return engine === 'codex' ? { ok: true as const, daemon: 'failed' as const, daemonMessage: 'daemon 重启超时' } : undefined;
+      },
+    });
+    for (const engine of ['codex', 'other', 'boom', 'busy']) {
+      await h.router.handle({ type: 'machine.engine.restart.request', ...c2a(), reqId: `r-${engine}`, engine }, phone);
+    }
+    await h.router.idle();
+    const res = h.byType('machine.engine.restart.response');
+    expect(res).toContainEqual(
+      expect.objectContaining({ reqId: 'r-codex', ok: true, engine: 'codex', daemon: 'failed', daemonMessage: 'daemon 重启超时' }),
+    );
+    expect(res).toContainEqual(expect.objectContaining({ reqId: 'r-other', ok: false, error: expect.objectContaining({ code: 'unavailable' }) }));
+    expect(res).toContainEqual(
+      expect.objectContaining({ reqId: 'r-boom', ok: false, error: expect.objectContaining({ code: 'failed', message: expect.stringContaining('炸了') }) }),
+    );
+    expect(res).toContainEqual(expect.objectContaining({ reqId: 'r-busy', ok: false, error: { code: 'busy', message: '1 个会话在忙' } }));
   });
 
   test('历史走引擎，不读 Claude 转录', async () => {

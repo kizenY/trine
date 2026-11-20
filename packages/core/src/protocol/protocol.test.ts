@@ -12,7 +12,7 @@ import {
   TransportFrameSchema,
   type E2eEvent,
 } from './index.ts';
-import { EngineSummarySchema, SessionMetaSchema } from '../types/index.ts';
+import { EngineSummarySchema, MachineFilesInfoSchema, SessionMetaSchema } from '../types/index.ts';
 
 const ts = Date.now();
 
@@ -244,6 +244,29 @@ describe('E2E 事件帧', () => {
       error: { code: 'not_found', message: 'gone' },
     };
     expect(AgentToClientEventSchema.parse(res).type).toBe('attachment.fetch.response');
+  });
+
+  test('files.trust.* 与 fs denied reason（trusted-browse-dirs）', () => {
+    const m = { ts, seq: 1, dir: 'c2a' } as const;
+    expect(ClientToAgentEventSchema.parse({ type: 'files.trust.add', ...m, reqId: 'r', path: '~/w' }).type).toBe('files.trust.add');
+    expect(ClientToAgentEventSchema.safeParse({ type: 'files.trust.remove', ...m, reqId: 'r', path: '' }).success).toBe(false);
+    const res = { type: 'files.trust.response', ts, seq: 1, dir: 'a2c', reqId: 'r', ok: false, error: { code: 'denied', message: 'x' } };
+    expect(AgentToClientEventSchema.parse(res).type).toBe('files.trust.response');
+    const denied = { type: 'fs.list.response', ...a2c, reqId: 'l', ok: false, error: { code: 'denied', message: 'x', reason: 'out_of_scope' } };
+    const parsed = AgentToClientEventSchema.parse(denied);
+    expect(parsed.type === 'fs.list.response' && parsed.error?.reason).toBe('out_of_scope');
+  });
+
+  test('files.bookmark.* 与 machine.info.files.bookmarks（file-bookmarks）', () => {
+    const add = { type: 'files.bookmark.add', ...c2a, reqId: 'r', path: '/w/a.md', kind: 'file' };
+    expect(ClientToAgentEventSchema.parse(add).type).toBe('files.bookmark.add');
+    expect(ClientToAgentEventSchema.safeParse({ ...add, kind: 'link' }).success).toBe(false);
+    expect(ClientToAgentEventSchema.safeParse({ type: 'files.bookmark.remove', ...c2a, reqId: 'r', path: '' }).success).toBe(false);
+    const res = { type: 'files.bookmark.response', ...a2c, reqId: 'r', ok: false, error: { code: 'invalid', message: 'x' } };
+    expect(AgentToClientEventSchema.parse(res).type).toBe('files.bookmark.response');
+    expect(MachineFilesInfoSchema.parse({ maxBytes: 1, bookmarks: [{ path: '/w', kind: 'dir', addedAt: 1 }] }).bookmarks).toHaveLength(1);
+    expect(MachineFilesInfoSchema.safeParse({ maxBytes: 1, bookmarks: [{ path: 'w', kind: 'dir' }] }).success).toBe(false);
+    expect(MachineFilesInfoSchema.parse({ maxBytes: 1 }).bookmarks).toBeUndefined();
   });
 
   test('fs.list / fs.read 请求与应答', () => {
@@ -675,6 +698,40 @@ describe('子 agent 过程（subagent-view）', () => {
     expect(AgentToClientEventSchema.safeParse(plain).success).toBe(true);
   });
 
+  test('tool.start / tool.end / history tool 条目可带 subagent（字段全可选，state 限枚举）', () => {
+    const start = {
+      type: 'tool.start',
+      ...a2c,
+      toolUseId: 't3',
+      toolName: 'Agent',
+      argSummary: 'probe',
+      subagent: { agentType: 'Explore', background: true },
+    };
+    expect(AgentToClientEventSchema.parse(start)).toEqual(start as never);
+    const end = {
+      type: 'tool.end',
+      ...a2c,
+      toolUseId: 't3',
+      status: 'ok',
+      durationMs: 5,
+      resultSummary: '✓',
+      subagent: { background: true, state: 'completed' },
+    };
+    expect(AgentToClientEventSchema.parse(end)).toEqual(end as never);
+    expect(AgentToClientEventSchema.safeParse({ ...end, subagent: { state: 'weird' } }).success).toBe(false);
+    expect(AgentToClientEventSchema.safeParse({ ...start, subagent: { agentType: '' } }).success).toBe(false);
+    const codex = { ...start, toolName: 'SubAgent', subagent: { nickname: 'n1', model: 'm1', agentId: 'thr-1', state: 'not_found' } };
+    expect(AgentToClientEventSchema.parse(codex)).toEqual(codex as never);
+    const history = {
+      type: 'session.history.response',
+      ...a2c,
+      reqId: 'r1',
+      items: [{ kind: 'tool', id: 't3', toolName: 'Agent', argSummary: 'x', subagent: { state: 'unknown', background: true }, ts }],
+      hasMore: false,
+    };
+    expect(AgentToClientEventSchema.parse(history)).toEqual(history as never);
+  });
+
   test('permission.request 可带 parentToolUseId', () => {
     const frame = {
       type: 'permission.request',
@@ -811,13 +868,25 @@ describe('远程更新 claude（claude-update）', () => {
     expect(ClientToAgentEventSchema.safeParse({ ...c2a, type: 'session.setEffort' }).success).toBe(true);
     expect(ClientToAgentEventSchema.safeParse({ ...noSession, type: 'machine.engine.update.request', reqId: 'r', engine: 'codex' }).success).toBe(true);
     expect(ClientToAgentEventSchema.safeParse({ ...noSession, type: 'machine.engine.check.request', reqId: 'r' }).success).toBe(false);
+    expect(ClientToAgentEventSchema.safeParse({ ...noSession, type: 'machine.engine.restart.request', reqId: 'r', engine: 'codex' }).success).toBe(true);
     const machine = { ts, seq: 1, dir: 'a2c' } as const;
+    const restart = { ...machine, type: 'machine.engine.restart.response', reqId: 'r', engine: 'codex' } as const;
+    expect(AgentToClientEventSchema.safeParse({ ...restart, ok: true, daemon: 'failed', daemonMessage: 'x' }).success).toBe(true);
+    expect(AgentToClientEventSchema.safeParse({ ...restart, ok: false, error: { code: 'busy', message: 'x' } }).success).toBe(true);
+    expect(AgentToClientEventSchema.safeParse({ ...restart, ok: true, daemon: 'stopped' }).success).toBe(false);
     expect(
       AgentToClientEventSchema.safeParse({ ...machine, type: 'machine.engine.update.response', reqId: 'r', engine: 'codex', ok: true, fromVersion: '1', toVersion: '2', output: '' }).success,
     ).toBe(true);
     expect(
       AgentToClientEventSchema.safeParse({ ...machine, type: 'machine.engine.check.response', reqId: 'r', engine: 'codex', ok: true, latest: { version: '2' } }).success,
     ).toBe(true);
+    // 自动更新开关
+    expect(ClientToAgentEventSchema.safeParse({ ...noSession, type: 'machine.engine.autoupdate.set', reqId: 'r', engine: 'codex', enabled: true }).success).toBe(true);
+    expect(ClientToAgentEventSchema.safeParse({ ...noSession, type: 'machine.engine.autoupdate.set', reqId: 'r', engine: 'codex' }).success).toBe(false);
+    const auto = { ...machine, type: 'machine.engine.autoupdate.response', reqId: 'r', engine: 'codex' } as const;
+    expect(AgentToClientEventSchema.safeParse({ ...auto, ok: true, enabled: true }).success).toBe(true);
+    expect(AgentToClientEventSchema.safeParse({ ...auto, ok: false, enabled: false, error: { code: 'not_found', message: 'x' } }).success).toBe(true);
+    expect(AgentToClientEventSchema.safeParse({ ...auto, ok: false, enabled: false, error: { code: 'busy', message: 'x' } }).success).toBe(false);
   });
 
   test('machine.claude.update.response：成功 / 各失败码 / 输出长度上限', () => {

@@ -113,6 +113,18 @@ describe('storage · peer 落盘取 max', () => {
     expect(loadPrefs(kv)).toMatchObject({ defaultModel: 'sonnet[1m]', defaultPermissionMode: 'plan' });
   });
 
+  test('各引擎 effort 默认值独立持久化；旧配置和坏值不影响模型 / 权限', () => {
+    const kv = new MemoryKv();
+    const base = loadPrefs(kv);
+    expect(base.engineDefaults).toEqual({});
+    savePrefs(kv, { ...base, engineDefaults: { claude: { effort: 'max' }, codex: { model: 'example-model', mode: 'read-only', effort: 'ultra' } } });
+    expect(loadPrefs(kv).engineDefaults).toEqual({ claude: { effort: 'max' }, codex: { model: 'example-model', mode: 'read-only', effort: 'ultra' } });
+    kv.set('trine.prefs', JSON.stringify({ ...base, engineDefaults: { codex: { model: 'example-model', mode: 'read-only', effort: 42 } } }));
+    const defaults = loadPrefs(kv).engineDefaults;
+    expect(defaults.codex).toMatchObject({ model: 'example-model', mode: 'read-only' });
+    expect(defaults.codex?.effort).toBeUndefined();
+  });
+
   test('sendKey：老 prefs 缺字段 / 坏值落默认 enter，合法值保留', () => {
     const kv = new MemoryKv();
     const base = { v: 1, theme: 'system', promptSnippets: [], knownModels: [], knownModelsSeed: KNOWN_MODELS_SEED };
@@ -265,5 +277,18 @@ describe('MachineDoc：一条坏会话行不该丢掉整份快照（N7）', () =
     const doc = await loadMachineDoc(docs, 'mbp', (n) => dropped.push(n));
     expect(Object.keys(doc!.sessions)).toEqual(['a']);
     expect(dropped).toEqual([]);
+  });
+
+  test('cwd 快照带 pinOrder：往返保留；形状不对只丢 pinOrder 自己', async () => {
+    const docs = new MemoryDocStore();
+    const pinnedCwd = { favorites: [], defaultCwd: '/', pinned: { '/a': 1, '/b': 2 }, pinOrder: ['/a', '/b'] };
+    await saveMachineDoc(docs, 'mbp', { info, cwd: pinnedCwd, sessions: {} });
+    expect((await loadMachineDoc(docs, 'mbp'))?.cwd).toEqual(pinnedCwd);
+
+    await docs.set('machine:mbp', { v: 1, info, cwd: { ...pinnedCwd, pinOrder: 'garbage' }, sessions: {} });
+    const doc = await loadMachineDoc(docs, 'mbp');
+    expect(doc?.info).toEqual(info);
+    expect(doc?.cwd?.pinned).toEqual({ '/a': 1, '/b': 2 });
+    expect(doc?.cwd?.pinOrder).toBeUndefined();
   });
 });

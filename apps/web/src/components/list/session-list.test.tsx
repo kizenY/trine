@@ -47,16 +47,23 @@ let router: ReturnType<typeof createMemoryRouter> | null = null;
 
 function render(
   sessions: Record<string, Record<string, SessionMeta>>,
-  opts: { actions?: Actions; query?: Partial<Query>; at?: '/' | '/archived' } = {},
+  opts: {
+    actions?: Actions;
+    query?: Partial<Query>;
+    at?: '/' | '/archived';
+    machines?: Record<string, MachineState>;
+    onNewSessionIn?: (machineId: string, cwd: string) => void;
+  } = {},
 ): void {
   const query: Query = { ...DEFAULT_LIST_QUERY, groupBy: 'none', ...opts.query };
   const list = (
     <SessionList
       sessions={sessions}
-      machines={machines}
+      machines={opts.machines ?? machines}
       query={query}
       now={2}
       {...(opts.actions === undefined ? {} : { actions: opts.actions })}
+      {...(opts.onNewSessionIn === undefined ? {} : { onNewSessionIn: opts.onNewSessionIn })}
     />
   );
   router = createMemoryRouter(
@@ -291,6 +298,17 @@ describe('工作空间分组', () => {
     host?.remove();
     render(sessions, { query: { groupBy: 'workspace' }, actions: { onOpenWorkspace, supportsLinks: () => false } });
     expect($$('session-group-menu')).toHaveLength(0);
+  });
+
+  test('复制目录：组头菜单复制工作区目录（未知目录没有菜单）', () => {
+    const onCopyCwd = mock((_cwd: string) => {});
+    render(sessions, { query: { groupBy: 'workspace' }, actions: { onCopyCwd } });
+    expect($$('session-group-menu')).toHaveLength(2);
+    openMenu($$('session-group-menu')[1]!);
+    expect($('group-menu-pin')).toBeNull();
+    expect($('group-menu-copy-cwd')?.textContent).toBe('复制目录');
+    click($('group-menu-copy-cwd')!);
+    expect(onCopyCwd.mock.calls).toEqual([['/w/two']]);
   });
 
   test('扩展：关联的会话在行上显示关联标签（多条时 +n）', () => {
@@ -659,5 +677,343 @@ describe('多引擎：行标签与菜单', () => {
     expect(show({ engines }, meta({ sessionId: 'a', engine: 'codex' }))).toContain('Codex');
     expect(show({ engines }, meta({ sessionId: 'a' }))).toContain('Claude');
     expect(show({ engines: [engines[0]] }, meta({ sessionId: 'a' }))).toBeUndefined();
+  });
+});
+
+describe('置顶空组与「在此目录新建会话」（plan §2 / §3）', () => {
+  const withCwd = (online: boolean, pinned: Record<string, number>) =>
+    ({
+      m: { machineId: 'm', name: 'MBP', online, lastSeenAt: 1, parkedCount: 0, cwd: { favorites: [], defaultCwd: '/', pinned } },
+    }) as unknown as Record<string, MachineState>;
+
+  test('全部会话已归档：置顶目录显示为空组，带「暂无会话」与新建按钮', () => {
+    const calls: [string, string][] = [];
+    render(
+      { m: { a: meta({ sessionId: 'a', cwd: '/p', archived: true }) } },
+      { query: { groupBy: 'workspace' }, machines: withCwd(true, { '/p': 1 }), onNewSessionIn: (m, c) => calls.push([m, c]) },
+    );
+    expect($('session-list-empty')).toBeNull();
+    expect($('session-group-empty')?.textContent).toContain('暂无会话');
+    click($('session-group-empty-new')!);
+    click($('session-group-new')!);
+    expect(calls).toEqual([
+      ['m', '/p'],
+      ['m', '/p'],
+    ]);
+  });
+
+  test('离线机器：缓存的置顶照常显示，空组新建按钮禁用并说明；组头「+」仍可打开（sheet 里说明原因）', () => {
+    render({}, { query: { groupBy: 'workspace' }, machines: withCwd(false, { '/p': 1 }), onNewSessionIn: () => {} });
+    expect(($('session-group-empty-new') as HTMLButtonElement).disabled).toBe(true);
+    expect($('session-group-empty-blocked')?.textContent).toContain('离线');
+    expect(($('session-group-new') as HTMLButtonElement).disabled).toBe(false);
+  });
+
+  test('组菜单有「在此目录新建会话」；未知目录组不显示入口', () => {
+    const calls: string[] = [];
+    render(
+      { m: { a: meta({ sessionId: 'a', cwd: '/x' }), b: meta({ sessionId: 'b', cwd: '' }) } },
+      { query: { groupBy: 'workspace' }, onNewSessionIn: (_m, c) => calls.push(c) },
+    );
+    expect($$('session-group-new')).toHaveLength(1);
+    openMenu($$('session-group-menu')[0]!);
+    click($('group-menu-new-session')!);
+    expect(calls).toEqual(['/x']);
+  });
+
+  test('置顶组菜单：上移 / 下移 / 移到本机最前，按有效顺序算 before；旧 agent 没有这些项；离线禁用', () => {
+    const moves: [string, string, string | null][] = [];
+    const orderMachines = (online: boolean, pinOrder: boolean) =>
+      ({
+        m: {
+          machineId: 'm',
+          name: 'MBP',
+          online,
+          lastSeenAt: 1,
+          parkedCount: 0,
+          info: pinOrder ? { cwd: { pinOrder: true } } : null,
+          cwd: { favorites: [], defaultCwd: '/', pinned: { '/a': 1, '/b': 2, '/c': 3 }, pinOrder: ['/a', '/b', '/c'] },
+        },
+      }) as unknown as Record<string, MachineState>;
+    const actions: Actions = {
+      onPinWorkspace: () => {},
+      supportsPinOrder: () => true,
+      onMovePinnedWorkspace: (m, c, b) => {
+        moves.push([m, c, b]);
+      },
+    };
+    render({}, { query: { groupBy: 'workspace' }, machines: orderMachines(true, true), actions });
+    expect($$('session-group').map((g) => g.dataset.groupKey)).toEqual(['/a', '/b', '/c'].map((c) => groupKey('m', c)));
+    openMenu($$('session-group-menu')[1]!);
+    expect(($('group-menu-move-up') as HTMLElement).dataset.disabled).toBeUndefined();
+    click($('group-menu-move-down')!);
+    openMenu($$('session-group-menu')[2]!);
+    click($('group-menu-move-top')!);
+    expect(moves).toEqual([
+      ['m', '/b', null],
+      ['m', '/c', '/a'],
+    ]);
+    act(() => root?.unmount());
+    document.body.innerHTML = '';
+
+    render({}, { query: { groupBy: 'workspace' }, machines: orderMachines(false, true), actions });
+    openMenu($$('session-group-menu')[1]!);
+    expect($('group-menu-move-up')?.dataset.disabled).toBe('');
+    act(() => root?.unmount());
+    document.body.innerHTML = '';
+
+    render({}, { query: { groupBy: 'workspace' }, machines: orderMachines(true, true), actions: { ...actions, supportsPinOrder: () => false } });
+    openMenu($$('session-group-menu')[1]!);
+    expect($('group-menu-move-up')).toBeNull();
+    act(() => root?.unmount());
+    document.body.innerHTML = '';
+
+    // 与中继断开 / 有在途移动（pinMoveBlocked）：机器虽在线也禁用，并写明原因
+    render({}, {
+      query: { groupBy: 'workspace' },
+      machines: orderMachines(true, true),
+      actions: { ...actions, pinMoveBlocked: () => '与中继的连接已断开，暂不能调整顺序' },
+    });
+    openMenu($$('session-group-menu')[1]!);
+    expect($('group-menu-move-up')?.dataset.disabled).toBe('');
+    expect($('group-menu-move-up')?.getAttribute('title')).toContain('中继');
+  });
+
+  test('拖柄：只在精确指针、机器在线、agent 支持、没有筛选时出现；每台机器一段', () => {
+    const realMatchMedia = globalThis.matchMedia;
+    const setPointerFine = (fine: boolean): void => {
+      globalThis.matchMedia = ((q: string) => ({
+        matches: q === '(pointer: fine)' ? fine : realMatchMedia(q).matches,
+        media: q,
+        addEventListener: () => {},
+        removeEventListener: () => {},
+      })) as unknown as typeof matchMedia;
+    };
+    const two = (online: boolean) =>
+      Object.fromEntries(
+        ['m', 'n'].map((id) => [
+          id,
+          {
+            machineId: id,
+            name: id.toUpperCase(),
+            online,
+            lastSeenAt: 1,
+            parkedCount: 0,
+            info: { cwd: { pinOrder: true } },
+            cwd: { favorites: [], defaultCwd: '/', pinned: { '/a': 1, '/b': 2 } },
+          },
+        ]),
+      ) as unknown as Record<string, MachineState>;
+    const actions: Actions = { onPinWorkspace: () => {}, supportsPinOrder: () => true, onMovePinnedWorkspace: () => {} };
+    const reset = (): void => {
+      act(() => root?.unmount());
+      document.body.innerHTML = '';
+    };
+    try {
+      setPointerFine(true);
+      render({}, { query: { groupBy: 'workspace' }, machines: two(true), actions });
+      expect($$('session-group-drag')).toHaveLength(4);
+      expect($$('session-group-sortable')).toHaveLength(4);
+      // 拖柄是组头按钮的兄弟，键盘可聚焦
+      const handle = $$('session-group-drag')[0]!;
+      expect(handle.closest('[data-testid="session-group-header"]')).toBeNull();
+      expect(handle.getAttribute('aria-roledescription')).not.toBeNull();
+      reset();
+
+      render({}, { query: { groupBy: 'workspace' }, machines: two(false), actions });
+      expect($$('session-group-drag')).toHaveLength(0);
+      reset();
+
+      render({ m: { x: meta({ sessionId: 'x', cwd: '/a' }) } }, { query: { groupBy: 'workspace', search: 'a' }, machines: two(true), actions });
+      expect($$('session-group-drag')).toHaveLength(0);
+      reset();
+
+      setPointerFine(false);
+      render({}, { query: { groupBy: 'workspace' }, machines: two(true), actions });
+      expect($$('session-group-drag')).toHaveLength(0);
+      // 触屏仍有菜单里的上移 / 下移
+      openMenu($$('session-group-menu')[0]!);
+      expect($('group-menu-move-down')).not.toBeNull();
+    } finally {
+      globalThis.matchMedia = realMatchMedia;
+    }
+  });
+
+  test('拖柄的键盘操作：空格拿起 → ↓ → 空格放下 = 移到下一项之后', async () => {
+    const realMatchMedia = globalThis.matchMedia;
+    const realRect = window.HTMLElement.prototype.getBoundingClientRect;
+    globalThis.matchMedia = ((q: string) => ({
+      matches: q === '(pointer: fine)',
+      media: q,
+      addEventListener: () => {},
+      removeEventListener: () => {},
+    })) as unknown as typeof matchMedia;
+    // happy-dom 不排版：按组的先后给每个可拖组一个 40px 高的竖直位置
+    window.HTMLElement.prototype.getBoundingClientRect = function (this: HTMLElement) {
+      const sortable = this.closest<HTMLElement>('[data-testid="session-group-sortable"]');
+      const all = $$('session-group-sortable');
+      const i = sortable === null ? 0 : all.indexOf(sortable);
+      const top = i * 40;
+      return { x: 0, y: top, top, left: 0, right: 300, bottom: top + 40, width: 300, height: 40, toJSON: () => ({}) } as DOMRect;
+    };
+    const moves: [string, string | null][] = [];
+    try {
+      render(
+        {},
+        {
+          query: { groupBy: 'workspace' },
+          machines: {
+            m: {
+              machineId: 'm',
+              name: 'MBP',
+              online: true,
+              lastSeenAt: 1,
+              parkedCount: 0,
+              info: { cwd: { pinOrder: true } },
+              cwd: { favorites: [], defaultCwd: '/', pinned: { '/a': 1, '/b': 2, '/c': 3 }, pinOrder: ['/a', '/b', '/c'] },
+            },
+          } as unknown as Record<string, MachineState>,
+          actions: { onPinWorkspace: () => {}, supportsPinOrder: () => true, onMovePinnedWorkspace: (_m, c, b) => void moves.push([c, b]) },
+        },
+      );
+      const handle = $$('session-group-drag')[0]!;
+      const key = (code: string): void => {
+        act(() => {
+          handle.dispatchEvent(new window.KeyboardEvent('keydown', { code, key: code === 'Space' ? ' ' : code, bubbles: true, cancelable: true }));
+        });
+      };
+      act(() => handle.focus());
+      key('Space');
+      await act(async () => await new Promise((r) => setTimeout(r, 0)));
+      key('ArrowDown');
+      await act(async () => await new Promise((r) => setTimeout(r, 0)));
+      key('Space');
+      await act(async () => await new Promise((r) => setTimeout(r, 0)));
+      expect(moves).toEqual([['/a', '/c']]);
+    } finally {
+      globalThis.matchMedia = realMatchMedia;
+      window.HTMLElement.prototype.getBoundingClientRect = realRect;
+    }
+  });
+
+  test('组头观感：末两级路径 + title 全路径；机器名只在全部机器且多台时出现；置顶区后有分隔线', () => {
+    const many = (n: number) =>
+      Object.fromEntries(
+        ['m', 'n'].slice(0, n).map((id) => [
+          id,
+          { machineId: id, name: `Machine-${id}`, online: true, lastSeenAt: 1, parkedCount: 0, cwd: { favorites: [], defaultCwd: '/', pinned: id === 'm' ? { '/home/me/work/proj/app': 1 } : {} } },
+        ]),
+      ) as unknown as Record<string, MachineState>;
+    const sessions = { m: { a: meta({ sessionId: 'a', cwd: '/home/me/work/proj/app' }), b: meta({ sessionId: 'b', cwd: '/srv/x' }) } };
+    render(sessions, { query: { groupBy: 'workspace' }, machines: many(1) });
+    expect($$('session-group-label').map((e) => e.textContent)).toEqual(['…/proj/app', '/srv/x']);
+    expect($$('session-group-header')[0]!.getAttribute('title')).toBe('/home/me/work/proj/app');
+    expect($('session-group-machine')).toBeNull();
+    // 分隔线正好夹在置顶组与第一个非置顶组之间
+    const order = [...document.querySelectorAll('[data-testid="session-group"], [data-testid="pinned-divider"]')].map(
+      (e) => (e as HTMLElement).dataset.testid,
+    );
+    expect(order).toEqual(['session-group', 'pinned-divider', 'session-group']);
+    act(() => root?.unmount());
+    document.body.innerHTML = '';
+
+    render(sessions, { query: { groupBy: 'workspace' }, machines: many(2) });
+    expect($$('session-group-machine')[0]?.textContent).toContain('Machine-m');
+    act(() => root?.unmount());
+    document.body.innerHTML = '';
+
+    render(sessions, { query: { groupBy: 'workspace', machine: 'm' }, machines: many(2) });
+    expect($('session-group-machine')).toBeNull();
+    act(() => root?.unmount());
+    document.body.innerHTML = '';
+
+    // 没有置顶组：不画分隔线
+    render({ m: { b: meta({ sessionId: 'b', cwd: '/srv/x' }) } }, { query: { groupBy: 'workspace' } });
+    expect($('pinned-divider')).toBeNull();
+  });
+
+  test('空组的「新建会话」是轻按钮，与「暂无会话」同一行', () => {
+    render({}, {
+      query: { groupBy: 'workspace' },
+      machines: {
+        m: { machineId: 'm', name: 'MBP', online: true, lastSeenAt: 1, parkedCount: 0, cwd: { favorites: [], defaultCwd: '/', pinned: { '/p': 1 } } },
+      } as unknown as Record<string, MachineState>,
+      onNewSessionIn: () => {},
+    });
+    const btn = $('session-group-empty-new')!;
+    expect(btn.dataset.variant).toBe('ghost');
+    expect(btn.parentElement).toBe($('session-group-empty'));
+  });
+
+  test('拖动观感：被拖组浮起、经过的组画插入线（方向决定在上还是下）；拖柄平时透明、盖在图钉上', async () => {
+    const { dropIndicatorSide } = await import('./PinnedSortable.tsx');
+    expect(dropIndicatorSide(0, 2, true)).toBe('before');
+    expect(dropIndicatorSide(2, 0, true)).toBe('after');
+    expect(dropIndicatorSide(1, 1, true)).toBeNull();
+    expect(dropIndicatorSide(1, 0, false)).toBeNull();
+    expect(dropIndicatorSide(1, -1, true)).toBeNull();
+
+    const realMatchMedia = globalThis.matchMedia;
+    const realRect = window.HTMLElement.prototype.getBoundingClientRect;
+    globalThis.matchMedia = ((q: string) => ({
+      matches: q === '(pointer: fine)',
+      media: q,
+      addEventListener: () => {},
+      removeEventListener: () => {},
+    })) as unknown as typeof matchMedia;
+    window.HTMLElement.prototype.getBoundingClientRect = function (this: HTMLElement) {
+      const sortable = this.closest<HTMLElement>('[data-testid="session-group-sortable"]');
+      const i = sortable === null ? 0 : $$('session-group-sortable').indexOf(sortable);
+      const top = i * 40;
+      return { x: 0, y: top, top, left: 0, right: 300, bottom: top + 40, width: 300, height: 40, toJSON: () => ({}) } as DOMRect;
+    };
+    try {
+      render({}, {
+        query: { groupBy: 'workspace' },
+        machines: {
+          m: {
+            machineId: 'm',
+            name: 'MBP',
+            online: true,
+            lastSeenAt: 1,
+            parkedCount: 0,
+            info: { cwd: { pinOrder: true } },
+            cwd: { favorites: [], defaultCwd: '/', pinned: { '/a': 1, '/b': 2, '/c': 3 }, pinOrder: ['/a', '/b', '/c'] },
+          },
+        } as unknown as Record<string, MachineState>,
+        actions: { onPinWorkspace: () => {}, supportsPinOrder: () => true, onMovePinnedWorkspace: () => {} },
+      });
+      const handle = $$('session-group-drag')[0]!;
+      expect(handle.className).toContain('opacity-0');
+      expect(handle.className).toContain('absolute');
+      // 图钉在悬停时让位给拖柄
+      expect($$('session-group-pinned')[0]!.getAttribute('class')).toContain('group-hover/header:invisible');
+      const key = (code: string): void => {
+        act(() => {
+          handle.dispatchEvent(new window.KeyboardEvent('keydown', { code, key: code === 'Space' ? ' ' : code, bubbles: true, cancelable: true }));
+        });
+      };
+      const tick = () => act(async () => await new Promise((r) => setTimeout(r, 0)));
+      act(() => handle.focus());
+      key('Space');
+      await tick();
+      key('ArrowDown');
+      await tick();
+      const groups = $$('session-group-sortable');
+      expect(groups[0]!.dataset.dragging).toBe('true');
+      expect(groups[1]!.dataset.dropIndicator).toBe('after');
+      expect($$('session-group-drop-line')).toHaveLength(1);
+      key('Escape');
+      await tick();
+      expect($('session-group-drop-line')).toBeNull();
+    } finally {
+      globalThis.matchMedia = realMatchMedia;
+      window.HTMLElement.prototype.getBoundingClientRect = realRect;
+    }
+  });
+
+  test('不给 onNewSessionIn：没有「+」', () => {
+    render({ m: { a: meta({ sessionId: 'a', cwd: '/x' }) } }, { query: { groupBy: 'workspace' } });
+    expect($('session-group-new')).toBeNull();
   });
 });

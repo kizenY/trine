@@ -1,26 +1,17 @@
 /**
- * PC（≥900px）常驻左侧栏，300px 固定宽——原型 `.desk-side`。
- *
- * 结构（自上而下，照原型）：
- *   brand「◈ trine」+ 连接状态 chip
- *   机器过滤 chip 行          ← components/list/MachineFilterChips
- *   搜索框 + 「筛选」弹出层    ← components/list/ListControls（SidebarListControls）
- *   会话列表                   ← components/list/SessionList（compact 变体）
- *   底部「+ 新建 / 机器 / 设置」
- *
- * ## 中间两块与列表页共用同一套组件（2b 已接上）
- *
- * 方案要求侧栏与列表页复用同一套组件，所以这里的两个 Slot 只是薄封装：
- * 从 store 取数据、传给 `components/list/**`，紧凑变体对应原型的
- * `.desk-side .sess{padding:9px 11px}`。过滤选中态由 Layout 持有
- * （`useMachineFilter()`），列表页选了机器侧栏跟着变。
- * 本文件的骨架、300px 宽度、底部入口保持 2a 定稿不动。
+ * Desktop workspace navigation (900px+).
+ * Brand / create / workspace filters / sessions / maintenance actions.
+ * The right edge can be dragged to resize (dragging far left collapses it); collapsed it
+ * becomes an icon rail. ⌘B / Ctrl+B toggles. Width and collapsed state live in prefs.
+ * Session data and filtering are shared with the mobile list view.
+ * See docs/DESIGN.md for layout and component conventions.
  */
-import { useMemo } from 'react';
-import { NavLink, useNavigate } from 'react-router';
-import { MonitorIcon, PlusIcon, RefreshCwIcon, SettingsIcon } from 'lucide-react';
+import { useMemo, useRef } from 'react';
+import { NavLink } from 'react-router';
+import { PanelLeftCloseIcon, PanelLeftOpenIcon, PlusIcon, RefreshCwIcon, SettingsIcon } from 'lucide-react';
 import { Button } from '@/components/ui/button.tsx';
 import { ScrollArea } from '@/components/ui/scroll-area.tsx';
+import { MachinesNavButton } from '@/components/machines/MachinesNavButton.tsx';
 import { MachineFilterChips } from '@/components/list/MachineFilterChips.tsx';
 import { SessionList } from '@/components/list/SessionList.tsx';
 import { SidebarListControls } from '@/components/list/ListControls.tsx';
@@ -30,11 +21,14 @@ import { useEngineFilter, useListGroupBy, useListQuery, useListShowTemp } from '
 import { useSessionActions } from '@/components/list/use-session-actions.ts';
 import { useListFilters } from '@/app/Layout.tsx';
 import { useNow, useSessionRefresh } from '@/components/list/use-session-refresh.ts';
-import { NewSessionSheetRoute } from '@/components/sheets/new-session-route.tsx';
+import { NewSessionSheetRoute, useNewSessionSheet } from '@/components/sheets/new-session-route.tsx';
 import { PlanUsageStrip } from '@/components/usage/PlanUsage.tsx';
-import { useTrine } from '@/app/runtime.ts';
+import { useClient, useTrine } from '@/app/runtime.ts';
+import { IS_MAC } from '@/components/composer/composer-keys.ts';
+import { CHAT_MIN_WIDTH, SIDEBAR_MIN_WIDTH } from '@/lib/layout-prefs.ts';
 import { cn } from '@/lib/utils.ts';
 import { ChipLabel, StatusDot } from './StatusDot.tsx';
+import { useSidebarResize, useSidebarShortcut } from './sidebar-resize.ts';
 
 /** 连接状态 → 状态点 + 文案。侧栏顶部与设置页共用这套口径 */
 export function useConnectionChip(): { tone: 'on' | 'off' | 'wait' | 'err'; label: string } {
@@ -57,10 +51,10 @@ export function useConnectionChip(): { tone: 'on' | 'off' | 'wait' | 'err'; labe
   }
 }
 
-export function Brand(): React.JSX.Element {
+export function Brand({ trailing }: { trailing?: React.ReactNode }): React.JSX.Element {
   const chip = useConnectionChip();
   return (
-    <div className="flex items-center gap-2 px-4 pt-3.5 pb-2.5 text-[15px] font-semibold">
+    <div className="flex items-center gap-2.5 px-4 pt-5 pb-4 text-[17px] font-semibold">
       <span className="text-brand font-mono" aria-hidden>
         ◈
       </span>
@@ -69,6 +63,7 @@ export function Brand(): React.JSX.Element {
         <StatusDot tone={chip.tone} />
         {chip.label}
       </ChipLabel>
+      {trailing}
     </div>
   );
 }
@@ -139,6 +134,8 @@ function SessionListSlot(): React.JSX.Element {
   const [, setShowTemp] = useListShowTemp();
   const actions = useSessionActions();
   const now = useNow();
+  // 组头「+」：sheet 挂在本侧栏（见 Sidebar 底部的 NewSessionSheetRoute），写 intent 即可
+  const [, , openNewSessionIn] = useNewSessionSheet();
   return (
     <>
       <SessionList
@@ -147,17 +144,70 @@ function SessionListSlot(): React.JSX.Element {
         query={query}
         actions={actions}
         onShowTemp={setShowTemp}
+        onNewSessionIn={openNewSessionIn}
         variant="compact"
         now={now}
         className="px-2.5 pb-3"
       />
-      {/*
-        新建会话 sheet 的挂载点（PC）。它是 portal，对侧栏布局零影响；挂在这里
-        是因为 PC 上唤起它的「+ 新建」在侧栏底部，而列表页此刻并没有挂载
-        （PC 的 `/` 主区是空态）。移动端反过来——不渲染侧栏，由列表页挂载。
-      */}
-      <NewSessionSheetRoute />
     </>
+  );
+}
+
+/** 侧栏底部的刷新 / 机器 / 设置；展开时横排，折叠成图标栏时竖排 */
+function SidebarFooterActions({ vertical = false }: { vertical?: boolean }): React.JSX.Element {
+  // PC 上列表页从不挂载（`/` 渲染 EmptyMain），刷新入口只能在侧栏（评审 M1）
+  const { refresh, refreshing, canRefresh } = useSessionRefresh();
+  return (
+    <div className={cn('flex items-center gap-2', vertical && 'flex-col gap-1')}>
+      <Button
+        size="icon-sm"
+        variant="ghost"
+        data-testid="sidebar-refresh"
+        title="刷新会话列表"
+        aria-label="刷新会话列表"
+        disabled={!canRefresh || refreshing}
+        onClick={refresh}
+      >
+        <RefreshCwIcon className={cn(refreshing && 'motion-safe:animate-spin')} />
+      </Button>
+      <MachinesNavButton testId="sidebar-machines" />
+      <Button size="icon-sm" variant="ghost" asChild title="设置">
+        <NavLink to="/settings" aria-label="设置">
+          <SettingsIcon />
+        </NavLink>
+      </Button>
+    </div>
+  );
+}
+
+const SHORTCUT = IS_MAC ? '⌘B' : 'Ctrl+B';
+
+/** 折叠后的图标栏：展开、新建，底部仍是刷新 / 机器 / 设置 */
+function SidebarRail({ onExpand }: { onExpand: () => void }): React.JSX.Element {
+  const [, setNewOpen] = useNewSessionSheet();
+  const chip = useConnectionChip();
+  return (
+    <aside
+      data-testid="sidebar"
+      data-collapsed=""
+      className="border-border bg-background flex w-14 shrink-0 flex-col items-center gap-1 border-r pt-4 pb-3 min-[1100px]:border-r-0"
+    >
+      <span className="relative mb-2 flex size-8 items-center justify-center" title={chip.label} data-testid="connection-chip">
+        <span className="text-brand font-mono text-[17px]" aria-hidden>
+          ◈
+        </span>
+        <StatusDot tone={chip.tone} className="absolute right-0.5 bottom-0.5" />
+        <span className="sr-only">{chip.label}</span>
+      </span>
+      <Button size="icon-sm" variant="ghost" data-testid="sidebar-expand" title={`展开侧栏（${SHORTCUT}）`} aria-label="展开侧栏" onClick={onExpand}>
+        <PanelLeftOpenIcon />
+      </Button>
+      <Button size="icon-sm" data-testid="sidebar-new" title="新建会话" aria-label="新建会话" onClick={() => setNewOpen(true)}>
+        <PlusIcon />
+      </Button>
+      <div className="flex-1" />
+      <SidebarFooterActions vertical />
+    </aside>
   );
 }
 
@@ -168,52 +218,102 @@ export function Sidebar({
   filter: string | null;
   onFilterChange: (machineId: string | null) => void;
 }): React.JSX.Element {
-  const navigate = useNavigate();
-  // PC 上列表页从不挂载（`/` 渲染 EmptyMain），刷新入口只能在侧栏（评审 M1）
-  const { refresh, refreshing, canRefresh } = useSessionRefresh();
+  const client = useClient();
+  const collapsed = useTrine((s) => s.prefs.sidebarCollapsed);
+  const setCollapsed = (value: boolean): void => client?.updatePrefs({ sidebarCollapsed: value });
+  useSidebarShortcut(() => setCollapsed(!collapsed));
+  return (
+    <>
+      {collapsed ? (
+        <SidebarRail onExpand={() => setCollapsed(false)} />
+      ) : (
+        <ExpandedSidebar filter={filter} onFilterChange={onFilterChange} onCollapse={() => setCollapsed(true)} />
+      )}
+      {/*
+        新建会话 sheet 的挂载点（PC）。它是 portal，对侧栏布局零影响；挂在这里
+        是因为 PC 上唤起它的「+ 新建」在侧栏里，而列表页此刻并没有挂载
+        （PC 的 `/` 主区是空态）。移动端反过来——不渲染侧栏，由列表页挂载。
+      */}
+      <NewSessionSheetRoute />
+    </>
+  );
+}
+
+function ExpandedSidebar({
+  filter,
+  onFilterChange,
+  onCollapse,
+}: {
+  filter: string | null;
+  onFilterChange: (machineId: string | null) => void;
+  onCollapse: () => void;
+}): React.JSX.Element {
+  const client = useClient();
+  const [, setNewOpen] = useNewSessionSheet();
+  const storedWidth = useTrine((s) => s.prefs.sidebarWidth);
+  const asideRef = useRef<HTMLElement | null>(null);
+  const resize = useSidebarResize(asideRef, {
+    onCommit: (width) => client?.updatePrefs({ sidebarWidth: width }),
+    onCollapse,
+    onReset: () => client?.updatePrefs({ sidebarWidth: null }),
+  });
+  const width = resize.dragWidth ?? storedWidth;
   return (
     <aside
+      ref={asideRef}
       data-testid="sidebar"
-      className="border-border bg-surface flex w-[300px] shrink-0 flex-col border-r"
+      className={cn(
+        'border-border bg-background relative flex shrink-0 flex-col border-r min-[1100px]:border-r-0',
+        width === null && 'w-[300px] min-[1100px]:w-[320px]',
+        resize.willCollapse && 'opacity-60',
+      )}
+      // 窗口变窄时给聊天栏至少留 CHAT_MIN_WIDTH（与 layout-prefs 的拖动上限同一口径；工作区放不下时自动收起）
+      style={width === null ? undefined : { width: `clamp(${SIDEBAR_MIN_WIDTH}px, ${width}px, 100vw - ${CHAT_MIN_WIDTH}px)` }}
     >
-      <Brand />
+      <Brand
+        trailing={
+          <Button
+            size="icon-xs"
+            variant="ghost"
+            data-testid="sidebar-collapse"
+            className="text-text-3 hover:text-text -mr-1"
+            title={`收起侧栏（${SHORTCUT}）`}
+            aria-label="收起侧栏"
+            onClick={onCollapse}
+          >
+            <PanelLeftCloseIcon />
+          </Button>
+        }
+      />
+      <div className="px-3 pb-4">
+        <Button className="w-full justify-start" data-testid="sidebar-new" onClick={() => setNewOpen(true)}>
+          <PlusIcon />新建会话
+        </Button>
+      </div>
+      <div className="text-text-3 px-4 pb-2 text-[11px] font-medium tracking-wider">工作空间</div>
       <MachineFilterSlot selected={filter} onSelect={onFilterChange} />
       <PlanUsageSlot filter={filter} />
       <ListControlsSlot filter={filter} />
+      <div className="text-text-3 px-4 pt-2 pb-2 text-[11px] font-medium tracking-wider">会话</div>
       <ScrollArea className="min-h-0 flex-1">
         <SessionListSlot />
       </ScrollArea>
-      <div className="border-border flex items-center gap-1 border-t px-2.5 py-2">
-        <Button
-          size="sm"
-          className="flex-1"
-          data-testid="sidebar-new"
-          onClick={() => navigate('/?new=1')}
-        >
-          <PlusIcon />
-          新建
-        </Button>
-        <Button
-          size="icon-sm"
-          variant="ghost"
-          data-testid="sidebar-refresh"
-          title="刷新会话列表"
-          aria-label="刷新会话列表"
-          disabled={!canRefresh || refreshing}
-          onClick={refresh}
-        >
-          <RefreshCwIcon className={cn(refreshing && 'motion-safe:animate-spin')} />
-        </Button>
-        <Button size="icon-sm" variant="ghost" asChild title="机器">
-          <NavLink to="/machines" aria-label="机器">
-            <MonitorIcon />
-          </NavLink>
-        </Button>
-        <Button size="icon-sm" variant="ghost" asChild title="设置">
-          <NavLink to="/settings" aria-label="设置">
-            <SettingsIcon />
-          </NavLink>
-        </Button>
+      <div className="border-border border-t px-3 py-3">
+        <SidebarFooterActions />
+      </div>
+      <div
+        aria-hidden
+        data-testid="sidebar-resize-handle"
+        title="拖动调整宽度，双击恢复默认；往左拖到底收起"
+        className="group/resize absolute inset-y-0 -right-1 z-10 w-2 cursor-col-resize touch-none"
+        {...resize.handleProps}
+      >
+        <span
+          className={cn(
+            'absolute inset-y-0 left-1/2 w-0.5 -translate-x-1/2 bg-transparent transition-colors group-hover/resize:bg-brand/50',
+            resize.dragWidth !== null && 'bg-brand/60',
+          )}
+        />
       </div>
     </aside>
   );

@@ -24,6 +24,9 @@ import {
   type UpdateResult,
 } from '@/components/machines/claude-update.ts';
 import { formatRelativeTime } from '@/lib/format.ts';
+import type { EngineAutoUpdate } from '@trine/core';
+import type { EngineAutoUpdateResult } from '@/lib/client.ts';
+import { EngineAutoUpdateToggle } from './EngineAutoUpdateToggle.tsx';
 import { cn } from '@/lib/utils.ts';
 
 const TONE_CLASS: Record<ClaudeUpdateSummary['tone'], string> = {
@@ -44,6 +47,7 @@ export function EngineUpdateSection({
   update,
   latest = null,
   check,
+  autoUpdate,
   now = Date.now(),
 }: {
   /** 界面上的引擎名 */
@@ -66,6 +70,8 @@ export function EngineUpdateSection({
   latest?: ClaudeLatestView | null;
   /** 立即检查最新版本；latest 不为 null 时才有意义 */
   check?: () => Promise<CheckResult>;
+  /** 自动更新开关（EngineSummary.autoUpdate）；不给 = agent 不支持 */
+  autoUpdate?: { state: EngineAutoUpdate; set: (enabled: boolean) => Promise<EngineAutoUpdateResult> } | undefined;
   now?: number;
 }): React.JSX.Element {
   const [confirming, setConfirming] = useState(false);
@@ -181,6 +187,17 @@ export function EngineUpdateSection({
           </Button>
         )}
       </div>
+      {autoUpdate !== undefined && (
+        <EngineAutoUpdateToggle
+          idPrefix={idPrefix}
+          engineName={engineName}
+          machineName={machineName}
+          online={online}
+          state={autoUpdate.state}
+          set={autoUpdate.set}
+          now={now}
+        />
+      )}
       {online === false && !updating && <p className="text-text-3 text-xs">机器离线，上线后才能更新。</p>}
       {updating && (
         <p className="text-text-3 text-xs" data-testid={`${idPrefix}-update-progress`}>

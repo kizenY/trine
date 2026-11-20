@@ -65,6 +65,8 @@ export type ContextUsage = z.infer<typeof ContextUsageSchema>;
 
 /** Claude Code 的引擎 id；`SessionMeta.engine` 省略时就是它 */
 export const CLAUDE_ENGINE_ID = 'claude';
+/** Claude SDK 接受的具名强度；模型支持范围与降档由 Claude Code 处理。 */
+export const CLAUDE_EFFORT_LEVELS = ['low', 'medium', 'high', 'xhigh', 'max'] as const;
 
 /**
  * 引擎 id（multi-engine，DECISIONS D20）。「引擎」是真正跑模型的编码 agent（Claude Code、
@@ -147,7 +149,7 @@ export const SessionMetaSchema = z.object({
    * client 看的近似值；Claude 会话不带，`permissionMode` 就是真值。
    */
   engineMode: EngineModeSchema.optional(),
-  /** 推理强度（agent ≥ 0.22.0）；省略 = 跟随引擎自己的配置 */
+  /** 推理强度（agent ≥ 0.25.0）；省略 = 跟随引擎自己的配置 */
   effort: EngineEffortSchema.optional(),
 });
 export type SessionMeta = z.infer<typeof SessionMetaSchema>;
@@ -232,6 +234,63 @@ export const HistoryAttachmentSchema = AttachmentMetaSchema.extend({
 });
 export type HistoryAttachment = z.infer<typeof HistoryAttachmentSchema>;
 
+/** ToolArgDetailSchema 的长度上限（agent 超出时截断并在尾部写明） */
+export const TOOL_ARG_DETAIL_MAX = 16_000;
+
+/**
+ * 工具调用的完整参数（tool.start / history tool 条目的 `argDetail`，agent ≥ 0.25.0）：
+ * Bash / Shell 的命令原文等，保留换行。argSummary 是压成单行、限长 120 的摘要，长命令
+ * 在卡片上看不全；agent 只在摘要与原文不同时带这个字段。旧 client 忽略。
+ */
+export const ToolArgDetailSchema = z.string().min(1).max(TOOL_ARG_DETAIL_MAX + 64);
+
+/**
+ * 子 agent 的目标状态（与「启动它的那次工具调用」的结果分开表达）。
+ *
+ * - Claude：后台子 agent 的 running → completed / failed / stopped；历史里拿不到结束证据时
+ *   为 `unknown`（状态未知）；只知道已结束（子转录 meta.json 的 finished）、不知成败时为 `ended`。
+ * - Codex：CollabAgentStatus 全部枚举一一对应：pendingInit → pending、running、interrupted、
+ *   completed、errored → failed、shutdown、notFound → not_found。
+ */
+export const SubagentStateSchema = z.enum([
+  'pending',
+  'running',
+  'completed',
+  'failed',
+  'stopped',
+  'interrupted',
+  'shutdown',
+  'not_found',
+  'ended',
+  'unknown',
+]);
+export type SubagentState = z.infer<typeof SubagentStateSchema>;
+
+/** SubagentInfo 里短文本字段的上限 */
+export const SUBAGENT_LABEL_MAX = 128;
+const SubagentLabelSchema = z.string().min(1).max(SUBAGENT_LABEL_MAX);
+
+/**
+ * 子 agent 卡的附加信息（tool.start / tool.end / history tool 条目的 `subagent`，加法字段，
+ * 旧 client 忽略）。同一张卡可多次下发，client 按字段合并（后到的覆盖），所以每次只带
+ * 知道的字段。
+ *
+ * - `agentType`：Claude 的 `subagent_type` / Codex 的角色（agentRole）
+ * - `background`：Claude 子 agent 在后台跑（启动工具立即返回，任务另行结束）
+ * - `state`：目标子 agent 的状态（见 SubagentStateSchema）；Claude 后台运行中的状态由
+ *   client 从 `bgtask.snapshot` 派生，agent 只在结束 / 历史回填时给
+ * - `nickname` / `model` / `agentId`：Codex 子 thread 的昵称、模型、thread id（显示短 id 兜底）
+ */
+export const SubagentInfoSchema = z.object({
+  agentType: SubagentLabelSchema.optional(),
+  background: z.boolean().optional(),
+  state: SubagentStateSchema.optional(),
+  nickname: SubagentLabelSchema.optional(),
+  model: SubagentLabelSchema.optional(),
+  agentId: SubagentLabelSchema.optional(),
+});
+export type SubagentInfo = z.infer<typeof SubagentInfoSchema>;
+
 /**
  * 历史回看条目（`session.history.response`，决策 D8：agent 读本机会话存储按需拉取）。
  *
@@ -266,11 +325,15 @@ export const HistoryItemSchema = z.discriminatedUnion('kind', [
     argSummary: z.string(),
     /** 文件类工具（Read/Write/Edit…）的完整路径，见 ToolStartSchema.filePath（agent ≥ 0.20.0） */
     filePath: z.string().min(1).max(4096).optional(),
+    /** 完整参数，见 ToolArgDetailSchema */
+    argDetail: ToolArgDetailSchema.optional(),
     status: ToolResultStatusSchema.optional(),
     /** tool_use 到 tool_result 两行 timestamp 之差（配到结果才有） */
     durationMs: z.number().int().nonnegative().optional(),
     resultSummary: z.string().optional(),
     outputPreview: z.string().optional(),
+    /** 子 agent 卡的附加信息（见 SubagentInfoSchema；agent 回填最终状态 / 状态未知） */
+    subagent: SubagentInfoSchema.optional(),
     ts: TimestampSchema,
   }),
 ]);
@@ -285,6 +348,12 @@ export const RateLimitWindowSchema = z.object({
 });
 export type RateLimitWindow = z.infer<typeof RateLimitWindowSchema>;
 
+/** 按模型计的限额窗口：`name` 是服务端给的模型桶名（如「Fable」） */
+export const ModelRateLimitWindowSchema = RateLimitWindowSchema.extend({
+  name: z.string().min(1).max(40),
+});
+export type ModelRateLimitWindow = z.infer<typeof ModelRateLimitWindowSchema>;
+
 /**
  * 机器上登录的 Claude 账号的订阅限额用量（usage-display 新增）。账号级数据：同一
  * 台机器的所有会话共用。会话活动时随 SDK 的限额事件刷新，或由 client 手动请求
@@ -293,6 +362,12 @@ export type RateLimitWindow = z.infer<typeof RateLimitWindowSchema>;
 export const RateLimitsSchema = z.object({
   fiveHour: RateLimitWindowSchema.optional(),
   sevenDay: RateLimitWindowSchema.optional(),
+  /**
+   * 按模型单独计的周限额（agent ≥ 0.25.0，如 Fable）。来源：usage 接口的 `model_scoped`
+   * （带模型名），以及 `rate_limit_event` 的 `unifiedWindows.seven_day_overage_included`。
+   * 账号没有这类限额时省略。旧 client 忽略。
+   */
+  models: z.array(ModelRateLimitWindowSchema).max(8).optional(),
   /** agent 最近一次拿到这份数据的时间 */
   updatedAt: TimestampSchema,
 });
@@ -389,6 +464,23 @@ export const EngineInstallSchema = z.object({
 });
 export type EngineInstall = z.infer<typeof EngineInstallSchema>;
 
+/** 引擎自动更新的状态（EngineSummary.autoUpdate） */
+export const EngineAutoUpdateSchema = z.object({
+  enabled: z.boolean(),
+  /** 最近一次自动更新（手动更新不记在这里）；还没自动更新过就省略 */
+  last: z
+    .object({
+      at: TimestampSchema,
+      ok: z.boolean(),
+      fromVersion: z.string().max(64),
+      toVersion: z.string().max(64),
+      /** ok 为 false 时的原因 */
+      error: z.string().max(300).optional(),
+    })
+    .optional(),
+});
+export type EngineAutoUpdate = z.infer<typeof EngineAutoUpdateSchema>;
+
 export const MachineClaudeLatestSchema = z.object({
   /** 查询的渠道：claude settings 的 `autoUpdatesChannel`，默认 latest */
   channel: z.enum(['latest', 'stable']),
@@ -404,9 +496,45 @@ export const MachineClaudeLatestSchema = z.object({
 export type MachineClaudeLatest = z.infer<typeof MachineClaudeLatestSchema>;
 
 /** 文件查看能力（fs.list / fs.read，见 protocol §1.10） */
+/** 会话 cwd 之外的可浏览根目录：`env` = TRINE_FILES_ALLOW（只能在机器上改），`trusted` = 信任目录（可远程增删） */
+/** machine.info.files.roots 的条数上限（TRINE_FILES_ALLOW 不限条数，agent 超出时截断并在日志里说明） */
+export const FILES_ROOTS_MAX = 256;
+
+export const FilesRootSchema = z.object({
+  path: z.string().min(1).max(4096),
+  source: z.enum(['env', 'trusted']),
+  /** 加入时间（trusted 才有） */
+  addedAt: z.number().int().nonnegative().optional(),
+});
+export type FilesRoot = z.infer<typeof FilesRootSchema>;
+
+/** 每台机器最多的文件书签数（超出时 agent 丢最旧的） */
+export const FILES_BOOKMARKS_MAX = 50;
+
+/** 文件书签：绝对路径 + 目录 / 文件。只是快捷入口，不扩大可浏览范围 */
+export const FileBookmarkSchema = z.object({
+  path: z.string().startsWith('/').max(4096),
+  kind: z.enum(['dir', 'file']),
+  /** 加入时间（agent 端记录） */
+  addedAt: z.number().int().nonnegative().optional(),
+});
+export type FileBookmark = z.infer<typeof FileBookmarkSchema>;
+
 export const MachineFilesInfoSchema = z.object({
   /** 单个文件可预览的字节上限 */
   maxBytes: z.number().int().positive(),
+  /**
+   * 会话 cwd 之外的可浏览目录（trusted-browse-dirs，agent ≥ 0.24.0）。缺失 = 旧 agent，
+   * client 隐藏信任目录的管理与「位置」菜单；空数组 = 支持但还没配置。
+   */
+  roots: z.array(FilesRootSchema).max(FILES_ROOTS_MAX).optional(),
+  /** agent 用户的 home（同上版本起）；client 据此对「信任 home 或其上级」加强提示 */
+  home: z.string().max(4096).optional(),
+  /**
+   * 文件书签（file-bookmarks，agent ≥ 0.30.0）：机器级、所有已配对设备共享，新加的在前。
+   * 缺失 = 旧 agent，client 退回只存本设备；空数组 = 支持但还没有书签。增删见 `files.bookmark.*`。
+   */
+  bookmarks: z.array(FileBookmarkSchema).max(FILES_BOOKMARKS_MAX).optional(),
 });
 export type MachineFilesInfo = z.infer<typeof MachineFilesInfoSchema>;
 
@@ -433,10 +561,12 @@ export const EngineCapabilitiesSchema = z.object({
   mutations: z.boolean().optional(),
   /** 能手动刷新 context 用量 */
   contextRefresh: z.boolean().optional(),
-  /** 能选推理强度（session.setEffort，选项在 EngineModel.efforts） */
+  /** 能选推理强度（session.setEffort，选项在 EngineModel / EngineSummary.efforts） */
   effort: z.boolean().optional(),
   /** 能从机器页更新引擎（machine.engine.update.request、machine.engine.check.request） */
   update: z.boolean().optional(),
+  /** 能从机器页重启引擎的后台进程、重新加载登录（machine.engine.restart.request，agent ≥ 0.28.0） */
+  restart: z.boolean().optional(),
 });
 export type EngineCapabilities = z.infer<typeof EngineCapabilitiesSchema>;
 
@@ -489,6 +619,8 @@ export const EngineSummarySchema = z.object({
   capabilities: EngineCapabilitiesSchema,
   /** 模型目录；省略 = 由 client 自己的已知模型列表决定（Claude） */
   models: z.array(EngineModelSchema).max(64).optional(),
+  /** 没有模型目录时可选的强度（Claude）；具体模型的支持范围由引擎处理 */
+  efforts: z.array(EngineEffortSchema).max(16).optional(),
   /** 权限模式目录；省略 = 协议的四档 PermissionMode（Claude） */
   modes: z.array(EngineModeOptionSchema).max(16).optional(),
   /** 账号限额。Claude 的仍在 MachineInfo.rateLimits，这里不重复 */
@@ -506,6 +638,11 @@ export const EngineSummarySchema = z.object({
     .optional(),
   /** 由包管理器安装时才有（agent ≥ 0.23.0）：更新走它，latest 也是它能装上的版本 */
   install: EngineInstallSchema.optional(),
+  /**
+   * 自动更新（agent ≥ 0.31.0）：有这个字段 = 支持，可用 machine.engine.autoupdate.set 开关。
+   * 开着时 agent 每次查到新版本（启动后约 30 秒、之后每 6 小时，或手动检查）就自动更新。
+   */
+  autoUpdate: EngineAutoUpdateSchema.optional(),
 });
 export type EngineSummary = z.infer<typeof EngineSummarySchema>;
 
@@ -534,6 +671,12 @@ export const MachineInfoSchema = z.object({
   files: MachineFilesInfoSchema.optional(),
   /** 机器上的引擎（multi-engine 新增，可选；agent ≥ 0.21.0）。缺失 = 旧 agent，只有 Claude Code */
   engines: z.array(EngineSummarySchema).max(16).optional(),
+  /**
+   * 工作目录能力（pin-order 新增，可选）。`pinOrder: true` = 认识 `cwd.pin.move`、cwd 快照带
+   * `pinOrder`；缺失 = 旧 agent，client 只按置顶时间排、不显示重排入口。`create: true`（cwd-create，
+   * agent ≥ 0.27.0）= 认识 `cwd.prepare.request`；缺失 = client 不预检 cwd，新建会话照旧
+   */
+  cwd: z.object({ pinOrder: z.boolean().optional(), create: z.boolean().optional() }).optional(),
 });
 export type MachineInfo = z.infer<typeof MachineInfoSchema>;
 

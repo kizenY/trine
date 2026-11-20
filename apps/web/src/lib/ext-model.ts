@@ -8,11 +8,15 @@
  *   web 不会把扩展给的效果转成普通的 input.send / session.create。
  */
 import {
+  negotiateExtFeatures,
   parseExtCatalog,
   type AgentToClientEvent,
   type ExtCatalogItem,
+  type ExtFeature,
+  type ExtFilesOpenEffect,
   type ExtLocalEffect,
   type ExtPlan,
+  type ExtPlanEdit,
   type ExtPoint,
   type ExtRecord,
   type MachineInfo,
@@ -22,6 +26,14 @@ import {
 export type ExtReadResponse = Extract<AgentToClientEvent, { type: 'ext.read.response' }>;
 export type ExtActionResult = Extract<AgentToClientEvent, { type: 'ext.action.result' }>;
 export type ExtActionPlanEvent = Extract<AgentToClientEvent, { type: 'ext.action.plan' }>;
+
+/** 确认时能改新会话的引擎配置与首条消息（agent ≥ 0.31.0 在摘要里带 planEdit） */
+export function supportsPlanEdit(info: MachineInfo | null | undefined): boolean {
+  return info?.extensions?.planEdit === true;
+}
+
+/** 确认框的结果：false = 取消；true = 按原计划；{ edits } = 带上用户的修改 */
+export type ConfirmOutcome = boolean | { edits: ExtPlanEdit[] };
 
 /** agent 支持时间线记录卡（agent ≥ 0.17.0 在摘要里带 records） */
 export function supportsExtRecords(info: MachineInfo | null | undefined): boolean {
@@ -103,10 +115,20 @@ export interface ReadTarget {
   point: ExtPoint;
   targetSessionId?: string;
   cwd?: string;
+  /**
+   * 本设备声明的特性（webExtFeatures，已按 agent 支持与贡献点协商过，等于 agent 会回的有效集）。
+   * 进 readKey：特性集变了就是另一份结果，切换期间不会拿旧特性集下的动作来显示。
+   */
+  features?: readonly ExtFeature[];
+}
+
+/** 特性集的规范形式：去重、排序、逗号连接 */
+export function featureKey(features: readonly string[] | undefined): string {
+  return [...new Set(features ?? [])].sort().join(',');
 }
 
 export function readKey(t: ReadTarget): string {
-  return [t.machineId, t.ext, t.op, t.point, t.targetSessionId ?? '', t.cwd ?? ''].join('\n');
+  return [t.machineId, t.ext, t.op, t.point, t.targetSessionId ?? '', t.cwd ?? '', featureKey(t.features)].join('\n');
 }
 
 /** 推送 / 应答对应哪个读取目标 */
@@ -118,6 +140,8 @@ export function responseKey(machineId: string, res: ExtReadResponse): string {
     point: res.point,
     ...(res.targetSessionId === undefined ? {} : { targetSessionId: res.targetSessionId }),
     ...(res.targetSessionId === undefined && res.cwd !== undefined ? { cwd: res.cwd } : {}),
+    // agent 回的有效特性集（旧 agent 不带 = 空，与 web 不声明时一致）
+    ...(res.features === undefined ? {} : { features: res.features as ExtFeature[] }),
   });
 }
 
@@ -132,10 +156,10 @@ export function isNewer(current: { rev: number } | undefined, next: { rev: numbe
 
 export interface ExtActionDeps {
   prepare: (token: string, invocationId: string, newSession: { model: string; permissionMode: PermissionMode }) => Promise<ExtActionPlanEvent | ExtActionResult>;
-  commit: (planId: string, invocationId: string) => Promise<ExtActionResult>;
+  commit: (planId: string, invocationId: string, edits?: ExtPlanEdit[]) => Promise<ExtActionResult>;
   cancel: (planId: string) => void;
-  /** 展示计划给用户确认；true = 确认 */
-  confirm: (plan: ExtPlan) => Promise<boolean>;
+  /** 展示计划给用户确认（见 ConfirmOutcome） */
+  confirm: (plan: ExtPlan) => Promise<ConfirmOutcome>;
   newSessionDefaults: () => { model: string; permissionMode: PermissionMode };
   uuid: () => string;
 }
@@ -153,11 +177,12 @@ export async function runTokenAction(token: string, deps: ExtActionDeps): Promis
     res = await deps.prepare(token, invocationId, deps.newSessionDefaults());
     for (let stage = 0; res.type === 'ext.action.plan' && stage < 3; stage++) {
       const confirmed = await deps.confirm(res.plan);
-      if (!confirmed) {
+      if (confirmed === false) {
         deps.cancel(res.planId);
         return { kind: 'cancelled' };
       }
-      const committed: ExtActionPlanEvent | ExtActionResult = await deps.commit(res.planId, invocationId);
+      const edits = typeof confirmed === 'object' && confirmed.edits.length > 0 ? confirmed.edits : undefined;
+      const committed: ExtActionPlanEvent | ExtActionResult = await deps.commit(res.planId, invocationId, edits);
       res = committed;
     }
   } catch (err) {
@@ -176,14 +201,94 @@ export interface LocalEffectHandlers {
   insert: (text: string) => void;
   copy: (text: string) => Promise<boolean>;
   refresh: () => void;
+  /**
+   * 打开文件 / 浏览目录（files.open）。只在会话页、agent 支持文件查看时提供；不提供时本设备
+   * 也不声明 files.open 特性（agent 就不会给带它的动作），万一收到也忽略。
+   */
+  filesOpen?: (effect: ExtFilesOpenEffect) => void;
 }
 
 export async function applyLocalEffects(effects: readonly ExtLocalEffect[], handlers: LocalEffectHandlers): Promise<void> {
   for (const effect of effects) {
     if (effect.type === 'prompt.insert') handlers.insert(effect.text);
     else if (effect.type === 'copy') await handlers.copy(effect.text);
+    else if (effect.type === 'files.open') handlers.filesOpen?.(effect);
     else handlers.refresh();
   }
+}
+
+/**
+ * 本页面实例 id（每次加载页面生成），随 ext.read / ext.action.prepare 发给 agent：同一设备换了
+ * 页面（别的标签页接管、旧版页面接管）时，agent 据此作废旧实例的订阅与带特性的在途结果。
+ */
+export const EXT_CLIENT_INSTANCE: string =
+  typeof globalThis.crypto?.randomUUID === 'function' ? globalThis.crypto.randomUUID() : Math.random().toString(36).slice(2, 14);
+
+/**
+ * 本设备在某个贡献点声明的特性 =本页有处理器的 ∩ agent 在 machine.info.extensions.features 里
+ * 列出的 ∩ 贡献点能执行的（与 agent 同一个 negotiateExtFeatures）。所以声明的就是 agent 会回的
+ * 有效集，请求与应答的缓存键一致；旧 agent 不列 features，就什么都不声明。
+ */
+export function webExtFeatures(point: ExtPoint, handlers: { filesOpen?: unknown }, agentFeatures: readonly string[] | undefined): ExtFeature[] {
+  const mine: ExtFeature[] = handlers.filesOpen !== undefined ? ['files.open'] : [];
+  return negotiateExtFeatures(mine, agentFeatures ?? [], point);
+}
+
+/**
+ * 本地动作能不能整条执行：用到的特性本页都有处理器。不能就整条不执行（不只执行其中一部分）。
+ * 返回缺的特性；undefined = 可以执行。
+ */
+export function missingLocalHandler(effects: readonly ExtLocalEffect[], handlers: { filesOpen?: unknown }): string | undefined {
+  return effects.some((e) => e.type === 'files.open') && handlers.filesOpen === undefined ? 'files.open' : undefined;
+}
+
+export interface LocalActionDeps {
+  /** **当前**的执行器：每一步都重新取，不用点击时捕获的（处理器可能在等待期间没了） */
+  handlers: () => LocalEffectHandlers;
+  /** 浏览器还在发起动作的会话（地址里含机器与会话） */
+  stillHere: () => boolean;
+  /** 整条或剩余部分没执行：missing = 本页没有这个特性的处理器；left = 已离开发起的会话 */
+  blocked: (reason: 'missing' | 'left', detail?: string) => void;
+}
+
+/**
+ * 执行一个动作的本地效果：
+ * - 先按当前处理器检查**整个动作**，缺特性就一条都不执行；
+ * - 带 files.open 的动作绑定发起会话：开始前、每个 await 之后、打开前都复查，离开了就丢弃剩余效果；
+ * - 同一动作的多段插入合成一次（逐段插入会被 React 合批成只剩最后一段）；
+ * - 多个 files.open 只打开最后一个（抽屉是单视图，逐个打开只会多留几条历史）。
+ */
+export async function executeLocalAction(effects: readonly ExtLocalEffect[], deps: LocalActionDeps): Promise<void> {
+  const bound = effects.some((e) => e.type === 'files.open');
+  const missing = missingLocalHandler(effects, deps.handlers());
+  if (missing !== undefined) return deps.blocked('missing', missing);
+  if (bound && !deps.stillHere()) return deps.blocked('left');
+  const inserts: string[] = [];
+  let open: ExtFilesOpenEffect | undefined;
+  for (const effect of effects) {
+    if (effect.type === 'prompt.insert') inserts.push(effect.text);
+    else if (effect.type === 'files.open') open = effect;
+    else if (effect.type === 'refresh') deps.handlers().refresh();
+    else {
+      await deps.handlers().copy(effect.text);
+      if (bound && !deps.stillHere()) return deps.blocked('left');
+    }
+  }
+  if (open !== undefined) {
+    if (!deps.stillHere()) return deps.blocked('left');
+    const filesOpen = deps.handlers().filesOpen;
+    if (filesOpen === undefined) return deps.blocked('missing', 'files.open');
+    filesOpen(open);
+  }
+  if (inserts.length > 0) deps.handlers().insert(inserts.join('\n'));
+}
+
+/**
+ * files.open 绑定发起的会话：结果回来时浏览器已经在别的会话（或别的页面）就丢掉，
+ * 不把扩展要打开的路径打开到另一个会话里（文件查看按会话鉴权、相对路径按会话 cwd 解析）。
+ */
+export function filesOpenTarget(originPath: string, currentPath: string): 'open' | 'drop' {
+  return originPath === currentPath ? 'open' : 'drop';
 }
 
 /** 计划步骤的人话（确认弹窗用） */

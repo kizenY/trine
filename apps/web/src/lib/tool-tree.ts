@@ -165,7 +165,7 @@ function capChildren(children: ToolEntry[]): ToolEntry[] {
  */
 function mergeToolEntry(base: ToolEntry, extra: ToolEntry): ToolEntry {
   let out = base;
-  const fill = <K extends 'status' | 'durationMs' | 'resultSummary' | 'outputPreview' | 'filePath'>(key: K): void => {
+  const fill = <K extends 'status' | 'durationMs' | 'resultSummary' | 'outputPreview' | 'filePath' | 'argDetail'>(key: K): void => {
     if (out[key] === undefined && extra[key] !== undefined) out = { ...out, [key]: extra[key] };
   };
   fill('status');
@@ -173,8 +173,14 @@ function mergeToolEntry(base: ToolEntry, extra: ToolEntry): ToolEntry {
   fill('resultSummary');
   fill('outputPreview');
   fill('filePath');
+  fill('argDetail');
   if ((out.toolName === '?' || out.toolName === '') && extra.toolName !== '?' && extra.toolName !== '') {
     out = { ...out, toolName: extra.toolName, argSummary: extra.argSummary };
+  }
+  // 子 agent 信息逐字段补缺（base 已有的字段为准）
+  if (extra.subagent !== undefined) {
+    const merged = { ...extra.subagent, ...out.subagent };
+    if (out.subagent === undefined || Object.keys(merged).length !== Object.keys(out.subagent).length) out = { ...out, subagent: merged };
   }
   if (extra.children !== undefined && extra.children.length > 0) out = appendChildren(out, extra.children);
   if (extra.childrenLoaded === true && out.childrenLoaded !== true) out = { ...out, childrenLoaded: true };
@@ -245,10 +251,12 @@ export function historyToolEntry(item: Extract<HistoryItem, { kind: 'tool' }>): 
     toolName: item.toolName,
     argSummary: item.argSummary,
     ...(item.filePath === undefined ? {} : { filePath: item.filePath }),
+    ...(item.argDetail === undefined ? {} : { argDetail: item.argDetail }),
     ...(item.status === undefined ? {} : { status: item.status }),
     ...(item.durationMs === undefined ? {} : { durationMs: item.durationMs }),
     ...(item.resultSummary === undefined ? {} : { resultSummary: item.resultSummary }),
     ...(item.outputPreview === undefined ? {} : { outputPreview: item.outputPreview }),
+    ...(item.subagent === undefined ? {} : { subagent: item.subagent }),
     seq: 0,
     ts: item.ts,
   };

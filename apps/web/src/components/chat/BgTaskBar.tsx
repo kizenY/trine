@@ -8,7 +8,18 @@
  * 有「停止」（`bgtask.stop`，agent < 0.7.0 不显示——旧 agent 不认识这帧，按了只会
  * 等到超时）。
  *
- * 全部结束后折成一行「后台任务 N 个已完成」，点开可看摘要，不永久占屏。
+ * 顶部常驻一行汇总（「后台任务 1 个运行中 · 3 个已完成」），点它折叠 / 展开列表。
+ * 默认：有任务在跑时展开，全部结束后自动折成这一行，不永久占屏；用户手动点过
+ * 之后以用户的选择为准（随会话重置——ChatView 按会话给 key）。展开的列表限高
+ * 滚动，任务多时不把时间线挤没。
+ *
+ * 快照由 agent 维护：在跑的全收、已结束的只留最近 10 条（MAX_ENDED）。汇总行右侧
+ * 的「隐藏已结束 / 显示已结束（N）」是全局偏好（prefs.bgHideEnded）：隐藏时列表只列
+ * 在跑的（之后新结束的也自动隐藏），汇总行照常计数；没有在跑的就只剩汇总行一行，
+ * 随时点「显示」找回。stale 时状态未知的算已结束。
+ *
+ * 描述（多为命令原文）默认单行省略；较长时点一下展开成可换行的全文，再点收起
+ * ——手机上没有悬停，title 看不到。
  *
  * `stale`（评审 M2）：agent 重启 / 崩溃后落盘快照里的 running 已经不可信（判据见
  * reducer `bgTasksStale`）——这些行显示成「状态未知」、不走秒、没有停止按钮、
@@ -21,15 +32,17 @@ import { cn } from '@/lib/utils.ts';
 
 const KIND_ICON: Record<BgTask['kind'], string> = { bash: '🔧', agent: '🤖', other: '⚙️' };
 
-/** 折叠行的文案：`后台任务 3 个已完成` / `… 2 个已完成 · 1 个失败 · 1 个已停止 · 1 个状态未知` */
+/** 汇总行的文案：`后台任务 1 个运行中 · 3 个已完成` / `… 2 个已完成 · 1 个失败 · 1 个已停止 · 1 个状态未知` */
 export function collapsedLabel(tasks: readonly BgTask[], stale = false): string {
-  const counts = { completed: 0, failed: 0, stopped: 0, unknown: 0 };
+  const counts = { running: 0, completed: 0, failed: 0, stopped: 0, unknown: 0 };
   for (const t of tasks) {
     if (t.status === 'running') {
       if (stale) counts.unknown += 1;
+      else counts.running += 1;
     } else counts[t.status] += 1;
   }
   const parts: string[] = [];
+  if (counts.running > 0) parts.push(`${counts.running} 个运行中`);
   if (counts.completed > 0) parts.push(`${counts.completed} 个已完成`);
   if (counts.failed > 0) parts.push(`${counts.failed} 个失败`);
   if (counts.stopped > 0) parts.push(`${counts.stopped} 个已停止`);
@@ -45,7 +58,7 @@ export function statusText(task: BgTask, now: number, stale = false): { text: st
       const elapsed = formatDuration(Math.max(0, now - task.startedAt));
       const progress =
         task.kind === 'agent' && task.lastToolName !== undefined
-          ? ` · ${task.lastToolName}${task.toolUses === undefined ? '' : ` ×${task.toolUses}`}`
+          ? ` · 最近 ${task.lastToolName}${task.toolUses === undefined ? '' : ` · 共 ${task.toolUses} 次工具调用`}`
           : '';
       return { text: `运行中 ${elapsed}${progress}`, tone: 'run' };
     }
@@ -56,6 +69,36 @@ export function statusText(task: BgTask, now: number, stale = false): { text: st
     case 'stopped':
       return { text: '⊘ 已停止', tone: 'muted' };
   }
+}
+
+/** 描述超过这个长度才可点开看全 */
+const DESC_EXPAND_MIN = 40;
+
+function TaskDescription({ task }: { task: BgTask }): React.JSX.Element {
+  const [open, setOpen] = useState(false);
+  const text = task.description === '' ? task.taskId : task.description;
+  if (text.length <= DESC_EXPAND_MIN) {
+    return (
+      <span className="min-w-0 flex-1 truncate" title={text}>
+        {text}
+      </span>
+    );
+  }
+  return (
+    <button
+      type="button"
+      data-testid="bgtask-desc"
+      aria-expanded={open}
+      title={open ? '点击收起' : `${text}\n（点击展开全文）`}
+      className={cn(
+        'hover:text-text-1 min-w-0 flex-1 cursor-pointer text-left',
+        open ? 'font-mono text-[11.5px] break-all whitespace-pre-wrap' : 'truncate',
+      )}
+      onClick={() => setOpen((v) => !v)}
+    >
+      {text}
+    </button>
+  );
 }
 
 const TONE_CLASS = {
@@ -70,6 +113,8 @@ export function BgTaskBar({
   now,
   canStop,
   onStop,
+  hideEnded = false,
+  onHideEndedChange,
   stale = false,
 }: {
   tasks: readonly BgTask[];
@@ -78,47 +123,66 @@ export function BgTaskBar({
   /** agent 是否支持 bgtask.stop（≥ 0.7.0） */
   canStop: boolean;
   onStop: (taskId: string) => void;
+  /** 隐藏已结束的任务（全局偏好） */
+  hideEnded?: boolean;
+  /** 切换隐藏；省略 = 不显示该按钮 */
+  onHideEndedChange?: (hide: boolean) => void;
   /** 快照里的 running 已陈旧（见文件头） */
   stale?: boolean;
 }): React.JSX.Element | null {
-  const [expanded, setExpanded] = useState(false);
+  // null = 跟随默认（有在跑的就展开）；用户点过之后以用户选择为准
+  const [userOpen, setUserOpen] = useState<boolean | null>(null);
   if (tasks.length === 0) return null;
   const running = stale ? 0 : tasks.filter((t) => t.status === 'running').length;
-  const collapsed = running === 0 && !expanded;
+  // 已结束的（stale 时连同状态未知的 = 不在跑的）
+  const ended = tasks.length - running;
+  const shown = hideEnded && ended > 0 ? tasks.filter((t) => !stale && t.status === 'running') : tasks;
+  // 隐藏后没有可列的：只剩汇总行，没有可展开的东西
+  const expandable = shown.length > 0;
+  const open = expandable && (userOpen ?? running > 0);
 
   return (
     <div
       data-testid="bgtask-bar"
       data-running={running}
+      data-open={open}
+      data-hide-ended={hideEnded || undefined}
       data-stale={stale || undefined}
       className="border-border bg-surface-2 text-text-2 shrink-0 border-t px-3.5 py-1.5 text-[12px]"
     >
-      {collapsed ? (
+      <div className="flex min-w-0 items-center gap-2">
         <button
           type="button"
-          data-testid="bgtask-collapsed"
-          className="hover:text-text-1 flex w-full items-center gap-1.5 text-left"
-          onClick={() => setExpanded(true)}
+          data-testid="bgtask-toggle"
+          aria-expanded={open}
+          disabled={!expandable}
+          className="enabled:hover:text-text-1 flex min-w-0 flex-1 items-center gap-1.5 text-left"
+          onClick={() => setUserOpen(!open)}
         >
-          <span aria-hidden>▸</span>
-          <span className="truncate">{collapsedLabel(tasks, stale)}</span>
+          <span aria-hidden className="w-[18px] shrink-0 text-center">
+            {expandable ? (open ? '▾' : '▸') : '·'}
+          </span>
+          <span className={cn('truncate', running > 0 && 'text-brand')}>{collapsedLabel(tasks, stale)}</span>
         </button>
-      ) : (
-        <ul className="flex flex-col gap-1">
-          {running === 0 && (
-            <li>
-              <button
-                type="button"
-                data-testid="bgtask-collapse"
-                className="hover:text-text-1 flex items-center gap-1.5 text-left"
-                onClick={() => setExpanded(false)}
-              >
-                <span aria-hidden>▾</span>
-                <span className="truncate">{collapsedLabel(tasks, stale)}</span>
-              </button>
-            </li>
-          )}
-          {tasks.map((task) => {
+        {onHideEndedChange !== undefined && ended > 0 && (
+          <button
+            type="button"
+            data-testid="bgtask-hide-ended"
+            aria-pressed={hideEnded}
+            className="text-text-3 hover:text-text-1 shrink-0 text-[11px]"
+            onClick={() => {
+              // 点「显示」时顺手展开，不然显示了也看不到
+              if (hideEnded) setUserOpen(true);
+              onHideEndedChange(!hideEnded);
+            }}
+          >
+            {hideEnded ? `显示已结束（${ended}）` : '隐藏已结束'}
+          </button>
+        )}
+      </div>
+      {open && (
+        <ul data-testid="bgtask-list" className="mt-1 flex max-h-[30vh] flex-col gap-1 overflow-y-auto">
+          {shown.map((task) => {
             const status = statusText(task, now, stale);
             return (
               <li
@@ -126,14 +190,12 @@ export function BgTaskBar({
                 data-testid="bgtask-row"
                 data-task-id={task.taskId}
                 data-status={task.status}
-                className="flex min-w-0 items-center gap-2"
+                className="flex min-w-0 items-baseline gap-2"
               >
                 <span aria-hidden className="w-[18px] shrink-0 text-center">
                   {KIND_ICON[task.kind]}
                 </span>
-                <span className="min-w-0 flex-1 truncate" title={task.description}>
-                  {task.description === '' ? task.taskId : task.description}
-                </span>
+                <TaskDescription task={task} />
                 <span
                   data-testid="bgtask-status"
                   className={cn('tabular min-w-0 shrink-0 truncate font-mono text-[11.5px]', TONE_CLASS[status.tone])}

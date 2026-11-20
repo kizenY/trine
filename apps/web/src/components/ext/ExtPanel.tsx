@@ -4,15 +4,15 @@
  * - 入口：有关联时显示第一个提供徽章的扩展给的徽章（`▤ 关联名 · 状态`），否则一个图标按钮。
  * - 面板：桌面右侧抽屉、手机底部 sheet；多个扩展用 tab 切换。打开期间持有订阅，agent 有变化就推。
  */
-import { useMemo, useState } from 'react';
+import { useCallback, useMemo, useRef, useState } from 'react';
 import { toast } from 'sonner';
 import { BlocksIcon, RefreshCwIcon } from 'lucide-react';
-import type { ExtCatalogItem, ExtWireAction, ExtWireItem, SessionMeta } from '@trine/core';
+import type { ExtCatalogItem, ExtFilesOpenEffect, ExtWireAction, ExtWireItem, SessionMeta } from '@trine/core';
 import { Button } from '@/components/ui/button.tsx';
 import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from '@/components/ui/sheet.tsx';
 import { useIsDesktop } from '@/components/shell/use-media-query.ts';
 import { useClient, useTrine } from '@/app/runtime.ts';
-import { extensionsFor } from '@/lib/ext-model.ts';
+import { extensionsFor, webExtFeatures } from '@/lib/ext-model.ts';
 import { cn } from '@/lib/utils.ts';
 import { ExtBadgeChip, ExtView } from './ExtView.tsx';
 import { updateLinks, useExtAction, useExtCatalog, useExtRead } from './use-ext.ts';
@@ -78,6 +78,7 @@ export function ExtPanelSheet({
   cwd,
   meta,
   onInsert,
+  onFilesOpen,
 }: {
   open: boolean;
   onOpenChange: (open: boolean) => void;
@@ -89,6 +90,11 @@ export function ExtPanelSheet({
   meta?: SessionMeta | undefined;
   /** 插入到输入框；工作区面板没有输入框，插入类动作退化为复制 */
   onInsert?: (text: string) => void;
+  /**
+   * 扩展的 files.open：会话页在 agent 支持文件查看时给。给了才向 agent 声明 files.open 特性；
+   * 只对会话面板生效（工作区面板没有会话，文件查看无从鉴权）。
+   */
+  onFilesOpen?: ((effect: ExtFilesOpenEffect) => void) | undefined;
 }): React.JSX.Element {
   const desktop = useIsDesktop();
   const catalog = useExtCatalog(machineId);
@@ -96,6 +102,19 @@ export function ExtPanelSheet({
   const panels = useMemo(() => extensionsFor(catalog ?? [], point), [catalog, point]);
   const [active, setActive] = useState<string | undefined>(undefined);
   const ext = panels.find((p) => p.id === active) ?? panels[0];
+  // 当前的 files.open 执行器：面板关着也随会话页更新。动作结果可能在处理器没了之后才回来，
+  // 执行时经 getter 读这一刻的值，而不是点击时捕获的
+  const agentFilesOpen = useTrine((s) => s.machines[machineId]?.info?.extensions?.features?.includes('files.open') === true);
+  const filesOpenRef = useRef<((effect: ExtFilesOpenEffect) => void) | undefined>(undefined);
+  filesOpenRef.current =
+    onFilesOpen === undefined || sessionId === undefined || !agentFilesOpen
+      ? undefined
+      : (effect) => {
+          // 先关面板，文件抽屉 / 工作区才不会被盖住
+          onOpenChange(false);
+          onFilesOpen(effect);
+        };
+  const getFilesOpen = useCallback(() => filesOpenRef.current, []);
   return (
     <Sheet open={open} onOpenChange={onOpenChange}>
       <SheetContent
@@ -137,6 +156,7 @@ export function ExtPanelSheet({
                       onOpenChange(false);
                     },
                   })}
+              {...(filesOpenRef.current === undefined ? {} : { getFilesOpen })}
             />
           )}
         </div>
@@ -152,6 +172,7 @@ function PanelBody({
   cwd,
   meta,
   onInsert,
+  getFilesOpen,
 }: {
   ext: ExtCatalogItem;
   machineId: string;
@@ -159,11 +180,20 @@ function PanelBody({
   cwd?: string;
   meta: SessionMeta | undefined;
   onInsert?: (text: string) => void;
+  /** 当前的 files.open 执行器（getter）；给了才声明 files.open */
+  getFilesOpen?: () => ((effect: ExtFilesOpenEffect) => void) | undefined;
 }): React.JSX.Element {
   const client = useClient();
+  const point = sessionId !== undefined ? 'sessionPanel' : 'workspacePanel';
+  const agentFeatures = useTrine((s) => s.machines[machineId]?.info?.extensions?.features);
+  const hasFilesOpen = getFilesOpen !== undefined;
+  const features = useMemo(
+    () => webExtFeatures(point, hasFilesOpen ? { filesOpen: true } : {}, agentFeatures),
+    [point, hasFilesOpen, agentFeatures],
+  );
   const read = useExtRead(
     sessionId !== undefined
-      ? { machineId, ext: ext.id, op: 'view', point: 'sessionPanel', targetSessionId: sessionId }
+      ? { machineId, ext: ext.id, op: 'view', point: 'sessionPanel', targetSessionId: sessionId, features }
       : { machineId, ext: ext.id, op: 'view', point: 'workspacePanel', cwd: cwd ?? '' },
     { watch: true },
   );
@@ -185,6 +215,8 @@ function PanelBody({
         ...(sessionId === undefined ? {} : { sessionId }),
         ...(onInsert === undefined ? {} : { insert: onInsert }),
         refresh: read.refresh,
+        features,
+        ...(getFilesOpen === undefined ? {} : { filesOpen: getFilesOpen }),
       },
     ).finally(() => setBusy(null));
   };

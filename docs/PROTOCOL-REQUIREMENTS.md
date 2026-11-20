@@ -29,13 +29,25 @@
 
 ### 1.2 工具调用卡（原地更新）
 
-- `tool.start` — `{ toolUseId, toolName, argSummary, filePath? }`
+- `tool.start` — `{ toolUseId, toolName, argSummary, filePath?, argDetail? }`
   - argSummary：单行摘要（Bash→命令、Edit→文件路径），由 agent 端生成，避免 client 理解每种工具的参数结构
   - filePath（agent ≥ 0.20.0）：Read / Write / Edit / MultiEdit / NotebookEdit 的完整路径（argSummary 会把长路径缩成 `…/a/b`），
     client 据此打开文件预览（§1.10）。history 的 tool 条目同样带。旧 client 忽略
-- `tool.end` — `{ toolUseId, status: ok|warn|error, durationMs, resultSummary, outputPreview }`
+  - argDetail（agent ≥ 0.25.0）：完整参数原文（Bash / Codex Shell 的命令，WebFetch 的 URL、WebSearch 的查询、
+    Grep / Glob 的模式），保留换行，上限 16000 字符（超出截断并在尾部写明原长）。只在 argSummary 看不全原文
+    （被压成单行或截断）时带；Codex 被识别成 Read 的命令也带原命令。Agent / Task 的 argDetail 是写给子 agent 的 prompt。
+    client 展开工具卡时显示、可复制。history 的 tool 条目同样带。旧 client 忽略
+  - subagent（可选，旧 client 忽略）：子 agent 卡的附加信息 `{ agentType?, background?, state?, nickname?, model?, agentId? }`。
+    同一 toolUseId 可以重发 tool.start 只为更新它，client 按字段合并、结果与子树保留。state 取值
+    pending / running / completed / failed / stopped / interrupted / shutdown / not_found / ended / unknown（Codex 的 CollabAgentStatus 一一对应；
+    ended = 只知道已结束、不知成败，如子转录 meta.json 的 finished）。历史页对已有卡片的 subagent 状态是对账来源：client 用它修正缓存，
+    但已是最终状态的不被改回运行中 / 状态未知。permission.request 另有可选 `subagentId`：来自子 agent 但对不上派生卡时的子 thread id
+- `tool.end` — `{ toolUseId, status: ok|warn|error, durationMs, resultSummary, outputPreview, subagent? }`
   - resultSummary：单行（`✓ +9 −2` / `⚠ 1 failed · 3.5s` 的数据源：exit code、diff stat、耗时）
   - outputPreview：尾部截断的输出文本（阈值待定，~2KB），展开查看用
+  - 子 agent：tool.end 表示「启动它的工具调用返回了」，不表示子 agent 结束。后台启动时带 `subagent.background: true`，
+    后台子 agent 结束时 agent 再发一帧同 id 的 tool.end 收尾并带 `subagent.state`；运行中的状态由 client 从 `bgtask.snapshot` 派生。
+    history 的 tool 条目回填最终状态，没有结束证据时 `state: unknown`
 
 ### 1.3 心跳 footer
 
@@ -74,9 +86,10 @@
 - `session.history.request`（client→agent，会话级）— `{ reqId, before?, limit?(1..500) }`；
   `before` 是上一页响应给的不透明游标，省略即最新一页。agent **不为它拉起会话进程**
   （读的是 `~/.claude/projects` 转录，SDK `getSessionMessages`）
-- `session.history.response`（agent→client，**只发给请求方设备**）— `{ reqId, items[], hasMore, nextBefore? }`；
+- `session.history.response`（agent→client，**只发给请求方设备**）— `{ reqId, items[], hasMore, nextBefore?, error? }`；
+  读取出错（agent ≥ 0.29.1）回空页带 `error{message}`，不发会话级 `error.fatal`，client 按失败处理、可重试；
   items 旧→新，三种：`user{id,text,attachments?,ts}` / `assistant{id=SDK message.id,text,ts}` /
-  `tool{id=toolUseId,toolName,argSummary,status?,durationMs?,resultSummary?,outputPreview?,ts}`，
+  `tool{id=toolUseId,toolName,argSummary,filePath?,argDetail?,status?,durationMs?,resultSummary?,outputPreview?,ts}`，
   id 与实时流同源以便去重。单条文本截断（~8KB），整帧体积封顶（~512KB，超了少给并 hasMore）——
   它会进服务端离线补发存储。会话找不到 → 空 items，不报错
 - client 合并：只收早于时间线里「agent 产生的条目（seq>0）」最早 ts 的历史项，按 id 去重，
@@ -140,14 +153,29 @@
     agent 用一次性 key 加密后上传 relay blob，引用随应答返回；单文件上限 20MiB（`machine.info.files.maxBytes`）
   - kind 先看扩展名，文本类扩展名与未知扩展名再嗅探前 8KB（无 NUL 且是合法 UTF-8 → text，否则 binary）
 - 错误码：`not_found | denied | too_large | is_dir | not_dir | io | unavailable`
-- 范围：会话 cwd 及其子目录，加上 agent 环境变量 `TRINE_FILES_ALLOW`（`:` 分隔的绝对路径或 `~` 开头的路径）。请求路径先按字面判断范围
+- 范围：会话 cwd 及其子目录，加上信任目录：agent 环境变量 `TRINE_FILES_ALLOW`（`:` 分隔的绝对路径或 `~` 开头的路径），
+  以及 `<home>/files.json` 里的列表（agent ≥ 0.24.0，见下文 `files.trust.*`）。往上浏览不另设限制，范围外的请求回 `denied`。请求路径先按字面判断范围
   （范围外直接 `denied`，不碰文件系统），再按 realpath 判断一次（挡符号链接逃逸）；不存在的路径要最深的已存在祖先在范围内才回
   `not_found`，否则也是 `denied`（不能经指向范围外的链接探测文件是否存在）。密钥类判断对字面路径与真实路径都做，目录名不分大小写。
   读文件用 `O_NONBLOCK | O_NOFOLLOW` 打开（命名管道不会挂住），打开后再解析一次路径、比对 inode，检查之后被换掉的回 `denied`。
   密钥类文件始终拒绝，不能配置放开：`.env` / `.env.*`（`.env.example` 等模板除外）、`*.pem` / `*.key` / `*.p12` / `*.pfx` 等、
   `id_rsa` 等 SSH 私钥、`.netrc` / `.npmrc` / `.pypirc` / `.pgpass` / `.git-credentials`、`credentials*.json`，
-  路径中任一段是 `.ssh` / `.gnupg` / `.aws` / `.git` / `.docker` / `.kube` 的，以及 agent 自己的 home
-- `machine.info.files?: { maxBytes }` — 有 = 支持；`TRINE_FILES=off` 时不带，请求回 `unavailable`
+  路径中任一段是 `.ssh` / `.gnupg` / `.aws` / `.git` / `.docker` / `.kube` 的，agent 自己的 home，以及 `/proc` / `/sys` / `/dev`（0.24.0 起）
+- `denied` 的 `error.reason?`（0.24.0 起）：`out_of_scope`（不在会话 cwd / 信任目录之内，client 可提供信任入口）或
+  `sensitive`（上面这些不可覆盖的拒绝）
+- `machine.info.files?: { maxBytes, roots?, home? }` — 有 = 支持；`TRINE_FILES=off` 时不带，请求回 `unavailable`。
+  `roots: { path, source: 'env' | 'trusted', addedAt? }[]`（0.24.0 起，有 = 支持信任目录），`home` 是 agent 用户的 home，
+  client 用来对「信任 home 或其上级」加强提示
+- 信任目录（机器级，0.24.0 起）：`files.trust.add { reqId, path }` / `files.trust.remove { reqId, path }` →
+  `files.trust.response { reqId, ok, path?, error?: { code: invalid | not_found | denied | limit | not_trusted | failed, message } }`，
+  只回请求方；成功后广播 `machine.info`。add 要求绝对路径或 `~` 开头、存在且是目录、不是 `/`（字面与真实路径）、不是密钥类；
+  重复加或已在 `TRINE_FILES_ALLOW` 里算成功；最多 64 个。信任目录每次请求按当前真实路径复查，之后被换成指向 `/` 或密钥类目录的链接就不再当根；`roots` 最多 256 条（过长的 `TRINE_FILES_ALLOW` 截断）。remove 按存下的路径匹配，`TRINE_FILES_ALLOW` 来源的回 `not_trusted`
+- 文件书签（机器级，0.30.0 起，存 `<home>/bookmarks.json`）：`machine.info.files.bookmarks: { path, kind: 'dir' | 'file', addedAt? }[]`
+  （有 = 支持，新加的在前，最多 50 个）。`files.bookmark.add { reqId, path, kind }` / `files.bookmark.remove { reqId, path }` →
+  `files.bookmark.response { reqId, ok, path?, error?: { code: invalid | failed, message } }`，只回请求方；成功后广播 `machine.info`。
+  path 须为绝对路径，agent 规范化（`.`/`..`、末尾 `/`）后存；重复加移到最前；超出丢最旧的；remove 不在列表里也算成功。
+  书签不扩大可浏览范围，agent 不查路径是否存在。client：没有 `bookmarks` 的旧 agent 退回存本设备 prefs；
+  有了之后把本设备的旧书签从最旧的开始补传（agent 已有的跳过），成功的从 prefs 删掉
 - client：入口是工具卡的预览按钮（`filePath`）、消息里像路径的行内代码与相对链接、会话菜单「浏览文件」；按 `machine.info.files` 有无决定显示。
   html 只显示源码；svg 只经 `<img>` 显示；PDF 放进 `<iframe>`（Blob 强制 `application/pdf`，静态响应的 CSP 因此带 `frame-src 'self' blob:`）
 
@@ -157,7 +185,7 @@
   `{ sessionId, title, state, lastEvent（单行摘要）, lastActivityAt, cwd, model, permissionMode, costUsd }`
 - `session.created` / `session.updated` — 列表增量更新（标题生成、状态迁移、成本累计）
 - `session.create`（client→agent）— `{ cwd, model, permissionMode }`（新建表单字段；cwd 默认值 = 该机器 defaultCwd，见 §6；model / permissionMode 默认值取 client 设置「新会话默认值」，初值 opus[1m] / bypassPermissions；model 可为家族别名如 opus、opus[1m]；permissionMode 含 bypassPermissions 档，UI 改选时两击确认）
-- 标题：MVP = 首条用户消息截断；`session.title` 字段留好，后续 agent 生成摘要
+- 标题：首条消息时先用首条用户消息占位；引擎自动起的标题（agent ≥ 0.29.0）随 `session.updated` 推送，client 不用重新列会话。Claude Code：每轮结束时 agent 查一次转录里的正式标题（`/rename` 的标题或自动生成的 aiTitle），没有就隔 5 秒再查一次，拿到后该会话不再查；有待落盘的用户标题时不查。Codex：agent 收到 app-server 的 `thread/name/updated` 即广播
 
 ### 2.1 会话元数据字段扩展（session-list-v2，2026-09-25）
 
@@ -192,7 +220,10 @@ agent 侧所有产出 SessionMeta 的出口（list、session.created、session.u
 
 - `session.pin { sessionId, reqId, pinned: boolean }` — 会话置顶 / 取消置顶。会话级帧，与 §2.2 同一套处理：不 resume、应答走 `session.mutate.response`（未知会话 → `not_found`），成功广播 `session.updated`（带或不带 `pinnedAt`）。不看会话忙不忙；重复置顶保留原时间。**归档会清掉置顶**，取消归档不恢复；删除一并清掉
 - `cwd.pin { path, pinned: boolean }` — 工作区置顶 / 取消置顶（机器级，fire-and-forget，同 `cwd.add`）。工作区不是实体，是 client 按（机器, 去尾 `/` 的 cwd）分出来的组；path 按这个规范化 cwd 发，agent 按字面存进 `~/.trine/cwd.json` 的 `pinned: {cwd: ts}`（最多 100 条，超出丢最早置顶的），随 `cwd.updated` / `cwd.list.response` 的 `pinned` 下发
-- 排序（client）：分组时组序 = 置顶组（越晚置顶越靠上）→ 工作区创建时间倒序（该机器该 cwd 下**全部**会话含已归档的最早 `createdAt`，缺省退回 `lastActivityAt`）；不再看组内状态与最后活动，组不随会话状态跳动。组内 / 平铺时：置顶会话（越晚置顶越靠上）→ 等待批准 → 运行中 → 其余按最后活动时间
+- 置顶顺序（pin-order，`machine.info.cwd.pinOrder: true` 的 agent）：`cwd.json` 另存可选的 `pinOrder: string[]`（pinned 的键，越前越靠上），随 `cwd.updated` / `cwd.list.response` 的 `pinOrder` 下发，同一台机器的各设备一致。agent 读取时规范化：去重、剔除没置顶的、缺的按置顶时间倒序补到末尾；`pinOrder` 坏了只退化它自己（回到时间序），不连带清空收藏 / 默认目录。新置顶插最前，取消置顶移除，100 条上限从 `pinOrder` 末尾淘汰。旧 agent 重写文件会丢掉 `pinOrder`（退回时间序）
+- `cwd.pin.move { reqId, path, before: string | null }` — 把置顶的 path 移到 before 之前（`null` = 末尾）。应答 `cwd.pin.move.response { reqId, ok, error?: { code, message } }` 只回请求方，`code ∈ not_pinned | before_not_pinned | invalid（path = before）| failed（写盘失败）`，不隐式置顶；成功（含顺序没变的重复请求）另广播 `cwd.updated`。agent 先在候选快照上算好、写盘成功才替换内存。目录身份是去尾 `/` 的路径（core `normalizeCwdPath`）：agent 读入时把同一目录的多种拼写合并成一条（保留较早的置顶时间），置顶 / 取消 / 移动和 client 的乐观更新都先规范化（同一目录的不同拼写也算 `invalid`）。只发给有能力位的 agent（旧 agent 会判 `schema_invalid`）。client 不让它进离线队列：与中继断开或机器离线时直接拒绝；每台机器同时只有一个在途移动；超时时撤掉仍在待发队列里的帧
+- 排序（client）：分组时组序 = 置顶组 → 工作区创建时间倒序。置顶组按 `pinOrder`（没有就按置顶时间倒序）；「全部机器」视图下置顶区先按机器分段（机器名、再 machineId 的稳定顺序），段内按该机器的 `pinOrder`。重排入口（组菜单「上移 / 下移 / 移到本机最前」、桌面拖柄）只在 agent 有能力位、机器在线、没有搜索 / 筛选时可用；乐观更新，失败回滚并重拉 `cwd.list`
+- 排序（client，续）：非置顶组按工作区创建时间倒序（该机器该 cwd 下**全部**会话含已归档的最早 `createdAt`，缺省退回 `lastActivityAt`）；不再看组内状态与最后活动，组不随会话状态跳动。组内 / 平铺时：置顶会话（越晚置顶越靠上）→ 等待批准 → 运行中 → 其余按最后活动时间
 - client 拉会话列表时顺带发一次 `cwd.list.request`，拿到置顶工作区
 - 互操作：按 `machine.info.agentVersion` ≥ 0.14.0 探测，版本不够时隐藏置顶菜单；旧 client 丢弃不认识的 `pinnedAt` / `pinned`
 
@@ -207,7 +238,11 @@ agent 侧所有产出 SessionMeta 的出口（list、session.created、session.u
 
 - `machine.status`† — 服务端可见（在线状态本身就是服务端知道的）：`{ machineId, online, lastSeenAt }`
 - `machine.info` — E2E 内容：`{ name, platform, osVersion, agentVersion, claudeVersion, activeSessionCount, maxSessions?, rateLimits?, extensions?, restart?, claudeLatest?, files? }`（maxSessions 自 0.10.0，rateLimits 自 0.12.0，extensions 自 0.16.0、其中 records 自 0.17.0，见 §3.1；restart 自 0.18.0，claudeLatest 自 0.19.0，见下；files 自 0.20.0，见 §1.10）（常用目录另见 §6）
-- `rateLimits?: { fiveHour?, sevenDay?: { percent(0–100), resetsAt? }, updatedAt }`（usage-display）— 机器上登录账号的订阅限额用量，账号级、同机所有会话共用。来源：会话活动时 CLI 每次 API 请求发的 `rate_limit_event`（取其 `unifiedWindows`，类型定义里没有的字段；没有时退回顶层的单个窗口），值变了（或值不变但距上次广播超过 5 分钟）就广播一次 `machine.info`。API key / Bedrock / Vertex 等没有订阅限额的账号不带。agent 不落盘，重启后等下一次会话活动或手动刷新
+- `rateLimits?: { fiveHour?, sevenDay?: { percent(0–100), resetsAt? }, models?: { name, percent, resetsAt? }[], updatedAt }`（usage-display）— 机器上登录账号的订阅限额用量，账号级、同机所有会话共用。来源：会话活动时 CLI 每次 API 请求发的 `rate_limit_event`（取其 `unifiedWindows`，类型定义里没有的字段；没有时退回顶层的单个窗口），值变了（或值不变但距上次广播超过 5 分钟）就广播一次 `machine.info`。API key / Bedrock / Vertex 等没有订阅限额的账号不带。agent 不落盘，重启后等下一次会话活动或手动刷新
+  - `models`（agent ≥ 0.25.0）：按模型单独计的周限额（如 Fable），`name` 是服务端给的桶名。来源：usage 接口的
+    `rate_limits.model_scoped`（带名字，空数组 = 没有这类限额，清掉已知值），以及 `rate_limit_event` 的
+    `unifiedWindows.seven_day_overage_included`（不带名字：已知恰好一个桶时更新它，还不知道时记作 `Fable`，
+    多个桶时无法对应、不动）。旧 client 忽略
 - `machine.claude.update.request { reqId }`（client→agent，机器级，agent ≥ 0.4.0）— 用会话所用的同一个 claude 可执行文件跑 `claude update`（单飞，5 分钟超时），跑完重新探测版本、先广播 `machine.info` 再回 `machine.claude.update.response { reqId, ok, fromVersion, toVersion, output, outputTruncated?, error?: { code: busy|not_found|timeout|failed, message } }`。运行中的会话不重启，新起的会话才用新版
 - `claudeLatest?: { channel: latest|stable, version?, checkedAt?, error? }`（agent ≥ 0.19.0）— 发布源上的 claude 最新版本：agent 查 `https://downloads.claude.ai/claude-code-releases/<channel>`（claude 原生安装自更新用的同一个地址，返回体就是版本号），渠道取 claude settings（`$CLAUDE_CONFIG_DIR` 或 `~/.claude`）的 `autoUpdatesChannel`，每次检查重读。启动后约 30 秒与每 6 小时自动查一次（环境里设了 `DISABLE_AUTOUPDATER` / `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC` 时不自动查），每次查完广播 `machine.info`。失败保留上次的 version / checkedAt 并带 `error`。client 拿 version 与 claudeVersion 开头的版本号比较，判断有没有新版本。缺失 = 不支持，client 隐藏检查入口
 - `machine.claude.check.request { reqId }`（client→agent，机器级，agent ≥ 0.19.0）— 立即检查一次（单飞，15 秒超时），先广播带新 claudeLatest 的 `machine.info`，再回 `machine.claude.check.response { reqId, ok, currentVersion, latest?: { version, channel }, error?: { code: failed, message } }`。旧 agent 静默丢弃，client 按 `machine.info.claudeLatest` 有无探测
@@ -224,19 +259,25 @@ agent 侧所有产出 SessionMeta 的出口（list、session.created、session.u
 
 契约与作者指南见 [EXTENSIONS.md](EXTENSIONS.md)。下面是协议帧。全部是**机器级**帧（扩展不属于任何会话的时间线），目标会话放在密文内的 `targetSessionId`；应答与推送只定向发给请求设备（`ext.record` 例外，广播给全部设备）。
 
-- `machine.info.extensions?: { api, rev, count, records? }` — 缺失 = agent 不支持扩展，client 隐藏全部扩展入口（按这个判断，不按版本号）。`rev` 变化时重拉目录。`records: true`（agent ≥ 0.17.0）= 支持时间线记录卡
+- `machine.info.extensions?: { api, rev, count, records?, features? }` — 缺失 = agent 不支持扩展，client 隐藏全部扩展入口（按这个判断，不按版本号）。`rev` 变化时重拉目录。`records: true`（agent ≥ 0.17.0）= 支持时间线记录卡。`features`（如 `["files.open"]`）= agent 支持的宿主特性，web 只声明这里列出的
 - `ext.catalog.request { reqId }` → `ext.catalog.response { reqId, rev, items[] }` — `items` 由 client 逐条宽松解析，不认识的条目只禁用那一条：`{ id, name, version, description?, apiVersion, contributes, capabilities, enabled, policy: { trust: full|custom, capabilities }, status: ok|disabled|error, lastError? }`
-- `ext.read { reqId, ext, op: view|badge|pick, point, targetSessionId?, cwd?, args?: { query? }, locale?, watch?: { ttlMs }, force? }` → `ext.read.response { reqId?, ext, op, point, targetSessionId?, cwd?, rev, ok, view? | badge? | items?, error? }`
-  - 带 `watch` 时建立订阅（同一设备、扩展、贡献点、目标覆盖旧的，`ttlMs` ≤ 10 分钟，`0` 退订）；之后有变化（动作完成、关联变化、会话一轮结束）就防抖 1 秒推送同类型帧（不带 reqId）。client 在面板可见、页面可见时续租
+- `ext.read { reqId, ext, op: view|badge|pick, point, targetSessionId?, cwd?, args?: { query? }, locale?, watch?: { ttlMs }, force?, features?: string[], client? }` → `ext.read.response { reqId?, ext, op, point, targetSessionId?, cwd?, rev, ok, view? | badge? | items?, error?, features? }`
+  - `client`：页面实例 id（每次加载页面生成，≤ 64）。同一设备换了实例（读取或 prepare 带的 `client` 变了，旧 web 不带 = 空实例）时，agent 作废旧实例的订阅与 token，带特性的在途读取结果不再投递，动作结果去掉 `local` / `view`，迟到的读取不给旧实例签发 token；token 只能由签发实例在 prepare 使用。退订（`ttlMs: 0`）不算换实例，且只删属于发起实例的订阅
+  - 应答 / 推送带回有效特性集 `features`（空时省略），是结果身份的一部分：client 的缓存键包含它
+  - 带 `watch` 时建立订阅（同一设备、扩展、贡献点、目标、有效特性集覆盖旧的，`ttlMs` ≤ 10 分钟，`0` 退订——退订要带同样的 `features`）；之后有变化（动作完成、关联变化、会话一轮结束）就防抖 1 秒推送同类型帧（不带 reqId）。client 在面板可见、页面可见时续租，续租同样带 `features`
   - `rev` 单调递增，client 丢弃比已显示内容旧的结果
   - 视图里需要 agent 执行的动作只带一次性 `token`；只含本地效果的动作带 `local`
-- `ext.action.prepare { reqId, invocationId, token, newSession?: { model, permissionMode } }` → 需要确认时 `ext.action.plan { reqId, invocationId, planId, plan, expiresAt }`，否则直接 `ext.action.result`
+  - `features`：web 能执行的宿主特性（目前只有 `files.open`，最多 16 项，不认识的忽略）。有效集 = 声明 ∩ agent 支持 ∩ 贡献点可执行（`files.open` 只在 `sessionPanel`），缺省为空；作为 `context.features` 传给扩展，并在输出边界整条过滤用到有效集之外特性的动作。旧 agent 会 strip 这个字段（等于空集），旧 web 不带（同样空集），给它的结果里不会有 `files.open`；同一设备新旧页面切换的窗口期内旧页面可能收到并丢弃一帧，重新读取后恢复，不涉及权限。详见 [EXTENSIONS.md §特性协商](EXTENSIONS.md#特性协商)
+  - 本地效果 `local[]`：`prompt.insert { text }`、`copy { text }`、`refresh`、`files.open { path, dir? }`（path ≤ 4096、不含 NUL；只在协商出 `files.open` 时出现）
+- `ext.action.prepare { reqId, invocationId, token, newSession?: { model, permissionMode }, features?: string[], client? }` → 需要确认时 `ext.action.plan { reqId, invocationId, planId, plan, expiresAt }`，否则直接 `ext.action.result`
+  - `features` 与 token 签发时的有效集取交集（只收窄），用于 `invoke` 的扩展输入和返回效果的检查。扩展在 `invoke.requires` 里事先声明的特性不在交集里时，启动扩展进程之前回 `unsupported`；执行后才发现返回效果用到交集之外的特性时，效果全部丢弃，结果 `ok: true` 且带 `effectsDropped: true`，`message` 说明「已执行、未回滚、勿直接重试」
   - `token` 只对签发设备有效、10 分钟过期、一次性；agent 重启、扩展 reload / 停用 / 改权限后作废。relay 留存的旧帧重连后迟到，也只会因过期被拒
   - `newSession` 是发起设备的新会话默认值，`session.create` 效果用它
-  - `plan.steps[]`：`session.create { cwd, title?, prompt, model, permissionMode, links }`、`prompt.send { targetSessionId, sessionTitle, cwd, permissionMode, busy, text }`、`links.add / links.remove`、`invoke { actionLabel, destructive, confirm? }`
-- `ext.action.commit { reqId, invocationId, planId }` → `ext.action.result`；`ext.action.cancel { planId }`（不应答）。commit 只认 planId，不重新运行扩展；执行前复查目标会话的 cwd 与权限模式、扩展代次，变了回 `stale`。plan 2 分钟过期
+  - `plan.steps[]`：`session.create { cwd, title?, prompt, model, permissionMode, links, engine?, engineMode?, effort? }`、`prompt.send { targetSessionId, sessionTitle, cwd, permissionMode, busy, text }`、`links.add / links.remove`、`invoke { actionLabel, destructive, confirm? }`
+- `ext.action.commit { reqId, invocationId, planId, edits? }` → `ext.action.result`；`ext.action.cancel { planId }`（不应答）。commit 只认 planId，不重新运行扩展；执行前复查目标会话的 cwd 与权限模式、扩展代次，变了回 `stale`。plan 2 分钟过期
+  - `edits[]`（agent ≥ 0.31.0，`machine.info.extensions.planEdit` 为真才发）：用户在确认框里对 `session.create` 步骤的修改，`{ step, prompt?, engine?, model?, permissionMode?, engineMode?, effort?: string | null }`，`step` 是 `plan.steps` 下标。只能改新会话的引擎配置（引擎、模型、推理强度、权限模式，`effort: null` = 跟随引擎配置）与首条消息，目录、标题、关联不变；换引擎必须同时给 `model`（回 `denied`），落在别的步骤上、下标重复也回 `denied`。引擎不可用、模式不认识时建会话失败。旧 agent 会 strip `edits`、按原计划执行，所以 web 只在有能力位时开放编辑
 - `ext.action.status { reqId, invocationId }` → `ext.action.result`：执行中 / 等待确认时 `ok: false` 带 `state`（等待确认时带 `pending: { planId, plan, expiresAt }`）；查不到回 `unknown_outcome`。重放的结果不带 `local`
-- `ext.action.result { reqId, invocationId, ok, error?, message?, createdSessionId?, local?, view?, viewRev?, sent?: { targetSessionId, clientMsgId, text, queued }, state?, pending? }` — `createdSessionId` 是新建的会话，只有发起设备跳转过去；`sent.queued` 时发起设备补一条本地排队条目（排队回执只对有本地条目的设备生效）
+- `ext.action.result { reqId, invocationId, ok, error?, message?, createdSessionId?, local?, view?, viewRev?, sent?: { targetSessionId, clientMsgId, text, queued }, state?, pending?, effectsDropped? }` — `createdSessionId` 是新建的会话，只有发起设备跳转过去；`sent.queued` 时发起设备补一条本地排队条目（排队回执只对有本地条目的设备生效）
 - `ext.config.set { reqId, ext, enabled?, policy? }` → `ext.config.response { reqId, ok, error? }`；成功后 `machine.info.extensions.rev` 变化
 - `session.links.update { reqId, targetSessionId, ext, add?: [{ ref, label }], remove?: [ref] }` → `session.links.update.response { reqId, ok, error? }`；结果随 `session.updated` 广播（`SessionMeta.links`）。这是用户在 trine 界面上的手动关联，不受扩展权限约束
 - 贡献点 `newSession`（agent ≥ 0.17.0）：新建会话 sheet 用 `ext.read { op: pick, point: newSession, cwd }` 列候选项（没有 `targetSessionId`）；agent 只给候选项留 `prompt.insert`（作为 `local`），不签发 token。用户点「开始会话」后 client 依次发 `session.create` → `session.links.update`（候选项的 `link`）→ `input.send`（sheet 里可编辑的首条消息），都是现有帧
@@ -289,10 +330,12 @@ PWA 装成 APP 后的系统级推送。帧都在 transport 层（不是 E2E 密�
 
 ### 6.2 工作目录管理（agent 端持久化，每机器一份）
 
-- `cwd.list`（req/resp）— `{ favorites: [path], defaultCwd, pinned? }`；机器详情/新建会话/会话设置三处共用；`pinned` 是置顶工作区（§2.3）
+- `cwd.list`（req/resp）— `{ favorites: [path], defaultCwd, pinned?, pinOrder? }`；机器详情/新建会话/会话设置三处共用；`pinned` 是置顶工作区、`pinOrder` 是它们的手动顺序（§2.3）
 - `cwd.add` / `cwd.remove` — `{ path }`
 - `cwd.setDefault` — `{ path }`；新建会话表单以 defaultCwd 预选
 - `cwd.pin` — `{ path, pinned }`；置顶工作区（§2.3）
+- `cwd.pin.move`（req/resp）— `{ path, before }`；调整置顶工作区顺序（§2.3）
+- `cwd.prepare.request { reqId, path, create }`（cwd-create，`machine.info.cwd.create: true` 的 agent ≥ 0.27.0）— 新建会话前检查（`create: false`）或创建（`create: true`，`mkdir -p`）工作目录。应答 `cwd.prepare.response { reqId, ok, path?, status?: exists | missing | created, missing?: [path], error?: { code, message } }` 只回请求方、不广播；`path` 是解析后的绝对路径（`~` 已展开），新建会话用它；`missing` 是要新建（已新建）的各级目录，从浅到深，最多 16 级。`code ∈ invalid（相对路径、含 NUL、超过 16 级）| denied | not_dir（路径或某级祖先是文件、失效的符号链接）| failed（没有权限、只读、磁盘满等）`。已存在的目录一律 `exists`，不做别的判断（预检不能把 session.create 原本能用的目录拦下）；要新建时，字面路径和「最深已存在祖先的真实路径 + 其余段」都不能落在密钥类路径、trine home 或 `/proc` `/sys` `/dev` 里（同文件查看），建完按真实路径复查。不提权。`session.create` 不变：client（新建会话面板）开始前先检查，`missing` 时弹确认框列出各级目录，确认后创建再建会话；失败时撤掉仍在待发队列里的帧。没有能力位的 agent 不预检，行为同以前
 - 变更广播 `cwd.updated` — 多客户端设备保持一致
 - 会话内当前 cwd 的展示：会话头部元信息行（低优先级折叠态），点开会话设置 sheet 查看/切换——数据即 `session.status.cwd`，无需独立事件
 
@@ -318,9 +361,11 @@ PWA 装成 APP 后的系统级推送。帧都在 transport 层（不是 E2E 密�
 - Codex 不支持的请求（后台任务、刷新 context）由 agent 拒绝。
 - 回退（agent ≥ 0.22.0）：`capabilities.rewind` 列出支持的模式，Codex 只有 `conversation`，`code`、`both` 回 `unavailable`。Codex 第一条消息也能回退；一轮中追加的消息回 `invalid`，因为撤掉的是整轮；旧格式 thread 回 `unavailable`。预览的 `files` 恒为不可用。
 - 压缩和 skill 不加帧：`session.commands.response` 给出清单（`compact` + 启用的 skill），client 照常把 `/name …` 当文本发送，Codex 引擎在 agent 端转成压缩或 skill 调用。不是 skill 的文本原样发给模型。
-- `session.setEffort`、`session.create.effort`、`SessionMeta.effort`（agent ≥ 0.22.0，`capabilities.effort`）：推理强度，开放字符串，选项在 `EngineModel.efforts`。模型不支持的值不采用。`session.setEffort` 省略 `effort` = 回到模型默认值。
+- `session.setEffort`、`session.create.effort`、`SessionMeta.effort`（agent ≥ 0.22.0，`capabilities.effort`）：推理强度，开放字符串，选项在 `EngineModel.efforts`；无模型目录的引擎可在 `EngineSummary.efforts` 提供统一选项（Claude），具体模型降档交给引擎处理。Codex 模型不支持的值不采用。`session.setEffort` 省略 `effort` = 回到模型默认值。
 - `MachineClaudeLatest.install`、`EngineSummary.install`（agent ≥ 0.23.0）：引擎由包管理器安装时才有，`manager` 是开放字符串，`command` 是实际执行的命令，只用于显示。这时最新版本来自包管理器；Claude 的 `channel` 优先取 cask 名或 apt 源地址。
 - `machine.engine.update.request`、`machine.engine.check.request` 及其应答（agent ≥ 0.22.0，`capabilities.update`）：语义同 `machine.claude.*`，多一个 `engine`。最新版本在 `EngineSummary.latest`，先随 `machine.info` 广播再回应答。
+- `machine.engine.autoupdate.set { reqId, engine, enabled }`（agent ≥ 0.31.0，`EngineSummary.autoUpdate` 有 = 支持）→ `machine.engine.autoupdate.response { reqId, engine, ok, enabled, error?: { code: not_found | failed, message } }`。开关存在 `<home>/engine-auto-update.json`，机器级、所有设备共享，成功后先广播 `machine.info` 再回应答；默认关。`EngineSummary.autoUpdate: { enabled, last?: { at, ok, fromVersion, toVersion, error? } }`，`last` 是最近一次自动更新的结果。开着时每次版本检查成功（启动后约 30 秒、之后每 6 小时，或手动检查）查到比当前新的版本就跑一次该引擎的更新（与手动更新同一个单飞执行器；手动更新进行中则跳过、不记结果）；打开时立即检查一次。没有退避：失败等下一次检查再试。Claude 只在找到全局 `claude` 时提供（SDK 内置版本无从更新）。运行中的会话不受影响，同手动更新
+- `machine.engine.restart.request { reqId, engine }`（agent ≥ 0.28.0，`capabilities.restart`）：重启引擎的后台进程。应答 `machine.engine.restart.response { reqId, engine, ok, daemon?: restarted | not_running | failed, daemonMessage?, error?: { code: busy | unavailable | failed, message } }`。Codex：该引擎有会话在回复、有排队消息时回 `busy`，不打断轮次；否则立即换掉 agent 的 `codex app-server`（加载着的 thread 按进程退出处理，下一条消息 resume），在新进程上刷新登录状态与限额（随 `machine.info` 广播）；机器上的常驻 daemon 在运行时执行 `codex app-server daemon restart`，没在运行不拉起。daemon 失败不影响 `ok`，原因在 `daemonMessage`。用途：Codex 换账号后运行中的进程不重新读 `auth.json`。
 - `EngineSummary.rateLimits.windows`：引擎的限额窗口，数量和时长因账号而异（实测有只给周窗口的账号），不能假设是 5 小时 + 7 天。Claude 的限额仍在 `MachineInfo.rateLimits`。
 
 ## 协议约定汇总

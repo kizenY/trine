@@ -21,7 +21,7 @@
  */
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { useLocation } from 'react-router';
-import { ChevronRightIcon, MoreHorizontalIcon, PinIcon } from 'lucide-react';
+import { ChevronRightIcon, MoreHorizontalIcon, PinIcon, PlusIcon } from 'lucide-react';
 import type { SessionMeta } from '@trine/core';
 import type { MachineState } from '@/store/types.ts';
 import { useTrine } from '@/app/runtime.ts';
@@ -49,8 +49,18 @@ import {
   isGroupExpanded,
   type ListQuery,
   type PinnedCwds,
+  type PinOrders,
   type SessionGroup,
 } from './filtering.ts';
+import { effectivePinOrder, pinDropTarget, pinMoveTarget, type PinMoveAction } from './pin-order.ts';
+import {
+  PinnedDragHandle,
+  PinnedSortableSegment,
+  POINTER_FINE_QUERY,
+  SortableGroup,
+  useInPinnedSortable,
+} from './PinnedSortable.tsx';
+import { useMediaQuery } from '@/components/shell/use-media-query.ts';
 import { useCollapsedGroups } from './collapsed-groups.ts';
 import {
   hasRowMenu,
@@ -80,6 +90,7 @@ export function SessionList({
   className,
   actions,
   onShowTemp,
+  onNewSessionIn,
 }: {
   sessions: Record<string, Record<string, SessionMeta>>;
   machines: Record<string, MachineState>;
@@ -91,6 +102,11 @@ export function SessionList({
   actions?: SessionRowActions;
   /** 临时会话提示旁的「显示 / 隐藏」按钮；不给就只有文字 */
   onShowTemp?: (value: boolean) => void;
+  /**
+   * 「在此目录新建会话」（组头「+」、空组按钮、组菜单）。由调用方决定怎么打开新建 sheet
+   * （侧栏 / 列表页 / 机器详情各自挂载点不同）；不给 = 不显示这些入口
+   */
+  onNewSessionIn?: (machineId: string, cwd: string) => void;
 }): React.JSX.Element {
   const location = useLocation();
   const compact = variant === 'compact';
@@ -107,11 +123,39 @@ export function SessionList({
     for (const [id, m] of Object.entries(machines)) if (m.cwd?.pinned !== undefined) out[id] = m.cwd.pinned;
     return out;
   }, [machines]);
+  // 置顶顺序（plan §1）：每台机器的有效顺序 + 稳定的机器顺序（名字、再 id；不按在线与否跳）
+  const pinSort = useMemo(() => {
+    const pinOrder: PinOrders = {};
+    for (const [id, m] of Object.entries(machines)) if (m.cwd?.pinned !== undefined) pinOrder[id] = effectivePinOrder(m.cwd);
+    const machineOrder = Object.values(machines)
+      .sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : a.machineId < b.machineId ? -1 : 1))
+      .map((m) => m.machineId);
+    return { pinOrder, machineOrder };
+  }, [machines]);
   const result = useMemo(
-    () => filterSessions(sessions, query, machineNames, pinnedCwds, doneAt),
-    [sessions, query, machineNames, pinnedCwds, doneAt],
+    () => filterSessions(sessions, query, machineNames, pinnedCwds, doneAt, pinSort),
+    [sessions, query, machineNames, pinnedCwds, doneAt, pinSort],
   );
+  /** 置顶组的重排入口：旧 agent 不给（undefined）；离线 / 搜索筛选中给原因（禁用） */
+  const pinMoveFor = (group: SessionGroup): PinMoveProps | undefined => {
+    const move = actions?.onMovePinnedWorkspace;
+    if (move === undefined || group.pinnedAt === undefined || query.archived) return undefined;
+    if (actions?.supportsPinOrder?.(group.machineId) !== true) return undefined;
+    const order = pinSort.pinOrder[group.machineId] ?? [];
+    const blocked = isFiltering(query)
+      ? '搜索 / 筛选中不能调整顺序'
+      : machines[group.machineId]?.online !== true
+        ? '机器离线，暂不能调整顺序'
+        : (actions.pinMoveBlocked?.(group.machineId) ?? null);
+    return {
+      order,
+      blocked,
+      move: (before) => swallowRejection(move(group.machineId, group.cwd, before)),
+    };
+  };
   const { requestRename, requestDelete, dialogs } = useRowActionDialogs(actions);
+  // 拖柄只给精确指针（桌面鼠标 / 触控板）；触屏用组菜单的上移 / 下移
+  const pointerFine = useMediaQuery(POINTER_FINE_QUERY);
 
   // ---- 多选 ----
   const onArchiveMany = actions?.onArchiveMany;
@@ -221,6 +265,14 @@ export function SessionList({
   }
 
   const showMachine = query.machine === null;
+  // 组头的机器名：「全部机器」视图且不止一台机器时才有意义
+  const showGroupMachine = showMachine && Object.keys(machines).length > 1;
+  // 第一个非置顶组（前面有置顶组时）：在它前面画分隔线
+  const firstUnpinnedKey = (() => {
+    const groups = result.groups ?? [];
+    const i = groups.findIndex((g) => g.pinnedAt === undefined);
+    return i > 0 ? groups[i]!.key : undefined;
+  })();
   // 从归档视图点进会话：带上来源，手机上「返回」回到 /archived 而不是列表（评审 minor 9）
   const linkState = location.pathname === '/archived' ? { from: '/archived' } : undefined;
   const renderRow = (row: SessionRowData): React.JSX.Element => {
@@ -323,13 +375,58 @@ export function SessionList({
         )}
         {result.groups === null
           ? result.rows.map(renderRow)
-          : result.groups.map((group) => (
+          : groupSegments(result.groups, (g) => pointerFine && pinMoveFor(g)?.blocked === null).flatMap((seg) =>
+              seg.sortable ? (
+                <PinnedSortableSegment
+                  key={`sortable:${seg.groups[0]!.machineId}`}
+                  items={seg.groups.map((g) => ({ id: g.key, label: groupLabel(g.cwd) }))}
+                  onMove={(activeKey, overKey) => {
+                    const active = seg.groups.find((g) => g.key === activeKey);
+                    const over = seg.groups.find((g) => g.key === overKey);
+                    const pm = active === undefined ? undefined : pinMoveFor(active);
+                    if (active === undefined || over === undefined || pm === undefined) return;
+                    const before = pinDropTarget(pm.order, active.cwd, over.cwd);
+                    if (before !== undefined) pm.move(before);
+                  }}
+                >
+                  {seg.groups.map((group) => (
+                    <SortableGroup key={group.key} id={group.key} label={groupLabel(group.cwd)}>
+                      {renderGroup(group)}
+                    </SortableGroup>
+                  ))}
+                </PinnedSortableSegment>
+              ) : (
+                seg.groups.flatMap((g) =>
+                  g.key === firstUnpinnedKey
+                    ? [
+                        // 置顶区与其余工作区之间的细分隔线（两种主题都用 border token）
+                        <div
+                          key="pinned-divider"
+                          role="separator"
+                          aria-label="以上为置顶的工作区"
+                          data-testid="pinned-divider"
+                          className="border-border mx-1 border-t"
+                        />,
+                        renderGroup(g),
+                      ]
+                    : [renderGroup(g)],
+                )
+              ),
+            )}
+        {tempNote}
+      </div>
+      {dialogs}
+    </>
+  );
+
+  function renderGroup(group: SessionGroup): React.JSX.Element {
+    return (
               <GroupSection
                 key={group.key}
                 group={group}
                 expanded={isGroupExpanded(group, collapsed, query)}
                 filtering={isFiltering(query)}
-                machineName={showMachine ? (machineNames[group.machineId] ?? group.machineId) : null}
+                machineName={showGroupMachine ? (machineNames[group.machineId] ?? group.machineId) : null}
                 compact={compact}
                 onToggle={(next) => setCollapsed(group.key, !next)}
                 {...(actions?.onPinWorkspace !== undefined &&
@@ -343,15 +440,39 @@ export function SessionList({
                 (actions.supportsLinks?.(group.machineId) ?? true)
                   ? { onWorkspace: () => actions.onOpenWorkspace?.(group.machineId, group.cwd) }
                   : {})}
+                {...(actions?.onCopyCwd !== undefined && group.cwd !== ''
+                  ? { onCopyCwd: () => swallowRejection(actions.onCopyCwd?.(group.cwd)) }
+                  : {})}
+                pinMove={pinMoveFor(group)}
+                {...(onNewSessionIn !== undefined && group.cwd !== ''
+                  ? {
+                      onNewSession: () => onNewSessionIn(group.machineId, group.cwd),
+                      newSessionBlocked: newSessionBlockedReason(machines[group.machineId]),
+                    }
+                  : {})}
               >
                 {group.rows.map(renderRow)}
               </GroupSection>
-            ))}
-        {tempNote}
-      </div>
-      {dialogs}
-    </>
-  );
+    );
+  }
+}
+
+/**
+ * 把排好序的组切成段：连续的、同一台机器的可拖置顶组合成一段（各自一个 DndContext），
+ * 其余每组单独成段。置顶区按机器分段排好，所以同机器的置顶组本来就相邻。
+ */
+function groupSegments(
+  groups: readonly SessionGroup[],
+  sortable: (g: SessionGroup) => boolean,
+): { sortable: boolean; groups: SessionGroup[] }[] {
+  const out: { sortable: boolean; groups: SessionGroup[] }[] = [];
+  for (const g of groups) {
+    const s = sortable(g);
+    const last = out.at(-1);
+    if (s && last?.sortable === true && last.groups[0]!.machineId === g.machineId) last.groups.push(g);
+    else out.push({ sortable: s, groups: [g] });
+  }
+  return out;
 }
 
 function GroupSection({
@@ -363,6 +484,10 @@ function GroupSection({
   onToggle,
   onPin,
   onWorkspace,
+  onCopyCwd,
+  onNewSession,
+  newSessionBlocked = null,
+  pinMove,
   children,
 }: {
   group: SessionGroup;
@@ -377,12 +502,23 @@ function GroupSection({
   onPin?: (pinned: boolean) => void;
   /** 打开工作区的扩展面板；不给 = 没有这一项 */
   onWorkspace?: () => void;
+  /** 复制工作区目录（不经 agent）；不给 = 没有这一项 */
+  onCopyCwd?: () => void;
+  /** 在此目录新建会话；不给 = 没有这些入口（未知目录 / 调用方不支持） */
+  onNewSession?: () => void;
+  /** 不能新建的原因（机器离线）；null = 可以 */
+  newSessionBlocked?: string | null;
+  /** 置顶组的重排（上移 / 下移 / 移到本机最前）；不给 = 不显示这些项 */
+  pinMove?: PinMoveProps | undefined;
   children: React.ReactNode;
 }): React.JSX.Element {
   // 有待批准 / 搜索筛选中强制展开：点了也收不起来，别假装能收（评审 M5 / minor 3）
   const forced = group.waitingCount > 0 || filtering;
-  const label = group.cwd === '' ? groupLabel('') : shortCwd(group.cwd, compact ? 2 : 3);
+  // 目录名优先：末两级路径，全路径在 title 里
+  const label = group.cwd === '' ? groupLabel('') : shortCwd(group.cwd, 2);
   const pinned = group.pinnedAt !== undefined;
+  // 可拖的置顶组：拖柄平时藏着，组头悬停 / 聚焦时占用图钉的位置，不额外占宽
+  const sortable = useInPinnedSortable();
   const header = (
       <button
         type="button"
@@ -406,9 +542,28 @@ function GroupSection({
           aria-hidden
           className={cn('size-3.5 shrink-0 transition-transform', expanded && 'rotate-90', forced && 'opacity-40')}
         />
-        {pinned && <PinIcon aria-label="已置顶" data-testid="session-group-pinned" className="size-3 shrink-0" />}
-        <span className={cn('min-w-0 truncate font-mono', group.cwd === '' && 'font-sans italic')}>{label}</span>
-        {machineName !== null && <span className="text-text-3 shrink-0 truncate">· {machineName}</span>}
+        {pinned && (
+          <PinIcon
+            aria-label="已置顶"
+            data-testid="session-group-pinned"
+            className={cn(
+              'size-3 shrink-0',
+              sortable && 'group-focus-within/header:invisible group-hover/header:invisible',
+            )}
+          />
+        )}
+        <span
+          data-testid="session-group-label"
+          className={cn('min-w-0 shrink truncate font-mono', group.cwd === '' && 'font-sans italic')}
+        >
+          {label}
+        </span>
+        {/* 机器名先让位：它比目录名更早被截断 */}
+        {machineName !== null && (
+          <span data-testid="session-group-machine" className="text-text-3 max-w-24 min-w-0 shrink-[4] truncate">
+            · {machineName}
+          </span>
+        )}
         <span className="text-text-3 tabular shrink-0">{group.rows.length}</span>
         {!expanded && (group.waitingCount > 0 || group.runningCount > 0) && (
           <span className="ml-auto flex shrink-0 gap-1.5" data-testid="session-group-badges">
@@ -426,29 +581,71 @@ function GroupSection({
         )}
       </button>
   );
-  const pinLabel = pinned ? '取消置顶工作区' : '置顶工作区';
+  // 组菜单项：「⋯」下拉与右键菜单共用一份
+  const menuItems: GroupMenuItem[] = [];
+  if (onNewSession !== undefined) {
+    menuItems.push({ id: 'new-session', label: '在此目录新建会话', onSelect: onNewSession });
+  }
+  if (onPin !== undefined) {
+    menuItems.push({ id: 'pin', label: pinned ? '取消置顶工作区' : '置顶工作区', onSelect: () => onPin(!pinned) });
+  }
+  if (pinMove !== undefined) {
+    for (const [action, label] of PIN_MOVE_ITEMS) {
+      const before = pinMoveTarget(pinMove.order, group.cwd, action);
+      menuItems.push({
+        id: `move-${action}`,
+        label,
+        disabled: pinMove.blocked !== null || before === undefined,
+        ...(pinMove.blocked === null ? {} : { title: pinMove.blocked }),
+        onSelect: () => {
+          if (before !== undefined) pinMove.move(before);
+        },
+      });
+    }
+  }
+  if (onWorkspace !== undefined) menuItems.push({ id: 'workspace', label: '扩展面板…', onSelect: onWorkspace });
+  if (onCopyCwd !== undefined) menuItems.push({ id: 'copy-cwd', label: '复制目录', title: group.cwd, onSelect: onCopyCwd });
+  const plus =
+    onNewSession === undefined ? null : (
+      <Button
+        size="icon-xs"
+        variant="ghost"
+        data-testid="session-group-new"
+        aria-label={`在「${groupLabel(group.cwd)}」新建会话`}
+        title={newSessionBlocked === null ? '在此目录新建会话' : `在此目录新建会话（${newSessionBlocked}）`}
+        onClick={onNewSession}
+        // 常显、低调；触屏把点击区放大到 44px（负外边距抵掉，组头不变高）
+        className="text-text-3 hover:text-text size-5 shrink-0 pointer-coarse:-my-3 pointer-coarse:size-11"
+      >
+        <PlusIcon />
+      </Button>
+    );
   return (
     <section data-testid="session-group" data-group-key={group.key} data-expanded={expanded} data-pinned={pinned || undefined} className="flex flex-col gap-2">
-      {onPin === undefined && onWorkspace === undefined ? (
+      {menuItems.length === 0 ? (
         header
       ) : (
-        // 「⋯」与按钮是兄弟（不嵌套交互元素）；右键整条组头也能出同一个菜单
-        <div className="group/header flex min-w-0 items-center gap-1">
+        // 「+」「⋯」与按钮是兄弟（不嵌套交互元素）；右键整条组头也能出同一个菜单
+        <div className="group/header relative flex min-w-0 items-center gap-1">
+          {/* 可拖的置顶段里才有（PinnedSortable.tsx SortableGroup 经 context 给）；绝对定位盖在图钉上 */}
+          <PinnedDragHandle />
           <ContextMenu>
             <ContextMenuTrigger asChild>{header}</ContextMenuTrigger>
             <ContextMenuContent data-testid="session-group-context-menu">
-              {onPin !== undefined && (
-                <ContextMenuItem data-testid="group-menu-pin" onSelect={() => onPin(!pinned)}>
-                  {pinLabel}
+              {menuItems.map((item) => (
+                <ContextMenuItem
+                  key={item.id}
+                  data-testid={`group-menu-${item.id}`}
+                  disabled={item.disabled}
+                  {...(item.title === undefined ? {} : { title: item.title })}
+                  onSelect={item.onSelect}
+                >
+                  {item.label}
                 </ContextMenuItem>
-              )}
-              {onWorkspace !== undefined && (
-                <ContextMenuItem data-testid="group-menu-workspace" onSelect={onWorkspace}>
-                  扩展面板…
-                </ContextMenuItem>
-              )}
+              ))}
             </ContextMenuContent>
           </ContextMenu>
+          {plus}
           <DropdownMenu modal={false}>
             <DropdownMenuTrigger asChild>
               <Button
@@ -463,21 +660,82 @@ function GroupSection({
               </Button>
             </DropdownMenuTrigger>
             <DropdownMenuContent align="end" className="w-auto min-w-36" data-testid="session-group-menu-content">
-              {onPin !== undefined && (
-                <DropdownMenuItem data-testid="group-menu-pin" onSelect={() => onPin(!pinned)}>
-                  {pinLabel}
+              {menuItems.map((item) => (
+                <DropdownMenuItem
+                  key={item.id}
+                  data-testid={`group-menu-${item.id}`}
+                  disabled={item.disabled}
+                  {...(item.title === undefined ? {} : { title: item.title })}
+                  onSelect={item.onSelect}
+                >
+                  {item.label}
                 </DropdownMenuItem>
-              )}
-              {onWorkspace !== undefined && (
-                <DropdownMenuItem data-testid="group-menu-workspace" onSelect={onWorkspace}>
-                  扩展面板…
-                </DropdownMenuItem>
-              )}
+              ))}
             </DropdownMenuContent>
           </DropdownMenu>
         </div>
       )}
-      {expanded && children}
+      {expanded &&
+        (group.rows.length === 0 ? (
+          <div
+            data-testid="session-group-empty"
+            className={cn('text-text-3 flex flex-wrap items-center gap-2 px-6', compact ? 'text-[11.5px]' : 'text-xs')}
+          >
+            <span>暂无会话</span>
+            {onNewSession !== undefined && (
+              <Button
+                size="xs"
+                variant="ghost"
+                data-testid="session-group-empty-new"
+                disabled={newSessionBlocked !== null}
+                onClick={onNewSession}
+                // 链接式的轻按钮；触屏用伪元素把点击区撑到 44px 高，不改变视觉大小
+                className="text-brand-ink relative h-auto px-1 py-0.5 pointer-coarse:after:absolute pointer-coarse:after:inset-x-0 pointer-coarse:after:-inset-y-3.5 pointer-coarse:after:content-['']"
+              >
+                <PlusIcon />
+                新建会话
+              </Button>
+            )}
+            {onNewSession !== undefined && newSessionBlocked !== null && (
+              <span data-testid="session-group-empty-blocked">{newSessionBlocked}</span>
+            )}
+          </div>
+        ) : (
+          children
+        ))}
     </section>
   );
+}
+
+/** 置顶组重排：本机的有效顺序、不能重排的原因（null = 可以）、发起移动 */
+interface PinMoveProps {
+  order: readonly string[];
+  blocked: string | null;
+  move: (before: string | null) => void;
+}
+
+const PIN_MOVE_ITEMS: readonly (readonly [PinMoveAction, string])[] = [
+  ['up', '上移'],
+  ['down', '下移'],
+  ['top', '移到本机最前'],
+];
+
+interface GroupMenuItem {
+  /** testid 后缀：`group-menu-<id>` */
+  id: string;
+  label: string;
+  title?: string;
+  disabled?: boolean;
+  onSelect: () => void;
+}
+
+/** 组里「新建会话」为什么不能点：机器离线（缓存里的置顶组照常显示，但发不出请求） */
+export function newSessionBlockedReason(machine: MachineState | undefined): string | null {
+  if (machine === undefined) return '机器已移除';
+  return machine.online === true ? null : '机器离线，暂不能新建';
+}
+
+/** 回调的 reject 已由回调自己 toast，这里吞掉，不冒成未处理异常 */
+function swallowRejection(result: void | Promise<unknown> | undefined): void {
+  if (result instanceof Promise) result.catch(() => {});
 }

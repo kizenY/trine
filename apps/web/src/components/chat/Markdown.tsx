@@ -11,8 +11,9 @@
  *
  * - 核心包不拉网；代码高亮用 `@streamdown/code` 的 shiki **JS 引擎**，
  *   语法与主题都打进 bundle，不走 CDN、不 fetch wasm；
- * - `@streamdown/math` / mermaid **不装**——MVP 用不上，且它们会引入远端
- *   资源与大体积依赖；
+ * - `@streamdown/math` **不装**；mermaid 用自己的懒加载插件（mermaid-plugin.ts）：
+ *   打进 bundle 但单独成 chunk，遇到 ```mermaid 才下载；产出的 SVG 绕过 rehype 管线，
+ *   由插件自己消毒（去掉一切外部 URL）。流式中与扩展输出（restricted）不渲染图，只显示源码；
  * - `linkSafety` 不开（它要外部检查）；
  * - **图片一律不外连**（见下）。
  * 构建后 `dist/` 的外链 grep 是这条约束在构建产物上的守门测。
@@ -51,16 +52,54 @@
  * shiki 双主题 `[github-light, github-dark]` 由 streamdown 按 CSS 变量切，
  * 与 app/theme.ts 的三态主题自洽（跟随 `prefers-color-scheme` 与 `.dark`）。
  */
-import { memo, useContext } from 'react';
-import { defaultRehypePlugins, Streamdown, type StreamdownProps } from 'streamdown';
+import { memo, useContext, useMemo } from 'react';
+import { defaultRehypePlugins, Streamdown, type MermaidErrorComponentProps, type StreamdownProps } from 'streamdown';
 import { code } from '@streamdown/code';
 import { ImageIcon } from 'lucide-react';
-import { decodeHref, detectPath, isLocalHref, resolveRelative } from '@/components/files/file-model.ts';
-import { FileBaseContext, useFileLinks } from '@/components/files/file-links.ts';
+import { useResolvedTheme } from '@/app/theme.ts';
+import { mermaid } from './mermaid-plugin.ts';
+import { decodeHref, detectPath, isLocalHref, resolveRelative, type DetectedPath } from '@/components/files/file-model.ts';
+import {
+  FileBaseContext,
+  FileDocAnchorContext,
+  targetForClick,
+  useFileLinks,
+  type FileOpenIntent,
+  type FileOpenTarget,
+} from '@/components/files/file-links.ts';
+import { splitFrontMatter, type FrontMatter } from '@/components/files/front-matter.ts';
+import { createSlugger, splitHref } from '@/components/files/toc-model.ts';
 import { cn } from '@/lib/utils.ts';
+
+/** 识别出的路径 → 打开 intent（以 `/` 结尾的是目录） */
+function intentFor(detected: DetectedPath, target: FileOpenTarget, fragment?: string): FileOpenIntent {
+  if (detected.dir) return { dir: true, path: detected.path, target };
+  return fragment === undefined || fragment === '' ? { path: detected.path, target } : { path: detected.path, target, fragment };
+}
 
 /** 插件实例提到模块级：每次渲染新建会丢掉 shiki 已加载的语言缓存 */
 const plugins = { code };
+/**
+ * 带 mermaid：只在非流式、非 restricted 时用。流式中图表源码每个 token 都在变，逐次重渲染既费
+ * 又闪（半截源码多半是语法错误），所以先显示成代码块，回复结束后再换成图。
+ */
+const pluginsWithDiagrams = { code, mermaid };
+
+/** 图表渲染失败：退回源码（语法错误时用户至少能看到写了什么） */
+function MermaidError({ chart, error }: MermaidErrorComponentProps): React.JSX.Element {
+  return (
+    <div data-testid="mermaid-error" className="bg-surface-2 my-2 rounded-lg">
+      <div className="text-text-3 px-3 pt-2 text-[11px]" title={error}>
+        mermaid 图表无法渲染，显示源码
+      </div>
+      <pre className="bg-code-bg overflow-x-auto rounded-b-lg p-3 font-mono text-[12.5px] whitespace-pre">{chart}</pre>
+    </div>
+  );
+}
+const mermaidOptions = {
+  light: { config: { theme: 'default' }, errorComponent: MermaidError },
+  dark: { config: { theme: 'dark' }, errorComponent: MermaidError },
+} as const;
 
 /**
  * `<source>` 一律不渲染（N1）。
@@ -94,7 +133,7 @@ function FileAwareInlineCode({ children, className, node: _node, ...props }: Rea
       data-testid="file-link"
       data-path={detected.path}
       title={detected.dir ? `浏览目录 ${detected.path}` : `预览 ${detected.path}`}
-      onClick={() => (detected.dir ? links.browse(detected.path) : links.open(detected.path))}
+      onClick={(e) => links.open(intentFor(detected, targetForClick(e)))}
       className="cursor-pointer align-baseline decoration-dotted underline-offset-2 hover:underline"
     >
       {codeEl}
@@ -112,20 +151,51 @@ function FileAwareLink({
 }: React.ComponentProps<'a'> & { node?: unknown; 'data-file-href'?: string }): React.JSX.Element {
   const links = useFileLinks();
   const base = useContext(FileBaseContext);
+  const anchors = useContext(FileDocAnchorContext);
   if (links !== null && typeof fileHref === 'string') {
-    // 先去掉 ?query / #锚点 再解码（文件名里的 %23 解码后是 #，不能再被当锚点切掉）
-    const href = decodeHref(fileHref.replace(/[?#].*$/, ''));
+    // 同文件锚点（只在文件预览里被保护下来）：在预览自己的滚动容器里定位，不动地址栏
+    if (fileHref.startsWith('#')) {
+      const fragment = decodeHref(fileHref.slice(1));
+      if (anchors === null || fragment === '') return <span className={className}>{children}</span>;
+      return (
+        <a
+          href={fileHref}
+          data-testid="file-anchor-link"
+          data-fragment={fragment}
+          onClick={(e) => {
+            // Ctrl/Cmd/Shift 点击不劫持
+            if (e.ctrlKey || e.metaKey || e.shiftKey) return;
+            e.preventDefault();
+            // 显式 side（Alt）优先：走完整 intent，由路由决定去处（工作区里另开一份）
+            if (targetForClick(e) === 'side' && base !== undefined) links.open({ path: base, fragment, target: 'side' });
+            else anchors.jump(fragment, { focus: true });
+          }}
+          className={cn('text-brand-ink underline', className)}
+        >
+          {children}
+        </a>
+      );
+    }
+    // 先去掉 ?query / #锚点 再解码（文件名里的 %23 解码后是 #，不能再被当锚点切掉）；锚点单独带给打开 intent
+    const { path: href, fragment } = splitHref(fileHref);
     const target = base === undefined ? href : resolveRelative(base, href);
     // 聊天里只认像路径的（`[x](foo)` 这种裸词不算）；文件里的相对链接都当文件
     const detected = base === undefined ? detectPath(target) : { path: target, dir: target.endsWith('/') };
     if (detected !== undefined) {
+      // 指回本文件的 `a.md#x`：普通点击当成同文件锚点；显式 side（Alt）优先，照常走 intent
+      const sameFile = anchors !== null && base !== undefined && !detected.dir && detected.path === base && fragment !== undefined;
       return (
         <button
           type="button"
           data-testid="file-link"
           data-path={detected.path}
+          {...(fragment === undefined ? {} : { 'data-fragment': fragment })}
           title={detected.path}
-          onClick={() => (detected.dir ? links.browse(detected.path) : links.open(detected.path))}
+          onClick={(e) => {
+            const target = targetForClick(e);
+            if (sameFile && target !== 'side') anchors.jump(fragment, { focus: true });
+            else links.open(intentFor(detected, target, fragment));
+          }}
           className={cn('text-brand-ink cursor-pointer text-left underline', className)}
         >
           {children}
@@ -156,7 +226,7 @@ function FileDocImage({
       type="button"
       data-testid="file-doc-image"
       data-path={target}
-      onClick={() => links.open(target)}
+      onClick={(e) => links.open({ path: target, target: targetForClick(e) })}
       className="border-border bg-surface-2 text-text-2 hover:text-text inline-flex items-center gap-1 rounded-md border px-2 py-0.5 text-[12px]"
     >
       <ImageIcon className="size-3.5" />
@@ -165,33 +235,117 @@ function FileDocImage({
   );
 }
 
+type HeadingProps = React.ComponentProps<'h1'> & { node?: unknown; 'data-heading-slug'?: string };
+
+/** streamdown 默认标题的样式（h1–h3 另由 Markdown 的 className 覆盖） */
+const HEADING_CLASS = ['text-3xl', 'text-2xl', 'text-xl', 'text-lg', 'text-base', 'text-sm'] as const;
+
+/**
+ * 文件预览里的标题：slug 由 rehype 插件写进 `data-heading-slug`（每次转换重新编号），
+ * id 在这里加上本预览实例的前缀——同屏多个预览（抽屉 + 工作区）不会撞 id。
+ * tabIndex=-1：目录 / 锚点跳转后把焦点移到这里，键盘与读屏从目标节继续。
+ */
+function DocHeading({ level, node: _node, id: _id, className, children, ...props }: HeadingProps & { level: 1 | 2 | 3 | 4 | 5 | 6 }): React.JSX.Element {
+  const anchors = useContext(FileDocAnchorContext);
+  const slug = props['data-heading-slug'];
+  const Tag = `h${level}` as const;
+  return (
+    <Tag
+      {...props}
+      {...(anchors !== null && slug !== undefined ? { id: `${anchors.ns}-${slug}`, tabIndex: -1 } : {})}
+      data-streamdown={`heading-${level}`}
+      className={cn('mt-6 mb-2 scroll-mt-2 font-semibold focus:outline-none', HEADING_CLASS[level - 1], className)}
+    >
+      {children}
+    </Tag>
+  );
+}
+const DocH1 = (p: HeadingProps): React.JSX.Element => <DocHeading level={1} {...p} />;
+const DocH2 = (p: HeadingProps): React.JSX.Element => <DocHeading level={2} {...p} />;
+const DocH3 = (p: HeadingProps): React.JSX.Element => <DocHeading level={3} {...p} />;
+const DocH4 = (p: HeadingProps): React.JSX.Element => <DocHeading level={4} {...p} />;
+const DocH5 = (p: HeadingProps): React.JSX.Element => <DocHeading level={5} {...p} />;
+const DocH6 = (p: HeadingProps): React.JSX.Element => <DocHeading level={6} {...p} />;
+
 const fileComponents = { source: (): null => null, inlineCode: FileAwareInlineCode, a: FileAwareLink };
-const fileDocComponents = { ...fileComponents, img: FileDocImage };
+const fileDocComponents = { ...fileComponents, img: FileDocImage, h1: DocH1, h2: DocH2, h3: DocH3, h4: DocH4, h5: DocH5, h6: DocH6 };
 
 interface HastNode {
   type: string;
   tagName?: string;
+  value?: string;
   properties?: Record<string, unknown>;
   children?: HastNode[];
+  position?: { start?: { line?: number } };
+}
+
+function hastText(node: HastNode): string {
+  if (node.type === 'text') return node.value ?? '';
+  return (node.children ?? []).map(hastText).join('');
+}
+
+/**
+ * 标题 slug（方案 §6）：放在 sanitize 之后、harden 之前，写 `data-heading-slug`。
+ * raw HTML 标题上作者写的 id（`<h2 id="custom">`）挪到 `data-anchor-id` 作为锚点别名，
+ * DOM 上的 id 由 DocHeading 统一换成「实例前缀 + slug」。注意：锁定的 streamdown 2.6 把 sanitize 的
+ * `clobberPrefix` 设成了空串，raw HTML 的 id 原样保留、**不会**带 `user-content-`（脚注的
+ * `user-content-fn-*` 是 remark-rehype 自己加的）；非标题元素的 id 保持原样，定位时按原值匹配。
+ * slugger 在**每次转换**里新建——streamdown 缓存的是处理器，插件闭包里不能留跨转换的计数，
+ * 也不往外回调（标题列表由预览在提交后从 DOM 读）。
+ */
+function addHeadingSlugs(tree: HastNode, slugger: (text: string) => string): void {
+  const props = tree.properties;
+  if (tree.type === 'element' && props !== undefined && /^h[1-6]$/.test(tree.tagName ?? '')) {
+    props['dataHeadingSlug'] = slugger(hastText(tree));
+    if (typeof props['id'] === 'string' && props['id'] !== '') props['dataAnchorId'] = props['id'];
+    delete props['id'];
+    return;
+  }
+  for (const child of tree.children ?? []) addHeadingSlugs(child, slugger);
+}
+
+// 名字与其他插件都不同（streamdown 按插件函数名缓存处理器）
+function rehypeFileDocHeadingSlugs() {
+  return (tree: HastNode): void => {
+    addHeadingSlugs(tree, createSlugger());
+    addSourceLines(tree);
+  };
+}
+
+/** 记源码行号的块级元素（滚动锚点：渲染 ↔ 源码切换、宽度变化后按块找回位置） */
+const SOURCE_LINE_BLOCKS = new Set(['p', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'li', 'pre', 'blockquote', 'table', 'tr', 'hr', 'dt', 'dd', 'div', 'details', 'img']);
+
+/**
+ * 块级元素写上 `data-src-line`（mdast 的 position，1 起）。文件预览是静态模式，整份文档一次转换，
+ * 行号就是文件里的行号。没有 position 的（插件生成的节点）跳过。
+ */
+function addSourceLines(tree: HastNode): void {
+  const line = tree.position?.start?.line;
+  if (tree.type === 'element' && tree.properties !== undefined && typeof line === 'number' && SOURCE_LINE_BLOCKS.has(tree.tagName ?? '')) {
+    tree.properties['dataSrcLine'] = line;
+  }
+  for (const child of tree.children ?? []) addSourceLines(child);
 }
 
 /**
  * 在 harden 之前把本地链接（以及文件预览里的本地图片）的**原始**地址存进 `data-file-href`，
  * 地址本身换成占位 `/`：harden 会把 `../x.md` 归一成 `/x.md`、把 `docs/a.md` 这种裸相对路径
  * 直接拦成 [blocked]，组件拿不到原文就没法按文件目录解析。放在 sanitize 之后，自定义属性不会被剥。
+ * 文件预览（`doc`）里同文件锚点 `#x` 也要保护（harden 同样会拦），聊天里照旧。
  */
-function stashLocalUrls(tree: HastNode, images: boolean): void {
+function stashLocalUrls(tree: HastNode, doc: boolean): void {
   const props = tree.properties;
   if (tree.type === 'element' && props !== undefined) {
-    if (tree.tagName === 'a' && typeof props['href'] === 'string' && isLocalHref(props['href'])) {
-      props['dataFileHref'] = props['href'];
+    const href = props['href'];
+    if (tree.tagName === 'a' && typeof href === 'string' && (isLocalHref(href) || (doc && href.length > 1 && href.startsWith('#')))) {
+      props['dataFileHref'] = href;
       props['href'] = '/'; // harden 认得的同源路径（`#`、裸相对路径会被它拦掉）；组件不用它
-    } else if (images && tree.tagName === 'img' && typeof props['src'] === 'string' && isLocalHref(props['src'])) {
+    } else if (doc && tree.tagName === 'img' && typeof props['src'] === 'string' && isLocalHref(props['src'])) {
       props['dataFileHref'] = props['src'];
       props['src'] = '/';
     }
   }
-  for (const child of tree.children ?? []) stashLocalUrls(child, images);
+  for (const child of tree.children ?? []) stashLocalUrls(child, doc);
 }
 
 // 两个插件必须是**不同名**的具名函数：streamdown 按插件函数名缓存 unified 处理器，
@@ -206,7 +360,8 @@ function rehypeStashFileLinksAndImages() {
 type Pluggable = NonNullable<StreamdownProps['rehypePlugins']>[number];
 const { raw, sanitize, harden } = defaultRehypePlugins as Record<'raw' | 'sanitize' | 'harden', Pluggable>;
 const fileRehypePlugins: Pluggable[] = [raw, sanitize, rehypeStashFileLinks, harden];
-const fileDocRehypePlugins: Pluggable[] = [raw, sanitize, rehypeStashFileLinksAndImages, harden];
+// 文件预览：raw → sanitize → 文件链接保护 / 标题 slug → harden（不放宽 sanitize）
+const fileDocRehypePlugins: Pluggable[] = [raw, sanitize, rehypeStashFileLinksAndImages, rehypeFileDocHeadingSlugs, harden];
 
 /**
  * 扩展给的详情文本（`restricted`）更严：图片一律不渲染（同源相对图片也会把文本带进请求 URL、
@@ -245,6 +400,7 @@ export const Markdown = memo(function Markdown({
   restricted = false,
   fileBase,
   fullHeightCode = false,
+  diagrams: diagramsProp = true,
 }: {
   text: string;
   /** 还在流式接收：开 streaming 模式（增量解析 + 未闭合语法修补） */
@@ -256,15 +412,22 @@ export const Markdown = memo(function Markdown({
   fileBase?: string;
   /** 代码块不限高（文件预览整页看源码）；默认 400px 内滚动 */
   fullHeightCode?: boolean;
+  /** ```mermaid 渲染成图（流式中与 restricted 时总是不渲染）；看源码的场景传 false */
+  diagrams?: boolean;
 }): React.JSX.Element {
   const links = useFileLinks();
   const mode = restricted || links === null ? 'plain' : fileBase === undefined ? 'chat' : 'doc';
+  // 只有文件预览识别开头的 front matter（聊天消息不动）：剥出来单独显示，正文里换成等量空行
+  const frontMatter = useMemo(() => (fileBase !== undefined && !restricted ? splitFrontMatter(text) : undefined), [fileBase, restricted, text]);
   const chosen = restricted ? restrictedComponents : mode === 'chat' ? fileComponents : mode === 'doc' ? fileDocComponents : components;
+  const theme = useResolvedTheme();
+  const diagrams = diagramsProp && !restricted && !streaming;
   const body = (
     <Streamdown
       mode={streaming ? 'streaming' : 'static'}
       parseIncompleteMarkdown={streaming}
-      plugins={plugins}
+      plugins={diagrams ? pluginsWithDiagrams : plugins}
+      {...(diagrams ? { mermaid: mermaidOptions[theme] } : {})}
       // 零远端资源：外域图片一律不请求（streamdown 默认放行 '*'，见文件头 M4）
       urlTransform={restricted ? restrictedUrlTransform : safeUrlTransform}
       // `<source srcset>` 绕过 urlTransform（见文件头 N1）：整个不渲染
@@ -273,14 +436,22 @@ export const Markdown = memo(function Markdown({
       shikiTheme={['github-light', 'github-dark']}
       {...(fullHeightCode ? { codeBlockMaxHeight: 0 } : {})}
       // 代码块只留复制（下载会触发浏览器下载，远程场景意义不大）
-      controls={{ code: { copy: true, download: false }, table: { copy: true, download: false } }}
+      // 图表：全屏 + 缩放平移；不给下载 / 复制（源码在文件里，PNG 导出要走 canvas）
+      controls={{
+        code: { copy: true, download: false },
+        table: { copy: true, download: false },
+        mermaid: { copy: false, download: false, fullscreen: true, panZoom: true },
+      }}
       lineNumbers={false}
       // 动画交给流式本身：逐词淡入在长回复里会拖慢观感
       animated={false}
       className={cn(
         'max-w-full text-[14px] leading-[1.55] break-words',
         '[&_p]:my-0 [&_p+p]:mt-2',
-        '[&_pre]:bg-code-bg [&_pre]:border-border [&_pre]:rounded-lg [&_pre]:border',
+        // 代码块：streamdown 外框（语言 + 复制）里套一个带边框的 body，pre 本身不再加框（否则三层框）
+        '[&_[data-streamdown=code-block]]:bg-surface-2 [&_[data-streamdown=code-block]]:my-2 [&_[data-streamdown=code-block]]:rounded-lg',
+        '[&_[data-streamdown=code-block-actions]]:border-transparent [&_[data-streamdown=code-block-actions]]:bg-transparent',
+        '[&_[data-streamdown=code-block-body]]:bg-code-bg [&_[data-streamdown=code-block-body]]:p-3 [&_pre]:bg-transparent',
         '[&_code]:font-mono [&_code]:text-[12.5px]',
         '[&_:not(pre)>code]:bg-code-bg [&_:not(pre)>code]:rounded [&_:not(pre)>code]:px-1 [&_:not(pre)>code]:py-0.5',
         '[&_ul]:my-2 [&_ul]:list-disc [&_ul]:pl-5 [&_ol]:my-2 [&_ol]:list-decimal [&_ol]:pl-5',
@@ -295,8 +466,48 @@ export const Markdown = memo(function Markdown({
         className,
       )}
     >
-      {text}
+      {frontMatter?.body ?? text}
     </Streamdown>
   );
-  return fileBase === undefined ? body : <FileBaseContext.Provider value={fileBase}>{body}</FileBaseContext.Provider>;
+  if (fileBase === undefined) return body;
+  return (
+    <FileBaseContext.Provider value={fileBase}>
+      {frontMatter !== undefined && <FrontMatterBlock frontMatter={frontMatter} />}
+      {body}
+    </FileBaseContext.Provider>
+  );
 });
+
+/**
+ * 文件开头的元数据：简单 `key: value` 显示成紧凑的小表格，认不出来就原样显示。不是标题，
+ * 不进目录、不影响 slug；带 `data-src-line="1"` 让滚动锚点在文档顶部也有块可认。
+ * 值一律当纯文本（React 转义），不解析、不执行。
+ */
+function FrontMatterBlock({ frontMatter }: { frontMatter: FrontMatter }): React.JSX.Element {
+  const { entries, raw } = frontMatter;
+  return (
+    <div data-testid="file-front-matter" data-src-line="1" className="border-border bg-surface-2 mb-3 rounded-lg border px-3 py-2 text-[12px]">
+      <div className="text-text-3 mb-1 text-[11px] font-medium">元数据</div>
+      {entries === null ? (
+        <pre data-testid="file-front-matter-raw" className="text-text-2 font-mono text-[12px] break-words whitespace-pre-wrap">
+          {raw}
+        </pre>
+      ) : entries.length === 0 ? (
+        <div className="text-text-3">（空）</div>
+      ) : (
+        <table className="w-full border-collapse">
+          <tbody>
+            {entries.map((e, i) => (
+              <tr key={i} data-testid="file-front-matter-row">
+                <th scope="row" className="text-text-3 py-0.5 pr-3 text-left align-top font-mono font-normal whitespace-nowrap">
+                  {e.key}
+                </th>
+                <td className="text-text-2 py-0.5 break-all">{e.value}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      )}
+    </div>
+  );
+}

@@ -7,7 +7,7 @@
  * - **Raw**（扩展进程 stdout → agent）：动作里直接写 effects。只在 agent 内部校验与使用，
  *   不过 E2E。
  * - **Wire**（agent → client）：agent 把每个动作改写成 client 能执行的样子——只含本地效果
- *   （插入、复制、刷新）的动作把效果原样带上，由点击的设备自己执行；含有需要 agent 执行的
+ *   （插入、复制、刷新、打开文件）的动作把效果原样带上，由点击的设备自己执行；含有需要 agent 执行的
  *   效果（发送、新建会话、改关联、回调扩展）的动作只带一个一次性 `token`。client 无法改写
  *   token 背后的效果，agent 也不会因为读取 / 刷新 / 推送而执行任何效果（EXTENSIONS.md §安全）。
  *
@@ -45,6 +45,8 @@ export const EXT_LIMITS = {
   linksPerSession: 32,
   /** 一次 links.add / remove 带的条数 */
   linksPerUpdate: 32,
+  /** files.open 的路径 */
+  path: 4096,
 } as const;
 
 const text = (max: number = EXT_LIMITS.text) => z.string().max(max);
@@ -108,13 +110,27 @@ export const ExtLinkRefSchema = z.object({
 });
 export type ExtLinkRef = z.infer<typeof ExtLinkRefSchema>;
 
-/** 由点击的设备自己执行的效果 */
+/** files.open 的路径：限长、不含 NUL（访问控制仍由 agent 的文件查看负责，这里不判断范围） */
+const ExtPathSchema = z
+  .string()
+  .min(1)
+  .max(EXT_LIMITS.path)
+  .refine((p) => !p.includes('\0'), { message: '路径不能含 NUL' });
+
+/**
+ * 由点击的设备自己执行的效果。
+ *
+ * `files.open` 需要特性协商（见 EXT_FEATURES）：只有声明了 `files.open` 的 web、在会话面板里
+ * 才会收到带它的动作；旧 web 不认识它，agent 在输出边界整条过滤掉。
+ */
 export const ExtLocalEffectSchema = z.discriminatedUnion('type', [
   z.object({ type: z.literal('prompt.insert'), text: text(EXT_LIMITS.prompt).min(1) }),
   z.object({ type: z.literal('copy'), text: text(EXT_LIMITS.prompt).min(1) }),
   z.object({ type: z.literal('refresh') }),
+  z.object({ type: z.literal('files.open'), path: ExtPathSchema, dir: z.boolean().optional() }),
 ]);
 export type ExtLocalEffect = z.infer<typeof ExtLocalEffectSchema>;
+export type ExtFilesOpenEffect = Extract<ExtLocalEffect, { type: 'files.open' }>;
 
 /** 由 agent 执行的效果 */
 export const ExtRemoteEffectSchema = z.discriminatedUnion('type', [
@@ -134,10 +150,62 @@ export type ExtRemoteEffect = z.infer<typeof ExtRemoteEffectSchema>;
 export const ExtEffectSchema = z.union([ExtLocalEffectSchema, ExtRemoteEffectSchema]);
 export type ExtEffect = z.infer<typeof ExtEffectSchema>;
 
-export const LOCAL_EFFECT_TYPES: ReadonlySet<string> = new Set(['prompt.insert', 'copy', 'refresh']);
+export const LOCAL_EFFECT_TYPES: ReadonlySet<string> = new Set(['prompt.insert', 'copy', 'refresh', 'files.open']);
 
 export function isLocalEffect(effect: ExtEffect): effect is ExtLocalEffect {
   return LOCAL_EFFECT_TYPES.has(effect.type);
+}
+
+// ---------------------------------------------------------------------------
+// 特性协商（EXTENSIONS.md §特性协商）
+//
+// 有些效果只有新 web 会执行。web 在 ext.read / ext.action.prepare 里声明 `features`，agent 取
+// 「web 声明 ∩ agent 支持 ∩ 贡献点能执行」作为有效特性集，随读取、订阅、token、invoke 上下文
+// 保存，并作为 `context.features` 传给扩展；输出里用到有效集之外特性的动作整条过滤掉。
+// 缺省为空：旧 web（不声明）永远收不到这些效果；旧扩展不看 features 也没关系。
+// ---------------------------------------------------------------------------
+
+/** 已定义的特性 */
+export const EXT_FEATURES = ['files.open'] as const;
+export type ExtFeature = (typeof EXT_FEATURES)[number];
+
+/** 请求里的特性声明：宽松字符串（更新的 web 可能声明本 agent 不认识的，忽略即可） */
+export const ExtFeatureListSchema = z.array(z.string().min(1).max(64)).max(16);
+
+/** 效果需要的特性；undefined = 不需要协商 */
+export function effectFeature(type: string): ExtFeature | undefined {
+  return type === 'files.open' ? 'files.open' : undefined;
+}
+
+/**
+ * 贡献点能执行的特性。files.open 只在会话面板：工作区面板没有会话（文件查看按会话鉴权），
+ * composerAction / newSession 是编辑语境，linkPicker / sessionBadge 没有动作。
+ */
+export function pointFeatures(point: ExtPoint): readonly ExtFeature[] {
+  return point === 'sessionPanel' ? ['files.open'] : [];
+}
+
+/** 有效特性集 = 请求声明 ∩ 支持 ∩ 贡献点；去重、按 EXT_FEATURES 的顺序 */
+export function negotiateExtFeatures(requested: readonly string[] | undefined, supported: readonly string[], point: ExtPoint): ExtFeature[] {
+  if (requested === undefined || requested.length === 0) return [];
+  const want = new Set(requested);
+  const have = new Set(supported);
+  const at = new Set<string>(pointFeatures(point));
+  return EXT_FEATURES.filter((f) => want.has(f) && have.has(f) && at.has(f));
+}
+
+/** 动作（effects 或 invoke.requires）事先看得出的特性是否都在有效集里 */
+export function actionAllowedBy(action: { effects?: readonly { type: string }[] | undefined; invoke?: { requires?: readonly string[] | undefined } | undefined }, features: readonly string[]): boolean {
+  if (action.effects !== undefined && !effectsAllowedBy(action.effects, features)) return false;
+  return (action.invoke?.requires ?? []).every((f) => features.includes(f));
+}
+
+/** 效果是否都在有效特性集里 */
+export function effectsAllowedBy(effects: readonly { type: string }[], features: readonly string[]): boolean {
+  return effects.every((e) => {
+    const need = effectFeature(e.type);
+    return need === undefined || features.includes(need);
+  });
 }
 
 const ActionCommon = {
@@ -154,7 +222,16 @@ export const ExtRawActionSchema = z
   .object({
     ...ActionCommon,
     effects: z.array(ExtEffectSchema).min(1).max(EXT_LIMITS.effectsPerAction).optional(),
-    invoke: z.object({ params: z.record(z.string(), z.unknown()).optional() }).optional(),
+    invoke: z
+      .object({
+        params: z.record(z.string(), z.unknown()).optional(),
+        /**
+         * 这次回调返回的效果会用到的特性（如 `files.open`）。有效特性集里缺任何一项，动作在视图里
+         * 就不给、prepare 也拒绝——在启动扩展进程之前，不会先执行副作用。
+         */
+        requires: z.array(z.string().min(1).max(64)).max(16).optional(),
+      })
+      .optional(),
   })
   .refine((a) => (a.effects === undefined) !== (a.invoke === undefined), { message: 'effects 与 invoke 必须二选一' });
 export type ExtRawAction = z.infer<typeof ExtRawActionSchema>;
@@ -301,6 +378,16 @@ export const MachineExtensionsSummarySchema = z.object({
   count: z.number().int().nonnegative(),
   /** 支持时间线记录卡（ext.records.request，agent ≥ 0.17.0） */
   records: z.boolean().optional(),
+  /**
+   * agent 支持的宿主特性（见 EXT_FEATURES）。web 只声明这里列出的：旧 agent 没有这个字段，
+   * web 就什么都不声明，请求、应答和本地缓存的特性集两边一致（都是空）。
+   */
+  features: z.array(z.string().min(1).max(64)).max(16).optional(),
+  /**
+   * 确认执行计划时可改新会话的引擎配置与首条消息（ext.action.commit.edits，agent ≥ 0.31.0）。
+   * 旧 agent 会静默丢掉 edits、按原计划执行，所以 web 只在有这个能力位时开放编辑。
+   */
+  planEdit: z.boolean().optional(),
 });
 export type MachineExtensionsSummary = z.infer<typeof MachineExtensionsSummarySchema>;
 
@@ -349,6 +436,12 @@ export const ExtPlanStepSchema = z.discriminatedUnion('type', [
     model: z.string(),
     permissionMode: z.string(),
     links: z.array(ExtLinkRefSchema),
+    /** 引擎（省略 = Claude Code）；用户在确认时改了才会是别的（ext.action.commit.edits） */
+    engine: z.string().optional(),
+    /** 非 Claude 引擎的权限模式（见 SessionMeta.engineMode） */
+    engineMode: z.string().optional(),
+    /** 推理强度；省略 = 跟随引擎配置 */
+    effort: z.string().optional(),
   }),
   z.object({
     type: z.literal('prompt.send'),

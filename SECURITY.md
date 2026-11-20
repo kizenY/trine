@@ -47,16 +47,38 @@ is not a substitute for those controls, backups or TLS.
 - With Codex enabled, the agent asks `api.github.com` for the latest Codex release shortly after start
   and every 6 hours, and any paired device can run `codex update` on the machine, the same exposure
   as `claude update`. The request carries no session data.
+- From agent 0.31.0, any paired device can turn on automatic engine updates (stored in
+  `<home>/engine-auto-update.json`). While on, the agent runs the same update commands as the
+  update button by itself whenever a version check finds a newer release, so a compromised or
+  misconfigured release source (or apt / Homebrew repository) reaches the machine without a click.
+  It is off by default.
+- From agent 0.28.0, any paired device can restart Codex on the machine: the agent's own
+  `codex app-server` and, when it is running, the machine's Codex daemon
+  (`codex app-server daemon restart`). The agent refuses while a trine Codex session is busy, but it
+  cannot see work in Codex clients outside trine, which the daemon restart may interrupt. It never
+  starts a daemon that is not running.
 - The agent keeps plaintext copies of received attachments under `<home>/uploads`
   (deleted with the session) and lets Claude read that session's folder without an
   approval prompt. Any paired controller can place files there.
 - File viewing (agent 0.20.0+) lets any paired device read files in a session's
-  working directory, plus directories listed in the agent's `TRINE_FILES_ALLOW`.
+  working directory, plus the machine's trusted directories: those listed in the agent's
+  `TRINE_FILES_ALLOW`, and (agent 0.24.0+) those in `<home>/files.json`, which any paired
+  device can add or remove. This does not give a paired device more than it already has (it can
+  start a session in any directory), but a trusted directory stays readable for every session
+  and device until removed. `/` cannot be trusted. File bookmarks (agent 0.30.0+) are kept in
+  `<home>/bookmarks.json` and sent to paired devices inside the encrypted `machine.info`; they
+  are only shortcuts and never widen the browsable scope.
   File contents travel like attachments (encrypted relay blobs). The agent always
   refuses key material (`.env*` except templates, private keys and certificates,
-  `.ssh`, `.gnupg`, `.aws`, `.git` internals, `.netrc`/`.npmrc`, the agent's own home)
+  `.ssh`, `.gnupg`, `.aws`, `.git` internals, `.netrc`/`.npmrc`, the agent's own home, and
+  from 0.24.0 `/proc`, `/sys` and `/dev`, where process environments can hold tokens)
   and checks symlink targets, but anything else in scope is readable. Set
   `TRINE_FILES=off` on the agent to disable it.
+- From agent 0.27.0, any paired device can have the agent create a missing working directory
+  for a new session (`mkdir -p` as the agent's user, after a confirmation in the browser). As
+  with trusting a directory, this adds nothing a paired device could not already do through a
+  session. The agent still refuses to create directories under key-material paths, its own
+  home or `/proc`, `/sys` and `/dev`, checks symlinked ancestors and never uses `sudo`.
 - A compromised frontend host can replace JavaScript and steal browser keys or plaintext.
   Same-origin hosting trusts the relay host to serve the correct frontend.
 - A compromised paired device or agent can read content and send authorized operations.

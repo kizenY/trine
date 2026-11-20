@@ -6,15 +6,19 @@ import { describe, expect, test } from 'bun:test';
 import {
   backgroundSubagentEnd,
   formatDuration,
+  isAsyncLaunch,
   outputPreview,
   subagentReportText,
   subagentRunStats,
+  subagentStartInfo,
   summarizeToolArgs,
   summarizeToolResult,
   toSingleLine,
+  toolArgDetail,
   toolFilePath,
   withFilePath,
 } from './summarize.ts';
+import { TOOL_ARG_DETAIL_MAX } from '@trine/core';
 
 describe('summarizeToolArgs', () => {
   test('Bash 取命令', () => {
@@ -220,10 +224,44 @@ describe('后台子 agent（评审 M1）', () => {
       durationMs: 18_288,
       resultSummary: '✓ 3 次工具调用 · 18.3s',
       outputPreview: '报告',
+      subagent: { background: true, state: 'completed' },
     });
-    expect(backgroundSubagentEnd('failed', { tool_uses: 1 }, '')).toEqual({ status: 'error', durationMs: 0, resultSummary: '✗ 子 agent 失败 · 1 次工具调用' });
-    expect(backgroundSubagentEnd('stopped', undefined, undefined)).toEqual({ status: 'warn', durationMs: 0, resultSummary: '⏹ 子 agent 已停止' });
+    expect(backgroundSubagentEnd('failed', { tool_uses: 1 }, '')).toEqual({
+      status: 'error',
+      durationMs: 0,
+      resultSummary: '✗ 子 agent 失败 · 1 次工具调用',
+      subagent: { background: true, state: 'failed' },
+    });
+    expect(backgroundSubagentEnd('stopped', undefined, undefined)).toEqual({
+      status: 'warn',
+      durationMs: 0,
+      resultSummary: '⏹ 子 agent 已停止',
+      subagent: { background: true, state: 'stopped' },
+    });
+    expect(backgroundSubagentEnd('killed', undefined, undefined).subagent.state).toBe('stopped');
     expect(backgroundSubagentEnd('completed', undefined, undefined).resultSummary).toBe('✓ 子 agent 已完成');
+  });
+
+  test('subagentStartInfo：subagent_type 与显式后台；非子 agent 工具 / 都没有时 undefined', () => {
+    expect(subagentStartInfo('Agent', { subagent_type: 'Explore', run_in_background: true, description: 'd' })).toEqual({
+      agentType: 'Explore',
+      background: true,
+    });
+    expect(subagentStartInfo('Task', { subagent_type: ' general-purpose ' })).toEqual({ agentType: 'general-purpose' });
+    expect(subagentStartInfo('Agent', { description: 'd' })).toBeUndefined();
+    expect(subagentStartInfo('Bash', { subagent_type: 'x' })).toBeUndefined();
+    expect(subagentStartInfo('Agent', { subagent_type: 'x'.repeat(300) })?.agentType?.length).toBe(128);
+  });
+
+  test('isAsyncLaunch：结构化 isAsync / async_launched 或回执文本', () => {
+    expect(isAsyncLaunch({ status: 'async_launched' }, '')).toBe(true);
+    expect(isAsyncLaunch({ isAsync: true }, '')).toBe(true);
+    expect(isAsyncLaunch(undefined, 'Async agent launched successfully. (internal)')).toBe(true);
+    expect(isAsyncLaunch({ status: 'completed' }, 'report')).toBe(false);
+  });
+
+  test('Agent 的 argDetail 是 prompt（摘要是 description）', () => {
+    expect(toolArgDetail('Agent', { description: 'probe', prompt: 'line1\nline2' }, 'probe')).toBe('line1\nline2');
   });
 
   test('subagentReportText：后台启动回执（内部元数据）剥成空串', () => {
@@ -242,5 +280,34 @@ describe('toolFilePath', () => {
     expect(toolFilePath('Read', {})).toBeUndefined();
     expect(withFilePath('Grep', { pattern: 'x' })).toEqual({});
     expect(withFilePath('Write', { file_path: '/w/b.md' })).toEqual({ filePath: '/w/b.md' });
+  });
+});
+
+describe('toolArgDetail', () => {
+  const detail = (name: string, input: unknown): string | undefined => toolArgDetail(name, input, summarizeToolArgs(name, input));
+
+  test('短的单行命令摘要已经完整，不带', () => {
+    expect(detail('Bash', { command: 'ls -la' })).toBeUndefined();
+    expect(detail('Bash', { command: 'ls -la', run_in_background: true })).toBeUndefined();
+    expect(detail('Read', { file_path: '/tmp/a' })).toBeUndefined();
+  });
+
+  test('长命令 / 多行命令给原文（保留换行，去掉尾部空白）', () => {
+    const long = `echo ${'x'.repeat(300)}`;
+    expect(detail('Bash', { command: long })).toBe(long);
+    expect(detail('Bash', { command: 'cd /tmp\nmake test\n\n' })).toBe('cd /tmp\nmake test');
+    expect(detail('Bash', { command: long, run_in_background: true })).toBe(long);
+  });
+
+  test('超长原文截断并写明原长', () => {
+    const huge = 'y'.repeat(TOOL_ARG_DETAIL_MAX + 10);
+    const out = detail('Bash', { command: huge });
+    expect(out?.startsWith('y'.repeat(TOOL_ARG_DETAIL_MAX))).toBe(true);
+    expect(out).toContain(`原文共 ${huge.length} 字符`);
+  });
+
+  test('没有原文字段的工具不带', () => {
+    expect(detail('mcp__x__y', { q: 'z'.repeat(400) })).toBeUndefined();
+    expect(detail('Bash', {})).toBeUndefined();
   });
 });

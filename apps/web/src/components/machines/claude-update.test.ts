@@ -9,7 +9,7 @@ import {
   shortClaudeVersion,
   summarizeClaudeUpdate,
   summarizeClaudeUpdateError,
-  supportsClaudeUpdate, engineLatestView, CODEX_RUNNING_NOTE,
+  supportsClaudeUpdate, engineLatestView, engineUpdateHints, CODEX_RUNNING_NOTE,
 } from './claude-update.ts';
 
 function res(over: Partial<ClaudeUpdateResult> = {}): ClaudeUpdateResult {
@@ -157,6 +157,33 @@ describe('其他引擎', () => {
       updateAvailable: true,
     });
     expect(engineLatestView({ capabilities: { update: true }, version: '0.167.0' })?.updateAvailable).toBeNull();
+  });
+  test('engineUpdateHints：Claude 看 claudeLatest，其他引擎看 engines[].latest', () => {
+    const codex = (version: string, latest: string) => ({
+      id: 'codex',
+      displayName: 'Codex',
+      available: true,
+      capabilities: { update: true },
+      version,
+      latest: { version: latest },
+    });
+    // engines 里的 Claude 条目不重复计算
+    const claudeEntry = { id: 'claude', displayName: 'Claude Code', available: true, capabilities: { update: true }, version: '1.0.0', latest: { version: '9.0.0' } };
+    expect(
+      engineUpdateHints({
+        claudeVersion: '2.1.282 (Claude Code)',
+        claudeLatest: { channel: 'latest', version: '2.1.308' },
+        engines: [claudeEntry, codex('0.166.0', '0.167.0')],
+      }),
+    ).toEqual(['claude 可更新 → 2.1.308', 'codex 可更新 → 0.167.0']);
+    expect(
+      engineUpdateHints({
+        claudeVersion: '2.1.308 (Claude Code)',
+        claudeLatest: { channel: 'latest', version: '2.1.308' },
+        engines: [codex('0.167.0', '0.167.0')],
+      }),
+    ).toEqual([]);
+    expect(engineUpdateHints(null)).toEqual([]);
   });
   test('结论里用引擎自己的名字和说明', () => {
     const summary = summarizeClaudeUpdate({ ok: true, fromVersion: '1', toVersion: '2', output: '' }, 'Codex', CODEX_RUNNING_NOTE);

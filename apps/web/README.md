@@ -20,6 +20,8 @@ The dev/preview proxy forwards `/auth`, `/ws`, `/healthz`, `/devices` and `/blob
 5173; use the same origin in the browser and the agent's `--server` argument.
 Production output is `dist/`; configure `TRINE_WEB_DIST` on the relay to serve it.
 
+Design and interaction conventions: [product design system](../../docs/DESIGN.md).
+
 ## Structure
 
 - `app/`: routing, runtime, lifecycle and theme.
@@ -30,8 +32,10 @@ Production output is `dist/`; configure `TRINE_WEB_DIST` on the relay to serve i
 
 Fonts, Markdown rendering dependencies and syntax highlighting are bundled locally.
 Keep external scripts and remote content requests out of the application runtime.
-libsodium and the syntax language bundles are split/lazy loaded; the larger build
-chunks are expected. Recheck the browser's network requests after dependency changes.
+libsodium, the syntax language bundles and mermaid are split/lazy loaded; the larger build
+chunks are expected. Mermaid SVG bypasses the Markdown sanitizer, so
+`components/chat/mermaid-plugin.ts` checks the source before rendering and strips external
+URLs from the output. Recheck the browser's network requests after dependency changes.
 
 Keys and cached messages are sensitive browser data. See [SECURITY.md](../../SECURITY.md)
 for the frontend-host trust boundary and lost-device recovery limits.

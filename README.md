@@ -12,7 +12,11 @@ the agent runs on your own computer.
 
 ## What it does
 
-- Streams assistant messages, tool activity and subagent history.
+- Streams assistant messages, tool activity and subagent history. Subagent cards name the agent
+  type and say whether it runs in the foreground or background ("Agent · Explore · 后台"); a
+  background subagent shows "后台运行中" with its own timer until it finishes, and after a reload the
+  card shows the final result, or "状态未知" / "已结束 · 结果未知" when the history can't tell.
+  Expanding a card shows the prompt. Requires agent 0.26.0 or later.
 - Shows message times like a chat app: day separators, a time marker after gaps of 10+ minutes,
   the time under each of your messages, and start times for replies and tools on hover or expand.
 - Rewinds a session to before one of your messages, restoring code, the conversation or both.
@@ -20,6 +24,10 @@ the agent runs on your own computer.
   with their reset times (subscription accounts only). Limits refresh while sessions run, or on demand.
 - Shows the output of local slash commands such as `/usage` and `/cost` as a card that keeps the
   terminal layout; `/usage` gets progress bars for each limit.
+- The "/" menu matches command names loosely: prefixes first, then word starts, substrings and
+  initials, so `/dep` finds `/local-deploy`. Session settings (model, permission mode, working
+  directory) open from the header line or from "会话设置…" in the session menu, which stays
+  reachable on narrow phone screens.
 - Attaches images and files to messages: pick them, paste them or drop them onto the page.
   Attachments are encrypted in the browser and relayed as ciphertext; small images go to
   Claude inline, other files are saved on the agent's machine and handed over by path.
@@ -27,18 +35,49 @@ the agent runs on your own computer.
   clickable paths in messages, and "浏览文件" in the session menu to browse the session's
   working directory. Markdown is rendered (relative links open the linked file), text and code
   are highlighted, PDFs open in the browser's viewer, images are shown, anything else can be
-  downloaded. Read-only; limited to the session directory plus `TRINE_FILES_ALLOW`, and key
-  material such as `.env` and private keys is always refused. Requires agent 0.20.0 or later.
+  downloaded. Read-only; limited to the session directory plus the machine's trusted
+  directories, and key material such as `.env` and private keys is always refused. The browser
+  can go up past the session directory: a directory outside the scope shows what trusting it
+  means and offers to trust it, and a "位置" menu jumps to the session directory, a bookmark or any
+  trusted directory. The bookmark button in a directory's or file's header adds it to the
+  bookmarks (per machine, shared by that machine's sessions; it does not widen what can be
+  browsed). With agent 0.30.0 or later bookmarks are kept on the agent and appear on every paired
+  device; bookmarks saved on a device before the upgrade are moved there the next time the file
+  panel opens. Older agents keep them on this device only. Requires agent 0.20.0 or later
+  (trusted directories: 0.24.0).
+  Markdown previews get a table of contents (a side rail when there is room, a floating button
+  otherwise) that follows your reading position, `#heading` links jump within the document or to
+  another file, and front matter shows as a small metadata block. ```` ```mermaid ```` blocks render
+  as diagrams with fullscreen and zoom, both in previews and in finished chat replies (still
+  streaming: shown as code). Diagrams that reference external images or `url()` styles show their
+  source instead, so a diagram never makes the browser contact another site. The reading position is kept
+  when switching between source and rendered view or resizing the window. On desktop, files can
+  also open in a workspace next to the chat: "在工作区打开" in the file drawer, "在侧边打开" on tool
+  cards, or Alt-click a path. The workspace works like an editor area — tabs in groups, drag a tab
+  to an edge to split, drag the dividers to resize; a single click opens a preview tab that the next
+  file replaces until you keep it. It can be collapsed (tabs are kept behind "文件（N）") or
+  maximized, and its layout is remembered per machine and working directory. Narrow windows fold it
+  away automatically; phones keep the drawer.
 - Keeps reusable prompt snippets on the device: edit and copy them in Settings, and insert one at
   the cursor (or copy it) from the prompt button next to the paperclip. On phones, attachments and
   snippets live behind a `+` button so the input keeps its width.
 - Lists, resumes, renames and archives sessions across paired machines; right-click or
   multi-select (Ctrl/Cmd/Shift-click) to archive in bulk, and copy a session's working directory.
+- Starts a new session in a directory that does not exist yet: the new-session sheet marks the
+  path as new, and "开始会话" first asks you to confirm the directories the agent will create
+  (`mkdir -p`, at most 16 levels). It never creates them under key-material directories such as
+  `.ssh` or `.git`, inside the agent's own home, or under `/proc`, `/sys` and `/dev`; it does not
+  use `sudo`. Requires agent 0.27.0 or later; older agents start the session as before.
 - Shows CPU, memory, disk, network and claude process usage for each agent machine (list header,
   machine cards, machine details). It refreshes only while the page is visible, at an interval set
   in Settings (1 minute by default, 5 seconds on the machine page), and can be refreshed by hand.
 - Pins sessions and workspaces (most recently pinned first). When grouped by workspace, groups
   keep a fixed order (newest workspace first) instead of jumping around as sessions change state.
+  A pinned workspace stays in the list even when it has no sessions, and every workspace header
+  has a `+` that opens the new-session dialog with that machine and directory selected. Pinned
+  workspaces can be reordered from the group menu (上移 / 下移 / 移到本机最前) or, on desktop, by
+  dragging; the order is kept by the agent, so all devices paired with that machine see the same
+  order (requires agent 0.26.0 or later).
 - Extensions: programs on the agent machine can add a panel, a badge and action buttons to the
   session page and the composer (for example a project's task list, with "resume this task in a new
   session"), and sessions can be linked to their items; list rows show the links, and a workspace
@@ -47,12 +86,23 @@ the agent runs on your own computer.
   actions leave a note in the session timeline. The browser never runs extension code; it only renders the
   data the agent returns, and actions run on the agent after a click. Install with
   `trine-agent ext add <dir>`; see [extensions](docs/EXTENSIONS.md). Requires agent 0.16.0 or later
-  (0.17.0 for starting from an item and timeline notes).
+  (0.17.0 for starting from an item and timeline notes). From agent 0.31.0, when an extension
+  action asks to start a new session (such as resuming a task), the confirmation dialog lets you
+  switch the engine, model, reasoning effort and permission mode and edit the first message
+  before it runs. From agent 0.26.0 an extension's buttons
+  in the session panel can open a file or directory in the file viewer (for example a task's
+  folder); the usual file scope and trust rules apply, and an extension can never trust a
+  directory for you.
 - Shows the Claude Code version each machine's sessions use and updates it remotely (`claude update`).
   The agent checks the release channel Claude Code updates from (`autoUpdatesChannel`, `latest` by
   default) shortly after start and every 6 hours, and machine cards flag a newer version; "检查更新"
   on the machine page checks right away. Automatic checks are off when `DISABLE_AUTOUPDATER` or
   `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC` is set. Checking requires agent 0.19.0 or later.
+  From agent 0.31.0 each engine card has an "自动更新" switch (off by default, stored on the
+  agent and shared by every paired device): when a check finds a newer Claude Code or Codex, the
+  agent updates it the same way as the update button. Running sessions are not restarted, and
+  the card shows the last automatic update's result. Claude Code is offered only when the agent
+  uses a global `claude` (the SDK's bundled copy cannot be updated).
 - Restarts the agent safely after you update its checkout, from the machine page or with
   `trine-agent restart` (also from inside a trine session): it checks the new code first, waits
   until no session is busy, then exits for the service manager to start it again. Restarting
@@ -71,9 +121,16 @@ the agent runs on your own computer.
   user; otherwise the error tells you the command to run on the machine.
 - With agent 0.22.0 or later, Codex sessions can also rewind the conversation (files are not
   restored, and the dialog says so), compact with `/compact`, run skills from the `/` menu and choose a
-  reasoning effort. Sub-agent activity shows as tool cards. The machine page has a card per engine, with
+  reasoning effort. Sub-agent activity shows as tool cards (from agent 0.26.0 with the sub-agent's
+  nickname, role and status, and approvals a sub-agent asks for appear in the parent session marked
+  "来自子 agent"). The machine page has a card per engine, with
   Codex's version and an update button (`codex update`). The agent checks GitHub for the latest Codex
   release shortly after start and every 6 hours.
+- With agent 0.28.0 or later, the Codex card also has "重启 Codex 进程": it replaces the agent's
+  `codex app-server` and, if the machine's own Codex daemon (`codex app-server daemon`, used by the
+  Codex terminal UI) is running, restarts that too. Codex does not reload a login for a different
+  account in a running process, so use this after switching accounts with `codex login`. It refuses
+  while a Codex session is replying or has queued messages; idle sessions resume on the next message.
 - Hides temporary sessions by default (working directory under a system temp directory, or
   non-interactive runs such as `claude -p`); a list filter shows them again.
 - Relays tool approval requests and interactive questions to your browser.
@@ -182,12 +239,17 @@ the agent to upload it again from its copy under `<home>/uploads`. Images up to 
 3.75 MB and 2000 px are given to Claude inline; larger images and other files are listed
 by path for Claude to read. Requires agent 0.11.0 or later.
 
-File viewing: any paired device can list and read files in a session's working directory.
-`TRINE_FILES_ALLOW` on the agent adds more directories (`:`-separated, absolute or starting
-with `~`); `TRINE_FILES=off` turns the feature off. Symlinks are followed only if the target is
+File viewing: any paired device can list and read files in a session's working directory and in
+the machine's trusted directories. Trusted directories come from two places: `TRINE_FILES_ALLOW`
+on the agent (`:`-separated, absolute or starting with `~`; read-only in the browser), and the
+list kept in `<home>/files.json`, which any paired device can change from the file panel or the
+machine page (agent 0.24.0 or later). Trusting applies to every session and every paired device of
+that machine. `/` cannot be trusted, and the browser warns before trusting the home directory or
+one of its parents. `TRINE_FILES=off` turns the feature off. Symlinks are followed only if the target is
 in scope, and key material is always refused: `.env` files (templates such as `.env.example`
 are allowed), private keys and certificates, `.netrc`/`.npmrc`/`.pypirc`, anything under
-`.ssh`, `.gnupg`, `.aws`, `.git`, `.docker` or `.kube`, and the agent's own home. Files up to
+`.ssh`, `.gnupg`, `.aws`, `.git`, `.docker` or `.kube`, the agent's own home, and `/proc`, `/sys`
+and `/dev` (agent 0.24.0 or later). Files up to
 20 MiB are encrypted by the agent and passed through the relay like attachments (same
 `TRINE_BLOB_TTL_MS`). Requires agent 0.20.0 or later.
 
@@ -198,6 +260,16 @@ aliases. New sessions preselect the model and permission mode from Settings → 
 session defaults (initially `opus[1m]` and `bypassPermissions`); each session keeps its own
 model and permission mode afterwards. Change the default permission mode if you do not
 want new sessions to skip tool approval.
+
+Claude sessions also support choosing an effort (`low`, `medium`, `high`, `xhigh`,
+`max`) when creating a session or in session settings; changes apply to the next turn.
+Claude Code handles the selected model's supported range. Settings → New session defaults
+saves a separate effort preference for Claude and Codex on this browser. “Follow configuration”
+leaves the engine's own setting in charge. Models that do not support the saved Codex effort
+fall back to their defaults, and older agents without the effort capability receive no override.
+These defaults only preselect new sessions; existing sessions keep their own settings.
+The Settings page groups session defaults, appearance and input, attachments and extensions,
+devices and connections, and maintenance, with navigation for desktop and mobile.
 
 In the message box, the Return key on touch devices (phones, tablets) always inserts a
 new line; tap the send button to send. With a physical keyboard, Settings → Send key

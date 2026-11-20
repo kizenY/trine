@@ -16,7 +16,7 @@ import { createInvitation } from '../../../server/src/auth/invitations.ts';
  * @trine/agent / @trine/server 以 devDependency 引入（无 exports 字段，直接引源文件路径）。
  */
 import { afterEach, beforeAll, beforeEach, describe, expect, test } from 'bun:test';
-import { mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -39,10 +39,10 @@ import { DEFAULT_LIST_QUERY, filterSessions } from '../components/list/filtering
 // 会话 cwd 在系统临时目录下（测试约定），默认会被当成临时会话隐藏
 const LIST_QUERY = { ...DEFAULT_LIST_QUERY, showTemp: true };
 import { supportsSessionMutations } from '../components/list/session-actions.ts';
-import { FsRequestError, SessionMutateError, TrineClient } from './client.ts';
+import { CwdPinMoveError, CwdPrepareError, FilesBookmarkError, FilesTrustError, FsRequestError, RequestTimeoutError, SessionMutateError, TrineClient } from './client.ts';
 import { LeaderElector } from './leader.ts';
 import { shouldAutoLoadHistory, type PermissionEntry, type TimelineEntry, type UserEntry } from './reducer.ts';
-import { KV_PEER, type PeerState } from './storage.ts';
+import { KV_PEER, loadMachineDoc, type PeerState } from './storage.ts';
 
 // ---------------------------------------------------------------------------
 // 夹具
@@ -150,7 +150,10 @@ beforeEach(async () => {
     home,
     machineId: 'mbp',
     log: (l) => agentLogs.push(l),
-    getSessionMessagesFn: (async (sid: string) => transcripts[sid] ?? []) as GetSessionMessages,
+    getSessionMessagesFn: (async (sid: string) => {
+      if (sid === 'broken') throw new Error('读转录炸了');
+      return transcripts[sid] ?? [];
+    }) as GetSessionMessages,
     commandsQueryFn: fakeCommandsQuery,
   });
   await waitFor(() => agent.app.node.online, 'agent 接入');
@@ -834,6 +837,15 @@ describe('web lib · 斜杠命令补拉', () => {
 });
 
 describe('web lib · 本机转录历史', () => {
+  test('历史读取出错：loadHistory 立即带原因失败（不等超时），不记成已读完', async () => {
+    await pair();
+    await waitFor(() => client.machine('mbp')?.info !== null, 'machine.info');
+    client.openSession('mbp', 'broken');
+    await waitFor(() => client.syncing['mbp/broken'] === undefined, 'sync.done');
+    await expect(client.loadHistory('mbp', 'broken')).rejects.toThrow('读转录炸了');
+    expect(client.timeline('mbp', 'broken').history).toBeUndefined();
+  }, 20_000);
+
   test('⑮ 打开本机终端建的会话（服务端无帧）→ sync 结束 → 拉到历史；翻页到底；刷新后仍在且不重拉', async () => {
     await pair();
     await waitFor(() => client.machine('mbp')?.info !== null, 'machine.info');
@@ -1050,6 +1062,189 @@ describe('web lib · 文件查看 e2e', () => {
       await rm(ws, { recursive: true, force: true });
     }
   }, 20_000);
+});
+
+describe('web lib · 信任目录 e2e', () => {
+  test('往上走被拒（out_of_scope）→ 信任上级 → machine.info 带上 roots、可以浏览同级 → 取消信任后又被拒', async () => {
+    await pair();
+    await waitFor(() => client.machine('mbp')?.info?.files?.roots !== undefined, 'machine.info.files.roots');
+    const parent = await mkdtemp(join(tmpdir(), 'trine-web-e2e-trust-'));
+    try {
+      const ws = join(parent, 'repo');
+      mkdirSync(ws);
+      mkdirSync(join(parent, 'sibling'));
+      writeFileSync(join(parent, 'sibling', 'note.md'), '合成');
+      const meta = await client.createSession('mbp', { cwd: ws, model: 'test-model', permissionMode: 'default' });
+      const sid = meta.sessionId;
+      const reasonOf = (p: Promise<unknown>) =>
+        p.then(() => 'ok', (e: unknown) => (e instanceof FsRequestError ? `${e.code}:${e.reason ?? '-'}` : String(e)));
+
+      expect(await reasonOf(client.listFiles('mbp', sid, parent))).toBe('denied:out_of_scope');
+      expect(await client.setDirTrusted('mbp', parent, true)).toBe(parent);
+      await waitFor(() => client.machine('mbp')?.info?.files?.roots?.some((r) => r.path === parent) === true, 'roots 更新');
+      const up = await client.listFiles('mbp', sid, parent);
+      expect([up.root, up.entries.map((e) => e.name)]).toEqual([parent, ['repo', 'sibling']]);
+      expect((await client.listFiles('mbp', sid, join(parent, 'sibling'))).entries.map((e) => e.name)).toEqual(['note.md']);
+
+      const err = await client.setDirTrusted('mbp', '/', true).then(() => undefined, (e: unknown) => e);
+      expect(err instanceof FilesTrustError ? err.code : String(err)).toBe('denied');
+
+      await client.setDirTrusted('mbp', parent, false);
+      await waitFor(() => client.machine('mbp')?.info?.files?.roots?.length === 0, 'roots 清空');
+      expect(await reasonOf(client.listFiles('mbp', sid, parent))).toBe('denied:out_of_scope');
+    } finally {
+      await rm(parent, { recursive: true, force: true });
+    }
+  }, 20_000);
+});
+
+describe('web lib · 文件书签 e2e', () => {
+  test('加入（路径规范化）→ machine.info 带上 bookmarks → 移出；相对路径被拒', async () => {
+    await pair();
+    await waitFor(() => client.machine('mbp')?.info?.files?.bookmarks !== undefined, 'machine.info.files.bookmarks');
+    expect(client.machine('mbp')?.info?.files?.bookmarks).toEqual([]);
+
+    expect(await client.setFileBookmark('mbp', '/synthetic/w/./docs/', 'dir')).toBe('/synthetic/w/docs');
+    await client.setFileBookmark('mbp', '/synthetic/w/a.md', 'file');
+    await waitFor(() => client.machine('mbp')?.info?.files?.bookmarks?.length === 2, 'bookmarks 更新');
+    expect(client.machine('mbp')?.info?.files?.bookmarks?.map((b) => [b.path, b.kind])).toEqual([
+      ['/synthetic/w/a.md', 'file'],
+      ['/synthetic/w/docs', 'dir'],
+    ]);
+
+    const err = await client.setFileBookmark('mbp', 'w/rel', 'dir').then(() => undefined, (e: unknown) => e);
+    expect(err instanceof FilesBookmarkError ? err.code : String(err)).toBe('invalid');
+
+    await client.setFileBookmark('mbp', '/synthetic/w/docs', null);
+    await waitFor(() => client.machine('mbp')?.info?.files?.bookmarks?.length === 1, 'bookmarks 移出');
+  }, 20_000);
+});
+
+describe('web lib · 新建工作目录 e2e（cwd-create）', () => {
+  test('能力位 → 检查报 missing、不建 → 创建 → 再查 exists → 在新目录里建会话；文件路径被拒', async () => {
+    await pair();
+    await waitFor(() => client.machine('mbp')?.info?.cwd?.create === true, 'machine.info.cwd.create');
+    const parent = await mkdtemp(join(tmpdir(), 'trine-web-e2e-cwd-'));
+    try {
+      const target = join(parent, 'a', 'b');
+      expect(await client.prepareCwd('mbp', target, false)).toEqual({ path: target, status: 'missing', missing: [join(parent, 'a'), target] });
+      expect(existsSync(join(parent, 'a'))).toBe(false);
+      expect((await client.prepareCwd('mbp', target, true)).status).toBe('created');
+      expect(existsSync(target)).toBe(true);
+      expect((await client.prepareCwd('mbp', target, false)).status).toBe('exists');
+      const meta = await client.createSession('mbp', { cwd: target, model: 'test-model', permissionMode: 'default' });
+      expect(meta.cwd).toBe(target);
+
+      writeFileSync(join(parent, 'f'), 'x');
+      const err = await client.prepareCwd('mbp', join(parent, 'f', 'sub'), true).then(() => undefined, (e: unknown) => e);
+      expect(err instanceof CwdPrepareError ? err.code : String(err)).toBe('not_dir');
+    } finally {
+      await rm(parent, { recursive: true, force: true });
+    }
+  }, 20_000);
+});
+
+describe('web lib · 置顶工作区排序 e2e（pin-order）', () => {
+  const START = ['/w/c', '/w/b', '/w/a'];
+  const order = (c: TrineClient = client) => c.machine('mbp')?.cwd?.pinOrder;
+  const failure = (p: Promise<unknown>) => p.then(() => 'ok', (e: unknown) => e);
+  const codeOf = (e: unknown) => (e instanceof CwdPinMoveError ? e.code : e instanceof Error ? e.message : String(e));
+  /** 配对、等能力位、置顶 a b c（新置顶插最前 → [c, b, a]） */
+  async function setup(): Promise<void> {
+    await pair();
+    await waitFor(() => client.machine('mbp')?.info?.cwd?.pinOrder === true, 'machine.info.cwd.pinOrder');
+    for (const p of ['/w/a', '/w/b', '/w/c']) client.pinWorkspace('mbp', p, true);
+    await waitFor(() => order()?.length === 3, 'pinOrder 三项');
+    expect(order()).toEqual(START);
+  }
+  /** agent 写 cwd.json 失败：把文件位置换成目录（rename 会失败） */
+  const cwdFile = () => join(home, 'cwd.json');
+  function breakCwdWrites(): void {
+    rmSync(cwdFile(), { force: true });
+    mkdirSync(cwdFile());
+  }
+
+  test('成功：乐观更新，另一台设备经 cwd.updated 广播收到同一顺序', async () => {
+    await setup();
+    const otherSockets = new ControlledSockets();
+    const other = await newClient({ kv: new MemoryKv(), docs: new MemoryDocStore(), sockets: otherSockets });
+    try {
+      await pair(other, otherSockets);
+      other.request('mbp', { type: 'cwd.list.request' }).catch(() => undefined);
+      await waitFor(() => order(other)?.length === 3, '第二台设备拿到 pinOrder');
+
+      const moving = client.movePinnedWorkspace('mbp', '/w/a', '/w/c');
+      expect(order()).toEqual(['/w/a', '/w/c', '/w/b']);
+      expect(client.machine('mbp')?.pinMoving).toBe(true);
+      await moving;
+      expect(client.machine('mbp')?.pinMoving).toBeUndefined();
+      // 第二台设备没有乐观状态：它变了只能是广播带来的
+      await waitFor(() => order(other)?.[0] === '/w/a', '第二台设备收到 cwd.updated');
+      expect(order(other)).toEqual(['/w/a', '/w/c', '/w/b']);
+      expect(agent.app.cwdStore.snapshot().pinOrder).toEqual(['/w/a', '/w/c', '/w/b']);
+    } finally {
+      other.stop();
+    }
+  }, 20_000);
+
+  test('有效路径被业务拒绝（agent 那边已取消置顶）：先回滚，再按重拉的快照收敛', async () => {
+    await setup();
+    await agent.app.cwdStore.setPinned('/w/b', false, 0); // 不广播：本地仍以为 b 已置顶
+    const moving = client.movePinnedWorkspace('mbp', '/w/b', '/w/c');
+    expect(order()).toEqual(['/w/b', '/w/c', '/w/a']);
+    expect(codeOf(await failure(moving))).toBe('not_pinned');
+    expect(order()).toEqual(START);
+    await waitFor(() => order()?.length === 2, '重拉 cwd.list');
+    expect(order()).toEqual(['/w/c', '/w/a']);
+    expect(client.machine('mbp')?.pinMoving).toBeUndefined();
+  }, 20_000);
+
+  test('写盘失败 + 在途时再移动被拒；连续两次失败都回到已确认的顺序（缓存也是）', async () => {
+    await setup();
+    breakCwdWrites();
+    try {
+      sockets.hold = (f) => f.type === 'relay';
+      const first = client.movePinnedWorkspace('mbp', '/w/a', '/w/c');
+      expect(order()).toEqual(['/w/a', '/w/c', '/w/b']);
+      // 每台机器只有一个在途移动：第二次直接拒绝，不叠乐观状态
+      expect(codeOf(await failure(client.movePinnedWorkspace('mbp', '/w/b', null)))).toBe('上一次调整还没完成');
+      expect(order()).toEqual(['/w/a', '/w/c', '/w/b']);
+      sockets.release();
+      expect(codeOf(await failure(first))).toBe('failed');
+      expect(order()).toEqual(START);
+      expect(codeOf(await failure(client.movePinnedWorkspace('mbp', '/w/b', null)))).toBe('failed');
+      expect(order()).toEqual(START);
+      await settle(100);
+      expect(order()).toEqual(START);
+      expect((await loadMachineDoc(docs, 'mbp'))?.cwd?.pinOrder).toEqual(START);
+      expect(agent.app.cwdStore.snapshot().pinOrder).toEqual(START);
+    } finally {
+      rmSync(cwdFile(), { recursive: true, force: true });
+    }
+  }, 20_000);
+
+  test('超时：回滚；与中继断开时直接拒绝、不改本地、不排队，重连后也不补发', async () => {
+    await setup();
+    // 帧被扣住（agent 收不到）→ 超时
+    sockets.hold = (f) => f.type === 'relay';
+    const timedOut = await failure(client.movePinnedWorkspace('mbp', '/w/a', '/w/c', { timeoutMs: 200 }));
+    expect(timedOut instanceof RequestTimeoutError).toBe(true);
+    expect(order()).toEqual(START);
+    expect(client.machine('mbp')?.pinMoving).toBeUndefined();
+    sockets.hold = null; // 扣住的帧丢掉，不放行
+
+    sockets.current.close();
+    await waitFor(() => client.connection.status !== 'open', '连接断开');
+    expect(client.machine('mbp')?.online).toBe(true); // 机器状态仍是在线：只看 online 拦不住
+    expect(codeOf(await failure(client.movePinnedWorkspace('mbp', '/w/a', '/w/c')))).toContain('中继');
+    expect(order()).toEqual(START);
+    expect(client.queuedCount).toBe(0);
+
+    await waitFor(() => client.connection.status === 'open', '重连', 10_000);
+    await settle(200);
+    expect(agent.app.cwdStore.snapshot().pinOrder).toEqual(START);
+    expect(order()).toEqual(START);
+  }, 30_000);
 });
 
 describe('web lib · 扩展（ext.*）', () => {

@@ -51,6 +51,7 @@ export class CodexLatestChecker {
   #disposed = false;
   readonly #detectInstall: (() => Promise<PackageInstall | undefined>) | undefined;
   readonly #managerLatest: (install: PackageInstall) => Promise<ManagerLatest>;
+  readonly #onChecked: ((version: string) => void) | undefined;
 
   constructor(
     options: {
@@ -60,8 +61,11 @@ export class CodexLatestChecker {
       log?: (line: string) => void;
       detectInstall?: () => Promise<PackageInstall | undefined>;
       managerLatest?: (install: PackageInstall) => Promise<ManagerLatest>;
+      /** 查成功后（广播之后）调：自动更新据此判断要不要更新 */
+      onChecked?: (version: string) => void;
     } = {},
   ) {
+    this.#onChecked = options.onChecked;
     this.#detectInstall = options.detectInstall;
     this.#managerLatest = options.managerLatest ?? latestFromManager;
     this.#fetch = options.fetchImpl;
@@ -126,6 +130,7 @@ export class CodexLatestChecker {
       this.#log(`[codex] ${message}`);
     }
     if (!this.#disposed) this.#onChange();
+    if (outcome.ok && !this.#disposed) this.#onChecked?.(outcome.version);
     return outcome;
   }
 }

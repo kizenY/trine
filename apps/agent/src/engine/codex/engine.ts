@@ -5,7 +5,7 @@
 import type { EngineModel, EngineRateWindow, EngineSummary, HistoryItem, PermissionMode, SessionMeta, SlashCommand } from '@trine/core';
 import type { CreateSessionArgs } from '../../bridge/manager.ts';
 import { AppServerClient, AppServerError, type AppServerClientOptions, type SpawnAppServer } from './app-server.ts';
-import { codexItemToHistory } from './history.ts';
+import { codexItemsToHistory, spawnOf, subagentLabels } from './history.ts';
 import { CODEX_MODES, isCodexMode, legacyFromMode, threadModeParams, DEFAULT_CODEX_MODE } from './modes.ts';
 import { CODEX_DEFAULT_MODEL, CODEX_ENGINE_ID } from './ids.ts';
 import { CodexSession, type CodexSessionClient, type CodexSessionEvents, type CodexSkill } from './session.ts';
@@ -25,6 +25,37 @@ const THREAD_NOT_FOUND_CODE = -32600;
 const LIST_WAIT_MS = 3_000;
 /** thread/list 默认只给交互来源；exec 也要，标成临时会话。子 agent 的 thread 不列 */
 const SOURCE_KINDS = ['cli', 'vscode', 'exec', 'appServer'];
+const METHOD_NOT_FOUND = -32601;
+/** 子 thread 归属表上限（超了丢最早的；一个会话很少派生上百个子 agent） */
+const MAX_CHILD_LINKS = 1000;
+/** 查子 thread 父级 / 昵称的等待上限 */
+const PARENT_LOOKUP_TIMEOUT_MS = 3_000;
+/** 逐级上溯的层数上限 */
+const MAX_SPAWN_DEPTH = 8;
+/** 归属未知的 thread 暂存通知：只要审批相关的，按 thread 限条数、限 thread 数、限时长 */
+const ORPHAN_METHODS: ReadonlySet<string> = new Set([
+  'item/started',
+  'item/completed',
+  'serverRequest/resolved',
+  'turn/started',
+  'turn/completed',
+  'thread/status/changed',
+]);
+const MAX_ORPHAN_NOTES = 50;
+const MAX_ORPHAN_THREADS = 20;
+const ORPHAN_TTL_MS = 60_000;
+/** 读历史时最多给多少个子 agent 查昵称 */
+const HISTORY_DESCRIBE_MAX = 8;
+
+/** thread 的父 thread：parentThreadId，或 source.subAgent.thread_spawn.parent_thread_id（spike S2） */
+export function parentThreadOf(thread: Rec): string | undefined {
+  const direct = str(thread['parentThreadId']);
+  if (direct !== undefined) return direct;
+  const source = thread['source'];
+  const sub = isRecord(source) ? source['subAgent'] : undefined;
+  const spawn = isRecord(sub) ? sub['thread_spawn'] : undefined;
+  return isRecord(spawn) ? str(spawn['parent_thread_id']) : undefined;
+}
 
 type Rec = Record<string, unknown>;
 
@@ -143,7 +174,7 @@ export function skillsFromList(response: unknown): CodexSkill[] {
 }
 
 export type CodexClient = Pick<AppServerClient, 'call' | 'userAgent' | 'dispose'> &
-  Partial<Pick<AppServerClient, 'hold' | 'release' | 'recycle'>>;
+  Partial<Pick<AppServerClient, 'hold' | 'release' | 'recycle' | 'restart'>>;
 
 export interface CodexEngineOptions {
   /** 给了 client 就用它（只测目录时）；否则按 spawn 建一个，并接上通知与审批 */
@@ -161,10 +192,25 @@ export class CodexEngine implements CodexSessionClient {
   readonly #client: CodexClient;
   /** threadId → 活跃会话 */
   readonly #sessions = new Map<string, CodexSessionEvents>();
+  /** 子 thread → 根会话 thread（见「子 thread」一节） */
+  readonly #childRoot = new Map<string, string>();
+  readonly #resolving = new Map<string, Promise<string | undefined>>();
+  /** 归属还不知道的 thread 的相关通知（有界、限时），归属确定后按序回放给根会话（评审 高2） */
+  readonly #orphans = new Map<string, { at: number; notes: [string, Rec][] }>();
+  /** app-server 进程代际：退出加一，旧进程的异步结果不再生效 */
+  #procGen = 0;
+  /** 收到的服务端请求个数（到达序号） */
+  #requestSeq = 0;
+
+  requestSeq(): number {
+    return this.#requestSeq;
+  }
   #models: EngineModel[] = [];
   readonly #now: () => number;
   readonly #log: (line: string) => void;
   readonly #onChange: () => void;
+  /** thread 的名字变了（Codex 自动起名、别的客户端改名）：manager 据此广播 session.updated */
+  #onTitle: ((sessionId: string, title: string) => void) | undefined;
   readonly #owned = new Map<string, SessionMeta>();
   readonly #notOwned = new Map<string, number>();
   #accountAt: number | undefined;
@@ -189,12 +235,13 @@ export class CodexEngine implements CodexSessionClient {
         now: this.#now,
         ...(options.log === undefined ? {} : { log: options.log }),
         onNotification: (method, params) => this.#onNotification(method, params),
-        onServerRequest: (id, method, params, reply) => {
-          const threadId = typeof params['threadId'] === 'string' ? params['threadId'] : undefined;
-          const session = threadId === undefined ? undefined : this.#sessions.get(threadId);
-          return session?.onServerRequest(id, method, params, reply) ?? false;
-        },
+        onServerRequest: (id, method, params, reply, fail) => this.#onServerRequest(id, method, params, reply, fail),
         onExit: () => {
+          // 子 thread 随进程一起没了：归属表、在查的归属、暂存的通知都属于旧进程（评审 高1）
+          this.#procGen += 1;
+          this.#childRoot.clear();
+          this.#resolving.clear();
+          this.#orphans.clear();
           for (const session of this.#sessions.values()) session.onExit();
         },
       });
@@ -228,8 +275,196 @@ export class CodexEngine implements CodexSessionClient {
   detach(threadId: string, session: CodexSessionEvents): boolean {
     if (this.#sessions.get(threadId) !== session) return false;
     this.#sessions.delete(threadId);
+    for (const [child, root] of this.#childRoot) if (root === threadId) this.#childRoot.delete(child);
     this.#client.release?.();
     return true;
+  }
+
+  // -------------------------------------------------------------------------
+  // 子 thread（multi-agent，spike S2）
+  //
+  // 子 agent 是独立的 thread，通知与审批走同一条连接、带子 threadId，但**没有 thread/started**。
+  // 归属表「子 thread → 根会话」的来源（不猜最近活跃会话）：
+  // 1. 会话 thread（或已知子 thread）上的派生 item：subAgentActivity started 的 agentThreadId、
+  //    spawnAgent 的 receiverThreadIds——先于子 thread 的任何帧到达；
+  // 2. thread/started 带 parentThreadId（防御：实测没有）；
+  // 3. 未知 thread 的 turn/started：`turn.rootTurnId` 是某个活跃会话当前的 turn；
+  // 4. 未知 thread 的审批：限时 thread/read 取 parentThreadId，逐级上溯到活跃会话。
+  // 都查不到才回 -32601（与旧行为相同）。
+  // -------------------------------------------------------------------------
+
+  /** 记一条归属：parent 是活跃会话或已知子 thread 才记；返回根会话 id */
+  #link(child: string, parent: string): string | undefined {
+    if (child === parent || this.#sessions.has(child)) return undefined;
+    const root = this.#sessions.has(parent) ? parent : this.#childRoot.get(parent);
+    if (root === undefined || root === child) return undefined;
+    if (this.#childRoot.get(child) === root) return root;
+    this.#childRoot.delete(child);
+    this.#childRoot.set(child, root);
+    while (this.#childRoot.size > MAX_CHILD_LINKS) {
+      const oldest = this.#childRoot.keys().next();
+      if (oldest.done === true) break;
+      this.#childRoot.delete(oldest.value);
+    }
+    // 归属确定前暂存的通知按到达顺序补给根会话（diff、撤销、轮结束都在里面）
+    const buffered = this.#orphans.get(child);
+    if (buffered !== undefined) {
+      this.#orphans.delete(child);
+      if (this.#now() - buffered.at <= ORPHAN_TTL_MS) {
+        const session = this.#sessions.get(root);
+        for (const [method, params] of buffered.notes) session?.onChildNotification?.(child, method, params);
+      }
+    }
+    return root;
+  }
+
+  /** 归属未知的 thread 的通知：只暂存审批相关的几类，按 thread 限条数、限 thread 数、限时长 */
+  #stashOrphan(threadId: string, method: string, params: Rec): void {
+    if (!ORPHAN_METHODS.has(method)) return;
+    const now = this.#now();
+    for (const [id, entry] of this.#orphans) if (now - entry.at > ORPHAN_TTL_MS) this.#orphans.delete(id);
+    let entry = this.#orphans.get(threadId);
+    if (entry === undefined) {
+      entry = { at: now, notes: [] };
+      this.#orphans.set(threadId, entry);
+      while (this.#orphans.size > MAX_ORPHAN_THREADS) {
+        const oldest = this.#orphans.keys().next();
+        if (oldest.done === true) break;
+        this.#orphans.delete(oldest.value);
+      }
+    }
+    entry.notes.push([method, params]);
+    if (entry.notes.length > MAX_ORPHAN_NOTES) entry.notes.shift();
+  }
+
+  /** 这个 thread 归哪个活跃会话（会话自己或它的子孙）；不知道 undefined */
+  rootOf(threadId: string): string | undefined {
+    return this.#sessions.has(threadId) ? threadId : this.#childRoot.get(threadId);
+  }
+
+  #learnLinks(method: string, threadId: string, params: Rec): void {
+    if (method === 'item/started' || method === 'item/completed') {
+      for (const spawn of spawnOf(params['item'])) this.#link(spawn.childThreadId, threadId);
+      return;
+    }
+    if (method === 'thread/started') {
+      const thread = params['thread'];
+      const id = isRecord(thread) ? str(thread['id']) : undefined;
+      const parent = isRecord(thread) ? parentThreadOf(thread) : undefined;
+      if (id !== undefined && parent !== undefined) this.#link(id, parent);
+      return;
+    }
+    if (method === 'turn/started' && this.rootOf(threadId) === undefined) {
+      const turn = params['turn'];
+      const rootTurn = isRecord(turn) ? str(turn['rootTurnId']) : undefined;
+      if (rootTurn === undefined || (isRecord(turn) && turn['id'] === rootTurn)) return;
+      for (const [id, session] of this.#sessions) {
+        if (session.ownsTurn?.(rootTurn) === true) {
+          this.#link(threadId, id);
+          return;
+        }
+      }
+    }
+  }
+
+  #onServerRequest(
+    id: unknown,
+    method: string,
+    params: Rec,
+    reply: (result: unknown) => void,
+    fail: (code: number, message: string) => void,
+  ): boolean {
+    const seq = ++this.#requestSeq;
+    const threadId = str(params['threadId']);
+    if (threadId === undefined) return false;
+    const own = this.#sessions.get(threadId);
+    if (own !== undefined) return own.onServerRequest(id, method, params, reply, undefined, seq);
+    const root = this.#childRoot.get(threadId);
+    if (root !== undefined) return this.#sessions.get(root)?.onServerRequest(id, method, params, reply, threadId, seq) ?? false;
+    if (this.#sessions.size === 0) return false;
+    // 归属未知：查过再决定，期间请求挂着（Codex 那边本来就在等用户）。查询期间到的撤销 / 轮结束
+    // 暂存在 #orphans，认亲时先回放，会话发布卡片前会看到
+    const gen = this.#procGen;
+    void this.#resolveRoot(threadId).then((found) => {
+      // 进程已换：这个请求属于旧连接，回复也送不到了
+      if (gen !== this.#procGen) return;
+      const session = found === undefined ? undefined : this.#sessions.get(found);
+      // 带上到达序号：查询期间会话被停止的，会话按停止处理
+      const handled = session?.onServerRequest(id, method, params, reply, threadId, seq) ?? false;
+      if (!handled) fail(METHOD_NOT_FOUND, 'not supported by this client');
+    });
+    return true;
+  }
+
+  /** 限时 thread/read 逐级上溯，找到活跃会话就记下归属；查不到 undefined。同一 thread 并发只查一次 */
+  #resolveRoot(threadId: string): Promise<string | undefined> {
+    const running = this.#resolving.get(threadId);
+    if (running !== undefined) return running;
+    const gen = this.#procGen;
+    const task = (async (): Promise<string | undefined> => {
+      const chain: string[] = [threadId];
+      let current = threadId;
+      for (let depth = 0; depth < MAX_SPAWN_DEPTH; depth++) {
+        const parent = await this.#readParent(current);
+        if (gen !== this.#procGen || parent === undefined) return undefined;
+        const root = this.rootOf(parent);
+        if (root !== undefined) {
+          // 从上往下记，每一级的 parent 都已在表里
+          for (let i = chain.length - 1; i >= 0; i--) this.#link(chain[i]!, i === chain.length - 1 ? parent : chain[i + 1]!);
+          return this.rootOf(threadId);
+        }
+        chain.push(parent);
+        current = parent;
+      }
+      return undefined;
+    })()
+      .catch(() => undefined)
+      .finally(() => {
+        if (this.#resolving.get(threadId) === task) this.#resolving.delete(threadId);
+      });
+    this.#resolving.set(threadId, task);
+    return task;
+  }
+
+  async #readParent(threadId: string): Promise<string | undefined> {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timeout = new Promise<undefined>((resolve) => {
+      timer = setTimeout(() => resolve(undefined), PARENT_LOOKUP_TIMEOUT_MS);
+    });
+    try {
+      const result = await Promise.race([this.#client.call('thread/read', { threadId }), timeout]);
+      const thread = isRecord(result) ? result['thread'] : undefined;
+      return isRecord(thread) ? parentThreadOf(thread) : undefined;
+    } catch {
+      return undefined;
+    } finally {
+      if (timer !== undefined) clearTimeout(timer);
+    }
+  }
+
+  /** 子 thread 的昵称 / 角色 / 模型（thread/read）；读不到 undefined */
+  async describeThread(threadId: string): Promise<{ nickname?: string; role?: string; model?: string } | undefined> {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timeout = new Promise<undefined>((resolve) => {
+      timer = setTimeout(() => resolve(undefined), PARENT_LOOKUP_TIMEOUT_MS);
+    });
+    try {
+      const result = await Promise.race([this.#client.call('thread/read', { threadId }), timeout]);
+      const thread = isRecord(result) ? result['thread'] : undefined;
+      if (!isRecord(thread)) return undefined;
+      const nickname = str(thread['agentNickname']);
+      const role = str(thread['agentRole']);
+      const model = str(thread['model']);
+      return {
+        ...(nickname === undefined ? {} : { nickname }),
+        ...(role === undefined ? {} : { role }),
+        ...(model === undefined ? {} : { model }),
+      };
+    } catch {
+      return undefined;
+    } finally {
+      if (timer !== undefined) clearTimeout(timer);
+    }
   }
 
   /** 建一个新 thread。thread 的 id 只能由 Codex 生成，首条消息之前不落盘（spike.md） */
@@ -290,6 +525,18 @@ export class CodexEngine implements CodexSessionClient {
     this.#onChange();
   }
 
+  /**
+   * 机器页「重启 Codex」：立即换掉 app-server（加载着的 thread 按进程退出处理，下一条消息 resume），
+   * 再起新进程刷新登录状态、限额——换账号后旧进程不重新读 auth.json。轮次在跑与否由调用方先查。
+   */
+  async restartProcess(): Promise<void> {
+    this.#client.restart?.();
+    this.#log('[codex] app-server 已按请求重启');
+    // 旧进程上的刷新会被打断（记成不可用）：等它收尾，再在新进程上刷一次
+    await this.#refreshing;
+    await this.refresh();
+  }
+
   createSession(args: CreateSessionArgs): CodexSession {
     return new CodexSession({
       sessionId: args.sessionId,
@@ -306,6 +553,11 @@ export class CodexEngine implements CodexSessionClient {
       log: this.#log,
       now: this.#now,
     });
+  }
+
+  /** 订阅 thread 名字变化（`thread/name/updated`）；只留一个监听者，后设的替换先设的 */
+  onTitle(listener: (sessionId: string, title: string) => void): void {
+    this.#onTitle = listener;
   }
 
   async rename(sessionId: string, title: string): Promise<void> {
@@ -334,9 +586,34 @@ export class CodexEngine implements CodexSessionClient {
     if (method === 'thread/name/updated' && threadId !== undefined) {
       const meta = this.#owned.get(threadId);
       const name = str(params['threadName']) ?? str(params['name']);
-      if (meta !== undefined && name !== undefined) this.#owned.set(threadId, { ...meta, title: name });
+      if (name !== undefined) {
+        if (meta !== undefined) this.#owned.set(threadId, { ...meta, title: name });
+        // 新建的 thread 往往还不在 #owned 里（列表没刷新过），照样通知
+        this.#onTitle?.(threadId, name);
+      }
     }
-    if (threadId !== undefined) this.#sessions.get(threadId)?.onNotification(method, params);
+    // thread/started 只带 {thread}，没有顶层 threadId（评审 低10）
+    if (method === 'thread/started') {
+      const thread = params['thread'];
+      const id = isRecord(thread) ? str(thread['id']) : undefined;
+      if (id !== undefined) this.#learnLinks(method, id, params);
+      return;
+    }
+    if (threadId === undefined) return;
+    this.#learnLinks(method, threadId, params);
+    const own = this.#sessions.get(threadId);
+    if (own !== undefined) {
+      own.onNotification(method, params);
+      return;
+    }
+    // 子 thread 的通知交给根会话（以前直接丢掉）；它的 turn/completed 不会结束父会话的轮
+    const root = this.#childRoot.get(threadId);
+    if (root !== undefined) {
+      this.#sessions.get(root)?.onChildNotification?.(threadId, method, params);
+      return;
+    }
+    // 归属还不知道（多半是等审批时才 thread/read 认亲的那种）：暂存，认亲后回放（评审 高2）
+    if (this.#sessions.size > 0) this.#stashOrphan(threadId, method, params);
   }
 
   /** 更新是稀疏的：只替换这一桶带来的窗口，没带的保留。没见过的桶重读一次拿全 */
@@ -449,25 +726,60 @@ export class CodexEngine implements CodexSessionClient {
   async history(sessionId: string): Promise<HistoryItem[]> {
     const fallbackTs = this.#owned.get(sessionId)?.createdAt ?? 0;
     const raw = await this.#readItems(sessionId);
-    let ts = fallbackTs;
-    const items: HistoryItem[] = [];
-    for (const item of raw) {
-      const converted = codexItemToHistory(item, ts);
-      if (converted === undefined) continue;
-      ts = converted.ts;
-      items.push(converted);
+    const items = codexItemsToHistory(raw, fallbackTs);
+    // 活跃会话里还在跑的子 agent：历史里没有结束证据，但不是「状态未知」。历史是权威对账来源
+    // （web 会用它修正已有卡片），所以这里要先用实时状态校正（评审 中7）
+    const live = this.#sessions.get(sessionId)?.childStates?.();
+    if (live !== undefined && live.size > 0) {
+      for (let i = 0; i < items.length; i++) {
+        const item = items[i]!;
+        const state = item.kind === 'tool' && item.subagent?.agentId !== undefined ? live.get(item.subagent.agentId) : undefined;
+        if (item.kind === 'tool' && state !== undefined && item.subagent?.state === 'unknown') items[i] = { ...item, subagent: { ...item.subagent, state } };
+      }
     }
+    await this.#describeCards(items);
     return items;
+  }
+
+  /** 派生卡补上子 agent 的昵称 / 角色（thread/read，限个数、限时；读不到就显示短 id） */
+  async #describeCards(items: HistoryItem[]): Promise<void> {
+    const targets = new Map<string, number[]>();
+    items.forEach((item, at) => {
+      const id = item.kind === 'tool' && item.toolName === 'SubAgent' ? item.subagent?.agentId : undefined;
+      if (id === undefined || item.kind !== 'tool' || item.subagent?.nickname !== undefined) return;
+      targets.set(id, [...(targets.get(id) ?? []), at]);
+    });
+    const ids = [...targets.keys()].slice(0, HISTORY_DESCRIBE_MAX);
+    const described = await Promise.all(ids.map((id) => this.describeThread(id)));
+    ids.forEach((id, k) => {
+      const info = described[k];
+      if (info === undefined) return;
+      for (const at of targets.get(id) ?? []) {
+        const item = items[at];
+        if (item?.kind !== 'tool') continue;
+        items[at] = { ...item, subagent: { ...item.subagent, ...subagentLabels(info), ...item.subagent } };
+      }
+    });
   }
 
   async #readItems(sessionId: string): Promise<unknown[]> {
     try {
       return await this.#readPaginatedItems(sessionId);
     } catch (err) {
-      // legacy thread 没有分页接口（-32601）：退回一次读完整个 thread
+      // legacy thread 没有分页接口（-32601）：退回一次读完整个 thread。
+      // 0.169 起首轮落盘前的新 thread 也回 -32601（not supported yet）
       if (!(err instanceof AppServerError) || err.code !== -32601) throw err;
     }
-    const result = await this.#client.call('thread/read', { threadId: sessionId, includeTurns: true });
+    let result: unknown;
+    try {
+      result = await this.#client.call('thread/read', { threadId: sessionId, includeTurns: true });
+    } catch (err) {
+      // 本进程里活跃的新会话：rollout 先建空文件、稍后才写首行，这个窗口里读会回内部错误
+      // （rollout is empty）。还没有可回看的历史，内容随实时事件到达，按空历史处理
+      if (!this.#sessions.has(sessionId)) throw err;
+      this.#log(`[codex] 会话 ${sessionId} 的历史暂不可读，按空历史返回：${err instanceof Error ? err.message : String(err)}`);
+      return [];
+    }
     const thread = isRecord(result) ? result['thread'] : undefined;
     const turns = isRecord(thread) && Array.isArray(thread['turns']) ? thread['turns'] : [];
     return turns.flatMap((turn: unknown) => (isRecord(turn) && Array.isArray(turn['items']) ? turn['items'] : []));

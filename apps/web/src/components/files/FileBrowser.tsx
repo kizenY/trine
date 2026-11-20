@@ -7,7 +7,8 @@ import type { FsEntry } from '@trine/core';
 import type { FsListing } from '@/lib/client.ts';
 import { formatBytes, formatRelativeTime } from '@/lib/format.ts';
 import { cn } from '@/lib/utils.ts';
-import { breadcrumbs, joinPath, visibleEntries } from './file-model.ts';
+import { targetForClick, type FileOpenTarget } from './file-links.ts';
+import { joinPath, pathCrumbs, visibleEntries } from './file-model.ts';
 
 function entryIcon(entry: FsEntry): React.JSX.Element {
   if (entry.denied === true) return <LockIcon className="text-text-3 size-4" />;
@@ -18,6 +19,10 @@ function entryIcon(entry: FsEntry): React.JSX.Element {
   return <FileIcon className="text-text-3 size-4" />;
 }
 
+/**
+ * 面包屑：完整绝对路径，从 `/` 开始。命中的根（会话目录 / 信任目录）及其之下正常显示，
+ * 之上的段变淡但照样能点——能不能看由 agent 判断。`root` 省略 = 当前路径不在范围内。
+ */
 export function Breadcrumbs({
   path,
   root,
@@ -25,26 +30,37 @@ export function Breadcrumbs({
   className,
 }: {
   path: string;
-  root: string;
+  root?: string | undefined;
   onBrowse: (dir: string) => void;
   className?: string;
 }): React.JSX.Element {
-  const crumbs = breadcrumbs(path, root);
+  const crumbs = pathCrumbs(path, root);
   return (
-    <nav data-testid="file-breadcrumbs" className={cn('flex min-w-0 flex-wrap items-center gap-0.5 font-mono text-[12px]', className)}>
-      {crumbs.map((c, i) => (
-        <span key={c.path} className="flex min-w-0 items-center gap-0.5">
-          {i > 0 && <span className="text-text-3">/</span>}
-          <button
-            type="button"
-            onClick={() => onBrowse(c.path)}
-            disabled={i === crumbs.length - 1}
-            className={cn('max-w-[14rem] truncate rounded px-0.5', i === crumbs.length - 1 ? 'text-text' : 'text-text-2 hover:text-text hover:underline')}
-          >
-            {c.label}
-          </button>
-        </span>
-      ))}
+    <nav aria-label="文件路径" data-testid="file-breadcrumbs" className={cn('flex min-w-0 flex-wrap items-center gap-0.5 font-mono text-[12px]', className)}>
+      {crumbs.map((c, i) => {
+        const last = i === crumbs.length - 1;
+        return (
+          <span key={c.path} className="flex min-w-0 items-center gap-0.5">
+            {i > 1 && <span className="text-text-3">/</span>}
+            <button
+              type="button"
+              data-testid="file-crumb"
+              data-in-scope={c.inScope || undefined}
+              onClick={() => onBrowse(c.path)}
+              disabled={last}
+              aria-current={last ? 'location' : undefined}
+              title={c.inScope ? c.path : `${c.path}（会话目录与信任目录之外）`}
+              className={cn(
+                'max-w-[min(14rem,100%)] truncate rounded px-1 py-1 pointer-coarse:min-h-11',
+                last ? 'text-text' : c.inScope ? 'text-text-2 hover:text-text hover:underline' : 'text-text-3 hover:text-text-2 hover:underline',
+                c.path === root && !last && 'font-medium',
+              )}
+            >
+              {c.label}
+            </button>
+          </span>
+        );
+      })}
     </nav>
   );
 }
@@ -58,8 +74,9 @@ export function FileList({
 }: {
   listing: FsListing;
   showHidden: boolean;
-  onBrowse: (dir: string) => void;
-  onOpen: (path: string) => void;
+  /** `target`：按点击修饰键给出（Alt = side），外壳据此决定就地导航还是走打开 intent */
+  onBrowse: (dir: string, target: FileOpenTarget) => void;
+  onOpen: (path: string, target: FileOpenTarget) => void;
   now?: number;
 }): React.JSX.Element {
   const entries = visibleEntries(listing.entries, showHidden);
@@ -85,9 +102,9 @@ export function FileList({
                 data-denied={e.denied === true || undefined}
                 disabled={!clickable}
                 title={e.denied === true ? '不提供查看（密钥类文件或范围外的链接）' : path}
-                onClick={() => (e.type === 'dir' ? onBrowse(path) : onOpen(path))}
+                onClick={(ev) => (e.type === 'dir' ? onBrowse(path, targetForClick(ev)) : onOpen(path, targetForClick(ev)))}
                 className={cn(
-                  'flex w-full items-center gap-2.5 px-4 py-2 text-left text-[13px]',
+                  'flex min-h-11 w-full items-center gap-2.5 px-4 py-2 text-left text-[13px]',
                   clickable ? 'hover:bg-surface-2 cursor-pointer' : 'text-text-3 cursor-default',
                 )}
               >

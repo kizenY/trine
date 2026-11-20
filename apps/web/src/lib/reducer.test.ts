@@ -24,6 +24,7 @@ import {
   markSendingAsFailed,
   mergeHistory,
   nextParkedExpiry,
+  reconcileSubagent,
   setLocalStatus,
   setUserAttachment,
   transitionLocalStatus,
@@ -98,6 +99,88 @@ describe('reducer · tool / permission 原地更新', () => {
     expect(tl.entries).toEqual([expect.objectContaining({ kind: 'tool', toolName: 'Bash', status: 'ok', outputPreview: 'a\nb' })]);
     tl = apply(tl, ev({ type: 'tool.end', ...S, toolUseId: 't2', status: 'error', durationMs: 1, resultSummary: '✗' }));
     expect(tl.entries[1]).toMatchObject({ kind: 'tool', id: 't2', toolName: '?', status: 'error' });
+  });
+
+  test('subagent 信息：start / end / 重发 start 按字段合并，结果与子树保留；历史条目带上；落盘往返不丢', async () => {
+    let tl = apply(
+      emptyTimeline(),
+      ev({ type: 'tool.start', ...S, toolUseId: 'a1', toolName: 'Agent', argSummary: 'd', subagent: { agentType: 'Explore' } }),
+      ev({ type: 'tool.end', ...S, toolUseId: 'a1', status: 'ok', durationMs: 1, resultSummary: '✓ 后台子 agent 已启动', subagent: { background: true } }),
+    );
+    expect(tl.entries[0]).toMatchObject({ status: 'ok', subagent: { agentType: 'Explore', background: true } });
+    tl = apply(tl, ev({ type: 'tool.end', ...S, toolUseId: 'a1', status: 'ok', durationMs: 9, resultSummary: '✓ 2 次', subagent: { background: true, state: 'completed' } }));
+    expect(tl.entries[0]).toMatchObject({ resultSummary: '✓ 2 次', subagent: { agentType: 'Explore', background: true, state: 'completed' } });
+    // Codex：重发 tool.start 只为更新子 agent 状态，调用结果不动
+    tl = apply(
+      tl,
+      ev({ type: 'tool.start', ...S, toolUseId: 'x1', toolName: 'SubAgent', argSummary: 'task' }),
+      ev({ type: 'tool.end', ...S, toolUseId: 'x1', status: 'ok', durationMs: 1, resultSummary: '已派生' }),
+      ev({ type: 'tool.start', ...S, toolUseId: 'x1', toolName: 'SubAgent', argSummary: 'task', subagent: { state: 'running', nickname: 'n' } }),
+      ev({ type: 'tool.start', ...S, toolUseId: 'x1', toolName: 'SubAgent', argSummary: 'task', subagent: { state: 'completed' } }),
+    );
+    expect(tl.entries[1]).toMatchObject({ status: 'ok', resultSummary: '已派生', subagent: { state: 'completed', nickname: 'n' } });
+    tl = mergeHistory(tl, {
+      items: [{ kind: 'tool', id: 'h1', toolName: 'Agent', argSummary: 'old', status: 'ok', subagent: { background: true, state: 'unknown' }, ts: 1 }],
+      hasMore: false,
+    });
+    expect(tl.entries[0]).toMatchObject({ id: 'h1', subagent: { state: 'unknown' } });
+    const store = new MemoryDocStore();
+    await saveTimeline(store, 'm/s1', tl);
+    const loaded = await loadTimeline(store, 'm/s1');
+    expect(loaded?.entries.find((e) => e.id === 'x1')).toMatchObject({ subagent: { state: 'completed', nickname: 'n' } });
+  });
+
+  test('评审 中7：历史对账已有卡片的子 agent 状态（缓存里的运行中被修正）；最终状态不被改回；无变化原样返回', () => {
+    let tl = apply(
+      emptyTimeline(),
+      ev({ type: 'tool.start', ...S, toolUseId: 'x1', toolName: 'SubAgent', argSummary: 't', subagent: { state: 'running', agentId: 'c1' } }),
+      ev({ type: 'tool.start', ...S, toolUseId: 'x2', toolName: 'SubAgent', argSummary: 't', subagent: { state: 'completed' } }),
+    );
+    const page = {
+      items: [
+        { kind: 'tool' as const, id: 'x1', toolName: 'SubAgent', argSummary: 't', subagent: { state: 'unknown' as const, nickname: 'n' }, ts: 1 },
+        { kind: 'tool' as const, id: 'x2', toolName: 'SubAgent', argSummary: 't', subagent: { state: 'unknown' as const }, ts: 1 },
+      ],
+      hasMore: false,
+    };
+    tl = mergeHistory(tl, page);
+    expect(tl.entries[0]).toMatchObject({ subagent: { state: 'unknown', nickname: 'n', agentId: 'c1' } });
+    expect(tl.entries[1]).toMatchObject({ subagent: { state: 'completed' } });
+    expect(mergeHistory(tl, page)).toBe(tl);
+    expect(reconcileSubagent({ state: 'running' }, { state: 'completed' })).toEqual({ subagent: { state: 'completed' }, adoptResult: true });
+    expect(reconcileSubagent({ state: 'ended' }, { state: 'failed' })).toEqual({ subagent: { state: 'failed' }, adoptResult: true });
+  });
+
+  test('复审 新中2：明确结果不被降级成 ended / unknown；ended 不被 unknown 覆盖', () => {
+    expect(reconcileSubagent({ state: 'failed' }, { state: 'ended' })).toBeUndefined();
+    expect(reconcileSubagent({ state: 'completed' }, { state: 'unknown' })).toBeUndefined();
+    expect(reconcileSubagent({ state: 'completed' }, { state: 'failed' })).toBeUndefined();
+    expect(reconcileSubagent({ state: 'ended' }, { state: 'unknown' })).toBeUndefined();
+    expect(reconcileSubagent({ state: 'unknown' }, { state: 'ended' })).toEqual({ subagent: { state: 'ended' }, adoptResult: false });
+  });
+
+  test('复审 新中3：历史把已有卡升级成明确结果时，摘要 / 报告 / 耗时一起更新；不升级时不动', () => {
+    let tl = apply(
+      emptyTimeline(),
+      ev({ type: 'tool.start', ...S, toolUseId: 'a1', toolName: 'Agent', argSummary: 'd' }),
+      ev({ type: 'tool.end', ...S, toolUseId: 'a1', status: 'ok', durationMs: 5, resultSummary: '✓ 后台子 agent 已启动', subagent: { background: true } }),
+      ev({ type: 'tool.start', ...S, toolUseId: 'a2', toolName: 'Agent', argSummary: 'd' }),
+      ev({ type: 'tool.end', ...S, toolUseId: 'a2', status: 'error', durationMs: 7, resultSummary: '✗ 子 agent 失败', subagent: { background: true, state: 'failed' } }),
+    );
+    tl = mergeHistory(tl, {
+      items: [
+        { kind: 'tool', id: 'a1', toolName: 'Agent', argSummary: 'd', status: 'ok', durationMs: 9000, resultSummary: '✓ 2 次工具调用 · 9.0s', outputPreview: '报告', subagent: { background: true, state: 'completed' }, ts: 1 },
+        { kind: 'tool', id: 'a2', toolName: 'Agent', argSummary: 'd', status: 'ok', resultSummary: '✓ 后台子 agent 已启动', subagent: { background: true, state: 'ended' }, ts: 1 },
+      ],
+      hasMore: false,
+    });
+    expect(tl.entries[0]).toMatchObject({ status: 'ok', resultSummary: '✓ 2 次工具调用 · 9.0s', outputPreview: '报告', durationMs: 9000, subagent: { state: 'completed' } });
+    expect(tl.entries[1]).toMatchObject({ status: 'error', resultSummary: '✗ 子 agent 失败', durationMs: 7, subagent: { state: 'failed' } });
+  });
+
+  test('评审 中8：子 thread 来源（subagentId）进条目', () => {
+    const tl = apply(emptyTimeline(), ev({ type: 'permission.request', ...S, requestId: 'r', toolName: 'Shell', input: {}, requestedAt: 1, subagentId: 'thread-abc12345' }));
+    expect(tl.entries[0]).toMatchObject({ kind: 'permission', subagentId: 'thread-abc12345' });
   });
 
   test('permission.request 同 requestId 幂等；resolved 后重发不回退 pending；invalidated 不覆盖 resolved', () => {
@@ -402,6 +485,11 @@ describe('reducer · sessions / machine / prefs', () => {
     expect(m.cwd).toEqual({ favorites: ['/a'], defaultCwd: '/a' });
     m = applyMachineEvent(m, ev({ type: 'cwd.updated', favorites: ['/a'], defaultCwd: '/a', pinned: { '/a': 5 } }));
     expect(m.cwd).toEqual({ favorites: ['/a'], defaultCwd: '/a', pinned: { '/a': 5 } });
+    m = applyMachineEvent(m, ev({ type: 'cwd.list.response', reqId: 'q', favorites: [], defaultCwd: '/', pinned: { '/a': 5, '/b': 6 }, pinOrder: ['/a', '/b'] }));
+    expect(m.cwd).toEqual({ favorites: [], defaultCwd: '/', pinned: { '/a': 5, '/b': 6 }, pinOrder: ['/a', '/b'] });
+    // 旧 agent 的快照不带 pinOrder：整份替换，顺序跟着消失（退回时间序）
+    m = applyMachineEvent(m, ev({ type: 'cwd.updated', favorites: [], defaultCwd: '/', pinned: { '/a': 5 } }));
+    expect(m.cwd?.pinOrder).toBeUndefined();
   });
 
   test('machine.stats：存最新与历史（限条数），晚到的旧快照忽略', () => {

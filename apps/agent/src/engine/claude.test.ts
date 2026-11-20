@@ -15,6 +15,8 @@ describe('claudeEngineSummary', () => {
     const parsed = MachineInfoSchema.parse(info);
     expect(parsed.engines?.[0]).toMatchObject({ id: 'claude', version: '2.1.0', available: true });
     expect(parsed.engines?.[0]?.capabilities.interactive).toBe(true);
+    expect(parsed.engines?.[0]?.capabilities.effort).toBe(true);
+    expect(parsed.engines?.[0]?.efforts).toEqual(['low', 'medium', 'high', 'xhigh', 'max']);
     expect(parsed.engines?.[0]?.capabilities.rewind).toEqual(['code', 'conversation', 'both']);
   });
 

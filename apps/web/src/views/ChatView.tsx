@@ -36,7 +36,7 @@
  * 按需请求、不轮询（方案 §0 行 i：这类请求占 agent 的并发名额）。结果不进
  * 时间线（它不是会话内容），只活在本地 state 里，刷新即消失。
  */
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { useLocation, useNavigate, useParams } from 'react-router';
 import { toast } from 'sonner';
 import type { McpServerStatus, PermissionMode, RewindMode } from '@trine/core';
@@ -92,15 +92,23 @@ import {
 } from '@/lib/reducer.ts';
 import { timelineKey } from '@/lib/storage.ts';
 import { CLAUDE_ENGINE_ID } from '@trine/core';
-import { capabilitiesOf, engineModeLabel, engineOf, sessionEngineTag } from '@/lib/engine-model.ts';
+import { capabilitiesOf, engineModeLabel, engineOf, hasMultipleEngines, sessionEngineTag } from '@/lib/engine-model.ts';
+import { EngineIcon } from '@/components/shell/EngineIcon.tsx';
 import { CostLabel } from '@/components/chat/CostLabel.tsx';
 import { waitingForOfTool } from '@/lib/waiting.ts';
 import { ExtHeadEntry, ExtPanelSheet } from '@/components/ext/ExtPanel.tsx';
-import { FilePanel } from '@/components/files/FilePanel.tsx';
-import { FileLinksContext, type FileLinks } from '@/components/files/file-links.ts';
-import { useFilePanelRoute } from '@/components/files/use-file-panel.ts';
+import { FilePanel, type DrawerHandoff } from '@/components/files/FilePanel.tsx';
+import { prefetchWorkspace } from '@/components/workspace/LazyWorkspace.tsx';
+import { useWorkspace } from '@/components/workspace/use-workspace.ts';
+import { intentForView, useDrawerHandoff, useWorkspaceDeepLink, type HandoffIntent } from '@/components/workspace/use-drawer-handoff.ts';
+import { WorkspacePane } from '@/components/workspace/WorkspacePane.tsx';
+import { useWorkspacePeekRoute, WorkspacePeek } from '@/components/workspace/WorkspacePeek.tsx';
+import { createFileLinks, FileLinksContext, type FileLinks } from '@/components/files/file-links.ts';
+import { useFilePanelRoute, viewForIntent } from '@/components/files/use-file-panel.ts';
 import { composerPickerLabel, ExtComposerPicker, useComposerExtensions } from '@/components/ext/ExtComposerPicker.tsx';
 import { useExtRecords } from '@/components/ext/use-ext.ts';
+import { useIsDesktop } from '@/components/shell/use-media-query.ts';
+import { contentMaxWidth, effectiveContentWidth, setContentWidthOverride, type ContentWidth } from '@/lib/layout-prefs.ts';
 
 type InfoCardState =
   | { kind: 'status'; rows: { label: string; value: React.ReactNode }[] }
@@ -129,6 +137,10 @@ export function ChatView(): React.JSX.Element {
   const setDraft = useTrine((s) => s.setDraft);
   const deviceId = useTrine((s) => s.deviceId);
   const prefs = useTrine((s) => s.prefs);
+  const isDesktop = useIsDesktop();
+  const contentWidth = effectiveContentWidth(prefs.contentWidth, prefs.sessionContentWidth, key);
+  const setSessionContentWidth = (width: ContentWidth | null): void =>
+    client?.updatePrefs({ sessionContentWidth: setContentWidthOverride(prefs.sessionContentWidth, key, width) });
 
   const [settingsSection, setSettingsSection] = useState<SettingsSection | null>(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
@@ -162,16 +174,59 @@ export function ChatView(): React.JSX.Element {
   const filesSupported = machine?.info?.files != null;
   const filePanel = useFilePanelRoute();
   const openFilePanel = filePanel.open;
+  // 文件工作区（桌面）：按「机器 + 会话 cwd」一份，手机宽度不加载 dockview、只有抽屉
+  const ws = useWorkspace({ machineId, sessionId, cwd: meta?.cwd, enabled: isDesktop && filesSupported });
+  const workspaceRoute = ws.route;
+  // 打开 intent 的路由：auto 在工作区展开时进工作区，否则抽屉；side 进工作区；窄屏 / 手机全落到抽屉
   const fileLinks = useMemo<FileLinks | null>(
-    () =>
-      filesSupported
-        ? {
-            open: (path) => openFilePanel({ kind: 'file', path }),
-            browse: (dir) => openFilePanel(dir === undefined ? { kind: 'dir' } : { kind: 'dir', path: dir }),
-          }
-        : null,
-    [filesSupported, openFilePanel],
+    () => (filesSupported ? createFileLinks({ drawer: (intent) => openFilePanel(viewForIntent(intent)), workspace: workspaceRoute }) : null),
+    [filesSupported, openFilePanel, workspaceRoute],
   );
+  const openWithState = ws.openWithState;
+  const handoff = useDrawerHandoff(useCallback((h: HandoffIntent) => openWithState(h.intent, h.state), [openWithState]));
+  const onDrawerHandoff = useCallback(
+    (h: DrawerHandoff) => handoff({ intent: intentForView(h.view), state: h.state }),
+    [handoff],
+  );
+  // 工作区展开时的 `?file=` / `?dir=` 深链（不是本页从关着打开的抽屉）：转成 tab，参数就地 replace 掉
+  const fileState = useLocation().state as { fileFromClosed?: unknown } | null;
+  useWorkspaceDeepLink(ws.shown, filePanel.view, fileState?.fileFromClosed === true, handoff);
+  // 桌面窄窗口：「文件（N）」以抽屉形式看当前活动 tab（一条可退回的历史）
+  const peek = useWorkspacePeekRoute();
+  const closePeek = peek.close;
+  const peekOpen = peek.open;
+  useEffect(() => {
+    // 宽度恢复（或工作区没了）：抽屉退掉，回到工作区布局
+    if (peekOpen && (!ws.narrow || ws.status === 'absent')) closePeek();
+  }, [peekOpen, ws.narrow, ws.status, closePeek]);
+  // 主区（聊天 + 工作区）实测宽度：放不下两栏时工作区自动收起
+  const rowRef = useRef<HTMLDivElement | null>(null);
+  const [mainWidth, setMainWidth] = useState(0);
+  const setWsMainWidth = ws.setMainWidth;
+  useLayoutEffect(() => {
+    const el = rowRef.current;
+    if (el === null || typeof ResizeObserver === 'undefined') return;
+    const measure = (): void => {
+      const w = Math.round(el.getBoundingClientRect().width);
+      setMainWidth(w);
+      setWsMainWidth(w);
+    };
+    measure();
+    const ro = new ResizeObserver(measure);
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, [setWsMainWidth]);
+  // 桌面空闲时预取 dockview chunk（首次展开不必等下载）
+  useEffect(() => {
+    if (!isDesktop || !filesSupported) return;
+    const idle = (globalThis as { requestIdleCallback?: (cb: () => void, o?: { timeout: number }) => number }).requestIdleCallback;
+    if (idle !== undefined) {
+      const id = idle(() => prefetchWorkspace(), { timeout: 10_000 });
+      return () => (globalThis as { cancelIdleCallback?: (id: number) => void }).cancelIdleCallback?.(id);
+    }
+    const t = setTimeout(() => prefetchWorkspace(), 5_000);
+    return () => clearTimeout(t);
+  }, [isDesktop, filesSupported]);
   const extRecords = useExtRecords(machineId, sessionId);
   const [renameBusy, setRenameBusy] = useState(false);
   const [now, setNow] = useState(() => Date.now());
@@ -685,6 +740,11 @@ export function ChatView(): React.JSX.Element {
 
   return (
     <FileLinksContext.Provider value={fileLinks}>
+      {/* display:contents 不改布局，只把内容宽度变量传给时间线与输入框（PC 上生效） */}
+      <div className="contents" style={{ '--chat-max': contentMaxWidth(contentWidth) } as React.CSSProperties}>
+      {/* 主区：聊天 | 工作区（桌面）。最大化时工作区盖住聊天栏，聊天不卸载、只是不可交互 */}
+      <div ref={rowRef} data-testid="chat-row" className="relative flex min-h-0 flex-1">
+      <div data-testid="chat-column" className="flex min-h-0 min-w-0 flex-1 flex-col" inert={ws.maximized ? true : undefined}>
       <AppHead
         back={backTo}
         title={meta?.title !== undefined && meta.title !== '' ? meta.title : sessionId.slice(0, 8)}
@@ -694,10 +754,19 @@ export function ChatView(): React.JSX.Element {
               type="button"
               data-testid="session-meta"
               disabled={engineCaps.interactive !== true}
-              className="hover:text-text-2 disabled:hover:text-inherit min-w-0 truncate text-left transition-colors"
+              // 用量徽标不收缩，窄屏上会把这里挤成 0 宽、点不到：留个最小宽度（⋯ 菜单里也有入口）
+              className="hover:text-text-2 disabled:hover:text-inherit min-w-[10ch] truncate text-left transition-colors"
               onClick={() => openSettings(null)}
               title="会话设置：模型 / 权限模式 / 工作目录"
             >
+              {/* 多引擎机器上在最前面标出引擎图标（Claude 会话也标，两种会话一眼可分） */}
+              {meta !== undefined && hasMultipleEngines(machine?.info) && (
+                <EngineIcon
+                  engineId={meta.engine ?? CLAUDE_ENGINE_ID}
+                  data-testid="session-meta-engine"
+                  className="mr-1 inline size-3 align-[-1px]"
+                />
+              )}
               {meta === undefined
                 ? '会话设置 ▾'
                 : engineTagText !== undefined
@@ -709,6 +778,7 @@ export function ChatView(): React.JSX.Element {
               // Claude 的限额只给确定是 Claude 的会话：多引擎机器上 meta 没到时还不知道是谁的
               rateLimits={engineOf(machine?.info, meta)?.id === CLAUDE_ENGINE_ID ? machine?.info?.rateLimits : undefined}
               windows={engineOf(machine?.info, meta)?.rateLimits}
+              model={meta?.model}
               now={usageNow}
               onRefreshContext={canRefreshContext ? refreshContext : undefined}
             />
@@ -734,7 +804,17 @@ export function ChatView(): React.JSX.Element {
               meta={meta}
               actions={sessionActions}
               onRequestRename={() => setRenameOpen(true)}
-              {...(fileLinks === null ? {} : { onBrowseFiles: () => fileLinks.browse() })}
+              {...(engineCaps.interactive === true ? { onOpenSettings: () => openSettings(null) } : {})}
+              {...(isDesktop && client !== null
+                ? {
+                    contentWidth: {
+                      value: prefs.sessionContentWidth[key] ?? null,
+                      global: prefs.contentWidth,
+                      onChange: setSessionContentWidth,
+                    },
+                  }
+                : {})}
+              {...(fileLinks === null ? {} : { onBrowseFiles: () => fileLinks.open({ dir: true, target: 'auto' }) })}
             />
           </div>
         }
@@ -750,6 +830,8 @@ export function ChatView(): React.JSX.Element {
           now={now}
           runningToolId={runningToolId}
           runningElapsedMs={runningElapsedMs}
+          bgTasks={bgTasks}
+          bgStale={bgStale}
           handlers={handlers}
           planOptions={agentSupportsPlanOptions(machine?.info?.agentVersion) && engineCaps.planMode === true}
           // machine.info 还没到时不下「版本过旧」的结论（评审 m4）
@@ -779,11 +861,15 @@ export function ChatView(): React.JSX.Element {
 
       {bgTasks !== undefined && bgTasks.length > 0 && (
         <BgTaskBar
+          // 折叠状态随会话重置（路由切会话不会重挂 ChatView）
+          key={key}
           tasks={bgTasks}
           now={now}
           stale={bgStale}
           canStop={agentSupportsBgTaskStop(machine?.info?.agentVersion)}
           onStop={stopBgTask}
+          hideEnded={prefs.bgHideEnded}
+          onHideEndedChange={(hide) => client?.updatePrefs({ bgHideEnded: hide })}
         />
       )}
       {running && hbView !== null && <HeartbeatFooter view={hbView} />}
@@ -844,6 +930,28 @@ export function ChatView(): React.JSX.Element {
           }}
         />
       )}
+      </div>
+      <WorkspacePane
+        ws={ws}
+        mainWidth={mainWidth}
+        storedWidth={prefs.workspaceWidth}
+        onWidthCommit={(width) => client?.updatePrefs({ workspaceWidth: width })}
+        onWidthReset={() => client?.updatePrefs({ workspaceWidth: null })}
+        onPeek={peek.show}
+      />
+      </div>
+
+      {ws.enabled && ws.count > 0 && (
+        <WorkspacePeek
+          open={peek.open && ws.narrow}
+          onClose={peek.close}
+          machineId={machineId}
+          sessionId={sessionId}
+          tabs={ws.tabs}
+          active={ws.active}
+          view={ws.view}
+        />
+      )}
 
       {dragging && (
         <div
@@ -863,6 +971,7 @@ export function ChatView(): React.JSX.Element {
           view={filePanel.view}
           onNavigate={filePanel.open}
           onClose={filePanel.close}
+          onHandoff={workspaceRoute === null ? undefined : onDrawerHandoff}
         />
       )}
 
@@ -873,6 +982,13 @@ export function ChatView(): React.JSX.Element {
         sessionId={sessionId}
         meta={meta}
         onInsert={(text) => setInsertRequest((r) => ({ id: (r?.id ?? 0) + 1, text }))}
+        // 扩展的 files.open 走统一的打开 intent（auto：工作区展开时进工作区，否则抽屉）；
+        // agent 不支持文件查看时不给，面板也就不声明这个特性
+        onFilesOpen={
+          fileLinks === null
+            ? undefined
+            : (effect) => fileLinks.open(effect.dir === true ? { dir: true, path: effect.path, target: 'auto' } : { path: effect.path, target: 'auto' })
+        }
       />
 
       <RewindDialog
@@ -923,6 +1039,7 @@ export function ChatView(): React.JSX.Element {
           }}
         />
       )}
+      </div>
     </FileLinksContext.Provider>
   );
 }

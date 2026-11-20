@@ -22,7 +22,7 @@ import { useEffect, useMemo, useState } from 'react';
 import { useNavigate } from 'react-router';
 import { toast } from 'sonner';
 import { CLAUDE_ENGINE_ID, type PermissionMode } from '@trine/core';
-import { creatableEngines, effortOptions, ENGINE_DEFAULT_MODEL } from '@/lib/engine-model.ts';
+import { creatableEngines, effortOptions, preferredEffort, ENGINE_DEFAULT_MODEL } from '@/lib/engine-model.ts';
 import { Button } from '@/components/ui/button.tsx';
 import { Input } from '@/components/ui/input.tsx';
 import { Textarea } from '@/components/ui/textarea.tsx';
@@ -32,6 +32,10 @@ import { useClient, useTrine } from '@/app/runtime.ts';
 import { cn } from '@/lib/utils.ts';
 import { ExtNewSessionPicker, useNewSessionExtensions, type NewSessionStart } from '@/components/ext/ExtNewSessionPicker.tsx';
 import { CwdPicker } from './CwdPicker.tsx';
+import { ConfirmDialog } from '@/components/machines/ConfirmDialog.tsx';
+import { CwdPrepareError, type CwdPrepareResult } from '@/lib/client.ts';
+import { copyText } from '@/lib/clipboard.ts';
+import { buildCopyCwd } from '@/components/list/session-actions.ts';
 import {
   clickEngineMode,
   clickMode,
@@ -44,20 +48,43 @@ import {
   type EngineModePickerState,
   type ModePickerState,
 } from './permission-mode.ts';
+import { EngineIcon } from '@/components/shell/EngineIcon.tsx';
+import type { NewSessionIntent } from './new-session-route.tsx';
 
 /** 分区标题（原型 `.form-row .lbl`） */
+/** 复制工作目录：与会话列表同一套 toast 文案 */
+const copyCwd = buildCopyCwd(copyText, toast);
+
+/**
+ * intent → 本次打开的机器 / 目录。机器不在本设备上：不选机器（`missing`），由界面说明原因，
+ * 绝不悄悄换成别的机器；离线机器照选，sheet 自己的离线提示会说明为什么建不了。
+ */
+export function resolveNewSessionIntent(
+  intent: NewSessionIntent,
+  machines: Record<string, unknown>,
+): { machineId: string; cwd: string; missing: boolean } {
+  if (machines[intent.machineId] === undefined) return { machineId: '', cwd: '', missing: true };
+  return { machineId: intent.machineId, cwd: intent.cwd, missing: false };
+}
+
 function Label({ children }: { children: React.ReactNode }): React.JSX.Element {
   return (
     <div className="text-text-3 mb-1.5 text-[11px] tracking-[0.05em] uppercase">{children}</div>
   );
 }
 
+/** intent 指定的机器不在本设备上时的提示（不静默换成别的机器） */
+export const INTENT_MISSING_HINT = '指定的机器不在本设备上（可能已移除），请另选一台。';
+
 export function NewSessionSheet({
   open,
   onOpenChange,
+  intent = null,
 }: {
   open: boolean;
   onOpenChange: (open: boolean) => void;
+  /** 一次性预选（plan §3）：每次打开时消费，覆盖上次的机器 / 目录选择 */
+  intent?: NewSessionIntent | null;
 }): React.JSX.Element {
   const client = useClient();
   const navigate = useNavigate();
@@ -86,6 +113,10 @@ export function NewSessionSheet({
   const [cwdRequested, setCwdRequested] = useState<string | null>(null);
   const [start, setStart] = useState<NewSessionStart | null>(null);
   const [prompt, setPrompt] = useState('');
+  /** 当前目录的预检结果（cwd-create）；key 对不上当前机器 + 目录 = 过期 */
+  const [cwdCheck, setCwdCheck] = useState<{ key: string; result?: CwdPrepareResult; error?: string } | null>(null);
+  /** 待确认新建的目录；非 null 时显示确认框 */
+  const [confirmCwd, setConfirmCwd] = useState<CwdPrepareResult | null>(null);
   const [engineId, setEngineId] = useState<string | null>(null);
   const [engineMode, setEngineMode] = useState<EngineModePickerState>({ value: undefined, pending: null });
   const defaultEngine = useTrine((s) => s.prefs.defaultEngine);
@@ -102,6 +133,10 @@ export function NewSessionSheet({
   const engineModes = engine?.modes;
   const engineDefault = engine === undefined ? undefined : engineDefaults[engine.id];
   const offline = machine !== undefined && machine.online !== true;
+  // agent 认识 cwd.prepare.request（能力位，不看版本号）；旧 agent 不预检，新建会话照旧
+  const canPrepareCwd = machine?.info?.cwd?.create === true && !offline;
+  const cwdKey = `${machineId}\0${cwd.trim()}`;
+  const check = cwdCheck?.key === cwdKey ? cwdCheck : null;
   const startExts = useNewSessionExtensions(machineId);
   // 选中后扩展被停用 / 移除（别的设备改了设置）：这一节会消失，选择与预填的文字一并作废，
   // 不能把用户已经看不到的内容发出去
@@ -123,13 +158,17 @@ export function NewSessionSheet({
     if (next !== cwd) changeStart(null);
   };
 
+  /** intent 指定、但本设备没有的机器 id；非 null 时不自动选默认机器 */
+  const [intentMissing, setIntentMissing] = useState<string | null>(null);
+
   // 打开时选默认机器（在线优先）
   useEffect(() => {
-    if (!open) return;
+    if (!open || intentMissing !== null) return;
     if (machineId !== '' && machines[machineId] !== undefined) return;
     const first = machineList[0];
     if (first) setMachineId(first.machineId);
-  }, [open, machineId, machineList, machines]);
+    // intentMissing 清掉（上次无效 intent → 这次普通打开）时要重跑，才会补选默认机器
+  }, [open, intentMissing, machineId, machineList, machines]);
 
   // 换机器 / 打开时：对在线机器拉一次常用目录
   useEffect(() => {
@@ -141,6 +180,26 @@ export function NewSessionSheet({
       .catch((err: unknown) => console.info(`[cwd] ${err instanceof Error ? err.message : String(err)}`));
   }, [open, client, machineId, machines, cwdRequested]);
 
+  // 目录一变就预检一次（只读，不新建）：不存在的提前标出来，开始会话时再确认新建
+  useEffect(() => {
+    const path = cwd.trim();
+    if (!open || !client || !canPrepareCwd || path === '') return;
+    const key = `${machineId}\0${path}`;
+    let cancelled = false;
+    client.prepareCwd(machineId, path, false).then(
+      (result) => {
+        if (!cancelled) setCwdCheck({ key, result });
+      },
+      (err: unknown) => {
+        // 超时、断线不算目录的问题：不标，开始会话时会再查一次
+        if (!cancelled && err instanceof CwdPrepareError) setCwdCheck({ key, error: err.message });
+      },
+    );
+    return () => {
+      cancelled = true;
+    };
+  }, [open, client, canPrepareCwd, machineId, cwd]);
+
   // 默认目录：机器的 defaultCwd，其次该机器最近一个会话的 cwd
   useEffect(() => {
     if (!open || machineId === '') return;
@@ -151,6 +210,25 @@ export function NewSessionSheet({
     const next = fav?.defaultCwd ?? recent?.cwd ?? '';
     setCwd((cur) => (cur === '' ? next : cur));
   }, [open, machineId, machines, sessions]);
+
+  // 消费预选 intent：放在上面两个默认值 effect 之后，同一次提交里后写的覆盖先写的。
+  // 只在打开 / intent 变化时跑——machines 刷新不能冲掉用户随后的改选
+  const intentMachine = intent?.machineId;
+  const intentCwd = intent?.cwd;
+  useEffect(() => {
+    if (!open) return;
+    if (intentMachine === undefined || intentCwd === undefined) {
+      setIntentMissing(null);
+      return;
+    }
+    const resolved = resolveNewSessionIntent({ machineId: intentMachine, cwd: intentCwd }, machines);
+    setMachineId(resolved.machineId);
+    setCwd(resolved.cwd);
+    setIntentMissing(resolved.missing ? intentMachine : null);
+    setStart(null);
+    setPrompt('');
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open, intentMachine, intentCwd]);
 
   // 每次打开按设置页的默认值预选（上次没建成的选择不留到下次）
   useEffect(() => {
@@ -179,10 +257,13 @@ export function NewSessionSheet({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open, engineKey]);
 
-  // 换了模型或引擎：之前选的强度新模型不一定有，回到默认
+  // 每次打开、换机器 / 引擎 / 模型，都按该引擎保存的默认强度预选；旧 agent 不发。
   useEffect(() => {
-    setEffort(undefined);
-  }, [engineKey, model]);
+    if (!open) return;
+    setEffort(preferredEffort(engine, model, engineDefault?.effort));
+    // machine.info 刷新不能冲掉本次选择
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open, machineId, engineKey, model]);
   const efforts = effortOptions(engine, model);
 
   const engineModels = engine?.models;
@@ -205,26 +286,62 @@ export function NewSessionSheet({
     if (!client || offline || creating || machineId === '' || cwd.trim() === '') return;
     setCreating(true);
     try {
-      const meta = await client.createSession(machineId, {
-        cwd: cwd.trim(),
-        model: model.trim(),
-        permissionMode: modeState.value,
-        ...(engine === undefined || engine.id === CLAUDE_ENGINE_ID ? {} : { engine: engine.id }),
-        ...(engineMode.value === undefined || !usesCatalog ? {} : { engineMode: engineMode.value }),
-        ...(effort === undefined || efforts === undefined ? {} : { effort }),
-      });
-      const from = startAvailable ? start : null;
-      if (from?.link !== undefined) await linkNewSession(meta.sessionId, from);
-      if (from !== null && prompt.trim() !== '') client.sendInput(machineId, meta.sessionId, prompt.trim());
-      onOpenChange(false);
-      navigate(`/s/${machineId}/${meta.sessionId}`);
+      let target = cwd.trim();
+      if (canPrepareCwd) {
+        // 以开始时这一次为准（预检结果可能已过期：别的设备刚建了 / 删了这个目录）
+        const result = await client.prepareCwd(machineId, target, false);
+        if (result.status === 'missing') {
+          setConfirmCwd(result);
+          return;
+        }
+        target = result.path;
+      }
+      await startSession(target);
     } catch (err) {
-      toast.error('新建会话失败', {
-        description: err instanceof Error ? err.message : String(err),
-      });
+      reportCreateError(err);
     } finally {
       setCreating(false);
     }
+  };
+
+  /** 确认框里点了「新建并开始」：先建目录，再建会话 */
+  const createCwdAndStart = async (): Promise<void> => {
+    if (!client || confirmCwd === null || creating) return;
+    setCreating(true);
+    try {
+      const result = await client.prepareCwd(machineId, confirmCwd.path, true);
+      setConfirmCwd(null);
+      await startSession(result.path);
+    } catch (err) {
+      setConfirmCwd(null);
+      reportCreateError(err);
+    } finally {
+      setCreating(false);
+    }
+  };
+
+  const reportCreateError = (err: unknown): void => {
+    toast.error(err instanceof CwdPrepareError ? '工作目录不可用' : '新建会话失败', {
+      description: err instanceof Error ? err.message : String(err),
+    });
+  };
+
+  /** 目录已就绪后建会话；失败抛给调用方 */
+  const startSession = async (target: string): Promise<void> => {
+    if (!client) return;
+    const meta = await client.createSession(machineId, {
+      cwd: target,
+      model: model.trim(),
+      permissionMode: modeState.value,
+      ...(engine === undefined || engine.id === CLAUDE_ENGINE_ID ? {} : { engine: engine.id }),
+      ...(engineMode.value === undefined || !usesCatalog ? {} : { engineMode: engineMode.value }),
+      ...(effort === undefined || efforts?.efforts.includes(effort) !== true ? {} : { effort }),
+    });
+    const from = startAvailable ? start : null;
+    if (from?.link !== undefined) await linkNewSession(meta.sessionId, from);
+    if (from !== null && prompt.trim() !== '') client.sendInput(machineId, meta.sessionId, prompt.trim());
+    onOpenChange(false);
+    navigate(`/s/${machineId}/${meta.sessionId}`);
   };
 
   /** 关联失败不挡建会话：会话已经建好，提示用户手动关联 */
@@ -249,7 +366,7 @@ export function NewSessionSheet({
 
   return (
     <Sheet open={open} onOpenChange={onOpenChange}>
-      <SheetContent side="bottom" className="max-h-[88dvh] overflow-y-auto" data-testid="new-session-sheet">
+      <SheetContent side="bottom" className="max-h-[88dvh] overflow-y-auto min-[900px]:mx-auto min-[900px]:max-w-2xl" data-testid="new-session-sheet">
         <SheetHeader>
           <SheetTitle>新建会话</SheetTitle>
           <SheetDescription>全部字段有默认值——两击可建。</SheetDescription>
@@ -272,6 +389,7 @@ export function NewSessionSheet({
                       onClick={() => {
                         setMachineId(m.machineId);
                         setCwd('');
+                        setIntentMissing(null);
                         changeStart(null);
                       }}
                     >
@@ -285,6 +403,11 @@ export function NewSessionSheet({
                     {OFFLINE_HINT}
                   </p>
                 )}
+                {intentMissing !== null && machineId === '' && (
+                  <p data-testid="ns-intent-missing" className="text-amber mt-1.5 text-[11.5px]">
+                    {INTENT_MISSING_HINT}
+                  </p>
+                )}
               </section>
 
               <section>
@@ -292,6 +415,7 @@ export function NewSessionSheet({
                 <CwdPicker
                   favorites={machine?.cwd?.favorites ?? []}
                   defaultCwd={machine?.cwd?.defaultCwd ?? ''}
+                  home={machine?.info?.files?.home}
                   value={cwd}
                   onChange={changeCwd}
                   disabled={offline}
@@ -299,7 +423,21 @@ export function NewSessionSheet({
                   onAdd={(p) => client?.send(machineId, { type: 'cwd.add', path: p })}
                   onRemove={(p) => client?.send(machineId, { type: 'cwd.remove', path: p })}
                   onSetDefault={(p) => client?.send(machineId, { type: 'cwd.setDefault', path: p })}
+                  onCopy={(p) => {
+                    copyCwd(p).catch(() => {});
+                  }}
+                  {...(check?.result?.status === 'missing' ? { customNote: '将新建' } : {})}
                 />
+                {check?.result?.status === 'missing' && (
+                  <p data-testid="ns-cwd-missing" className="text-amber mt-1.5 text-[11.5px]">
+                    这个目录还不存在，开始会话时会先确认新建。
+                  </p>
+                )}
+                {check?.error !== undefined && (
+                  <p data-testid="ns-cwd-error" className="text-red mt-1.5 text-[11.5px]">
+                    {check.error}
+                  </p>
+                )}
               </section>
 
               {!offline && startExts.length > 0 && (
@@ -336,6 +474,7 @@ export function NewSessionSheet({
                         selected={engine?.id === e.id}
                         onClick={() => setEngineId(e.id)}
                       >
+                        <EngineIcon engineId={e.id} className="size-3" />
                         {e.displayName}
                       </Chip>
                     ))}
@@ -463,6 +602,33 @@ export function NewSessionSheet({
             </>
           )}
         </div>
+        <ConfirmDialog
+          open={confirmCwd !== null}
+          onOpenChange={(next) => {
+            if (!next && !creating) setConfirmCwd(null);
+          }}
+          title="新建工作目录？"
+          description={
+            <>
+              <p>
+                这个目录在 {machine?.name ?? '这台机器'} 上还不存在。将新建以下目录，然后在里面开始会话：
+              </p>
+              <ul data-testid="ns-cwd-confirm-list" className="bg-surface-2 flex flex-col gap-1 rounded-[10px] px-2.5 py-1.5 font-mono text-xs break-all">
+                {(confirmCwd?.missing ?? []).map((p) => (
+                  <li key={p} className="flex gap-1.5">
+                    <span aria-hidden className="text-brand shrink-0">+</span>
+                    <span>{p}</span>
+                  </li>
+                ))}
+              </ul>
+            </>
+          }
+          confirmLabel="新建并开始"
+          destructive={false}
+          busy={creating}
+          onConfirm={() => void createCwdAndStart()}
+          testId="ns-cwd-confirm"
+        />
       </SheetContent>
     </Sheet>
   );

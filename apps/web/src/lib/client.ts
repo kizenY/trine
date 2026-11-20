@@ -22,12 +22,19 @@
 import { sodiumReady } from '@trine/core/crypto';
 import { AuthClient, BlobClient, BlobClientError, httpBase, type AuthToken, type BlobConfig } from '@trine/core/net';
 import { ATTACHMENT_NAME_MAX } from '@trine/core/types';
+import { movePinOrder, normalizePinOrder } from '@trine/core/protocol';
 import { attachmentKind, attachmentRefs } from './attachment-model.ts';
 import { encryptFile, maybeCompressImage, xhrUpload, type UploadFn } from './attachment-transfer.ts';
 import type {
   AgentToClientEvent,
   AttachmentRef,
+  CwdPinMoveErrorCode,
+  CwdPrepareErrorCode,
+  CwdPrepareStatus,
   FsEntry,
+  FilesBookmarkErrorCode,
+  FilesTrustErrorCode,
+  FsDeniedReason,
   FsErrorCode,
   FsFile,
   PermissionMode,
@@ -39,6 +46,7 @@ import type {
 } from '@trine/core';
 import type { Clock, DocStore, KvAdapter, SocketFactory } from './adapters.ts';
 import { Connection, type ConnectionSnapshot } from './connection.ts';
+import { FileCache, type FileLease } from './file-cache.ts';
 import { Inbound, type DroppedInfo } from './envelope.ts';
 import { ensureIdentity } from './identity.ts';
 import { Outbox, OutboxScopeFatalError, type OutboundBody } from './outbox.ts';
@@ -241,6 +249,11 @@ export type ClaudeUpdateResult = Extract<AgentToClientEvent, { type: 'machine.cl
 /** 其他引擎的更新、检查应答；ok 为 false 也照常返回 */
 export type EngineUpdateResult = Extract<AgentToClientEvent, { type: 'machine.engine.update.response' }>;
 export type EngineCheckResult = Extract<AgentToClientEvent, { type: 'machine.engine.check.response' }>;
+export type EngineRestartResult = Extract<AgentToClientEvent, { type: 'machine.engine.restart.response' }>;
+export type EngineAutoUpdateResult = Extract<AgentToClientEvent, { type: 'machine.engine.autoupdate.response' }>;
+
+/** 重启引擎后台进程要等新进程起来、daemon 重启（agent 侧 daemon 上限 60 秒） */
+export const ENGINE_RESTART_TIMEOUT_MS = 2 * 60_000;
 
 /** 配对流程（pairing.ts）成功后交给 client 的结果 */
 export interface PairingResult {
@@ -295,9 +308,16 @@ export class TrineClient {
   readonly #attachmentUrls = new Map<string, string>();
   /** 附件加载的在途请求：key = timelineKey + 条目 id + 下标 */
   readonly #attachmentInflight = new Map<string, Promise<string>>();
-  /** 文件预览缓存：`machine#session#请求路径` → 已下载的文件（刷新时替换并释放旧 URL） */
-  readonly #files = new Map<string, OpenedFile>();
-  readonly #fileInflight = new Map<string, Promise<OpenedFile>>();
+  /**
+   * 文件预览缓存：`machine#session#请求路径` → 已下载的文件。LRU + 引用计数（见 file-cache.ts）：
+   * 可见的视图占着的 URL 不会被淘汰 / 刷新释放掉
+   */
+  readonly #files = new FileCache<OpenedFile>({
+    maxEntries: FILE_CACHE_MAX_ENTRIES,
+    maxBytes: FILE_CACHE_MAX_BYTES,
+    sizeOf: (f) => f.file.size,
+    revoke: (url) => URL.revokeObjectURL(url),
+  });
   #blobClient: BlobClient | null = null;
   #blobConfig: Promise<BlobConfig> | null = null;
   readonly #listeners = new Map<keyof ClientEvents, Set<Listener>>();
@@ -1183,7 +1203,7 @@ export class TrineClient {
     });
     if (res.type !== 'fs.list.response') throw new Error(`意外的应答 ${res.type}`);
     if (!res.ok || res.path === undefined || res.root === undefined || res.entries === undefined) {
-      throw new FsRequestError(res.error?.code ?? 'io', res.error?.message ?? '读取目录失败');
+      throw new FsRequestError(res.error?.code ?? 'io', res.error?.message ?? '读取目录失败', res.error?.reason);
     }
     return { path: res.path, root: res.root, entries: res.entries, truncated: res.truncated === true };
   }
@@ -1193,56 +1213,42 @@ export class TrineClient {
    * `refresh` 时重新向 agent 要（旧的对象 URL 释放）。
    */
   openFile(machineId: string, sessionId: string, path: string, options: { refresh?: boolean } = {}): Promise<OpenedFile> {
-    const key = `${machineId}#${sessionId}#${path}`;
-    const cached = this.#files.get(key);
-    if (cached !== undefined && options.refresh !== true) {
-      // Map 的插入顺序即 LRU 顺序：命中就挪到最新
-      this.#files.delete(key);
-      this.#files.set(key, cached);
-      return Promise.resolve(cached);
-    }
-    const inflight = this.#fileInflight.get(key);
-    if (inflight !== undefined) return inflight;
-    const task = (async () => {
-      const res = await this.request<Extract<OutboundBody, { type: 'fs.read.request' }>>(
-        machineId,
-        { type: 'fs.read.request', sessionId, path },
-        { timeoutMs: Math.max(this.#requestTimeoutMs, 60_000) },
-      );
-      if (res.type !== 'fs.read.response') throw new Error(`意外的应答 ${res.type}`);
-      if (!res.ok || res.file === undefined) throw new FsRequestError(res.error?.code ?? 'io', res.error?.message ?? '读取文件失败');
-      const file = res.file;
-      const parts: Uint8Array[] = [];
-      await this.#blobs().downloadDecrypted(file.blobId, file.key, (chunk) => {
-        parts.push(chunk);
-      }, { maxBytes: file.size });
-      const blob = new Blob(parts as BlobPart[], { type: file.mime === '' ? 'application/octet-stream' : file.mime });
-      const url = createObjectUrl(blob);
-      if (url === undefined) throw new Error('当前环境无法显示文件');
-      const opened: OpenedFile = { file, blob, url };
-      const old = this.#files.get(key);
-      if (old !== undefined) URL.revokeObjectURL(old.url);
-      this.#files.delete(key);
-      this.#files.set(key, opened);
-      this.#trimFileCache();
-      return opened;
-    })().finally(() => {
-      this.#fileInflight.delete(key);
+    // 不需要占用（测试 / 一次性读取）：拿到即释放租约，URL 由缓存照常管理
+    return this.openFileLease(machineId, sessionId, path, options).then(({ value, release }) => {
+      release();
+      return value;
     });
-    this.#fileInflight.set(key, task);
-    return task;
   }
 
-  /** 文件缓存按条数与总字节淘汰最旧的（最新那个即使超额也留着：它正在显示） */
-  #trimFileCache(): void {
-    let total = 0;
-    for (const f of this.#files.values()) total += f.file.size;
-    for (const [key, f] of this.#files) {
-      if (this.#files.size <= 1 || (this.#files.size <= FILE_CACHE_MAX_ENTRIES && total <= FILE_CACHE_MAX_BYTES)) break;
-      URL.revokeObjectURL(f.url);
-      this.#files.delete(key);
-      total -= f.file.size;
+  /**
+   * 打开文件并占住它的对象 URL（租约在结果交给调用方之前就已取得，见 file-cache.ts）：
+   * 显示它的视图在取消加载、卸载、换内容时调 `release`。占用期间 LRU 不淘汰它，
+   * 刷新替换后也等最后一个使用者释放才 revoke。
+   */
+  openFileLease(machineId: string, sessionId: string, path: string, options: { refresh?: boolean } = {}): Promise<FileLease<OpenedFile>> {
+    const key = `${machineId}#${sessionId}#${path}`;
+    return this.#files.load(key, () => this.#downloadFile(machineId, sessionId, path), options);
+  }
+
+  async #downloadFile(machineId: string, sessionId: string, path: string): Promise<OpenedFile> {
+    const res = await this.request<Extract<OutboundBody, { type: 'fs.read.request' }>>(
+      machineId,
+      { type: 'fs.read.request', sessionId, path },
+      { timeoutMs: Math.max(this.#requestTimeoutMs, 60_000) },
+    );
+    if (res.type !== 'fs.read.response') throw new Error(`意外的应答 ${res.type}`);
+    if (!res.ok || res.file === undefined) {
+      throw new FsRequestError(res.error?.code ?? 'io', res.error?.message ?? '读取文件失败', res.error?.reason);
     }
+    const file = res.file;
+    const parts: Uint8Array[] = [];
+    await this.#blobs().downloadDecrypted(file.blobId, file.key, (chunk) => {
+      parts.push(chunk);
+    }, { maxBytes: file.size });
+    const blob = new Blob(parts as BlobPart[], { type: file.mime === '' ? 'application/octet-stream' : file.mime });
+    const url = createObjectUrl(blob);
+    if (url === undefined) throw new Error('当前环境无法显示文件');
+    return { file, blob, url };
   }
 
   #blobs(): BlobClient {
@@ -1367,6 +1373,66 @@ export class TrineClient {
    */
   pinWorkspace(machineId: string, cwd: string, pinned: boolean): boolean {
     return this.send(machineId, { type: 'cwd.pin', path: cwd, pinned });
+  }
+
+  /**
+   * 调整置顶工作区的顺序（pin-order，只对 `machine.info.cwd.pinOrder` 为真的 agent 调）：把 cwd 移到
+   * before 之前（null = 末尾）。先乐观改本地 pinOrder，以 agent 的应答 / `cwd.updated` 广播为准；
+   * 失败（被拒、超时）时若本地仍是这次的乐观值就回滚，再重拉一次 cwd 快照，然后抛出
+   * （被拒是 `CwdPinMoveError`）。cwd / before 按目录身份认（core normalizeCwdPath / movePinOrder，与 agent 同一规则）。
+   *
+   * - **不进离线队列**：与 relay 的连接不在（或机器离线）就直接拒绝，不做乐观更新——排队的移动在重连后
+   *   补发，可能覆盖用户之后在别的设备上调好的顺序。万一帧仍落进了待发队列，超时时撤掉它。
+   * - **每台机器同时只有一个在途移动**（`MachineState.pinMoving`）：快照永远是已确认的状态，失败回滚
+   *   不会恢复到上一个已失败的乐观值。在途时再调直接拒绝，界面据 pinMoving 禁用入口。
+   */
+  async movePinnedWorkspace(
+    machineId: string,
+    cwd: string,
+    before: string | null,
+    options: { timeoutMs?: number } = {},
+  ): Promise<void> {
+    const machine = this.#machines.get(machineId);
+    if (this.#connection?.isOpen !== true) throw new Error('与中继的连接已断开，暂不能调整顺序');
+    if (machine?.online !== true) throw new Error('机器离线，暂不能调整顺序');
+    if (machine.pinMoving === true) throw new Error('上一次调整还没完成');
+    const snap = machine.cwd;
+    let optimistic: string[] | undefined;
+    if (snap?.pinned !== undefined) {
+      const next = movePinOrder(normalizePinOrder(snap.pinOrder, snap.pinned), cwd, before);
+      if (Array.isArray(next)) optimistic = next;
+    }
+    this.#updateMachine(machineId, (m) => ({
+      ...m,
+      pinMoving: true,
+      ...(optimistic === undefined || m.cwd === null ? {} : { cwd: { ...m.cwd, pinOrder: optimistic } }),
+    }));
+    const reqId = this.#uuid();
+    try {
+      const res = await this.request<Extract<OutboundBody, { type: 'cwd.pin.move' }>>(machineId, {
+        type: 'cwd.pin.move',
+        reqId,
+        path: cwd,
+        before,
+      }, options);
+      if (res.type !== 'cwd.pin.move.response') throw new Error(`意外的应答 ${res.type}`);
+      if (!res.ok) throw new CwdPinMoveError(res.error?.code ?? 'failed', res.error?.message ?? '调整顺序失败');
+    } catch (err) {
+      // 还在待发队列里（断线后入队）的就撤掉：失败已经报给用户，重连后不能再补发
+      if (this.#outbox.cancelQueued(machineId, (e) => e.type === 'cwd.pin.move' && e.reqId === reqId)) this.#emitQueue();
+      this.#updateMachine(machineId, (m) => {
+        const { pinMoving: _done, ...rest } = m;
+        if (optimistic === undefined || rest.cwd === null || rest.cwd.pinOrder !== optimistic) return rest;
+        const { pinOrder: _drop, ...cwdRest } = rest.cwd;
+        return { ...rest, cwd: snap?.pinOrder === undefined ? cwdRest : { ...cwdRest, pinOrder: snap.pinOrder } };
+      });
+      if (this.#connection?.isOpen === true) void this.request(machineId, { type: 'cwd.list.request' }).catch(() => undefined);
+      throw err;
+    }
+    this.#updateMachine(machineId, (m) => {
+      const { pinMoving: _done, ...rest } = m;
+      return rest;
+    });
   }
 
   async deleteSession(machineId: string, sessionId: string): Promise<void> {
@@ -1544,6 +1610,8 @@ export class TrineClient {
     )
       .then((res) => {
         if (res.type !== 'session.history.response') throw new Error(`意外的应答 ${res.type}`);
+        // agent ≥ 0.29.1 读取出错时回空页带 error：不合并（否则会当成「已读完、没有更早的」），按失败处理可重试
+        if (res.error !== undefined) throw new Error(res.error.message);
         this.#updateTimeline(machineId, sessionId, (tl) => mergeHistory(tl, res));
       })
       .finally(() => {
@@ -1878,6 +1946,34 @@ export class TrineClient {
     return res;
   }
 
+  /** 重启引擎的后台进程（capabilities.restart 为真才支持）；ok 为 false 也照常返回 */
+  async restartEngine(machineId: string, engine: string): Promise<EngineRestartResult> {
+    let res: AgentToClientEvent;
+    try {
+      res = await this.request<Extract<OutboundBody, { type: 'machine.engine.restart.request' }>>(
+        machineId,
+        { type: 'machine.engine.restart.request', engine },
+        { timeoutMs: ENGINE_RESTART_TIMEOUT_MS },
+      );
+    } catch (err) {
+      if (err instanceof RequestTimeoutError) throw new RequestTimeoutError(err.requestType, err.timeoutMs, MUTATE_TIMEOUT_HINT);
+      throw err;
+    }
+    if (res.type !== 'machine.engine.restart.response') throw new Error(`意外的应答 ${res.type}`);
+    return res;
+  }
+
+  /** 打开 / 关闭引擎自动更新（EngineSummary.autoUpdate 存在才支持）；ok 为 false 也照常返回 */
+  async setEngineAutoUpdate(machineId: string, engine: string, enabled: boolean): Promise<EngineAutoUpdateResult> {
+    const res = await this.request<Extract<OutboundBody, { type: 'machine.engine.autoupdate.set' }>>(machineId, {
+      type: 'machine.engine.autoupdate.set',
+      engine,
+      enabled,
+    });
+    if (res.type !== 'machine.engine.autoupdate.response') throw new Error(`意外的应答 ${res.type}`);
+    return res;
+  }
+
   /** 立即查其他引擎的最新版本；失败处理同 checkClaude */
   async checkEngine(machineId: string, engine: string): Promise<EngineCheckResult> {
     let res: AgentToClientEvent;
@@ -1893,6 +1989,60 @@ export class TrineClient {
     }
     if (res.type !== 'machine.engine.check.response') throw new Error(`意外的应答 ${res.type}`);
     return res;
+  }
+
+  /**
+   * 检查（`create: false`）或创建（`create: true`）新会话的工作目录（cwd-create，只对
+   * `machine.info.cwd.create` 为真的 agent 调）。返回解析后的路径与状态；被拒抛 `CwdPrepareError`。
+   * 创建失败（超时、断线）时撤掉仍在待发队列里的帧：用户已经看到失败，重连后不该再悄悄建目录。
+   */
+  async prepareCwd(machineId: string, path: string, create: boolean): Promise<CwdPrepareResult> {
+    const reqId = this.#uuid();
+    let res: AgentToClientEvent;
+    try {
+      res = await this.request<Extract<OutboundBody, { type: 'cwd.prepare.request' }>>(machineId, {
+        type: 'cwd.prepare.request',
+        reqId,
+        path,
+        create,
+      });
+    } catch (err) {
+      if (this.#outbox.cancelQueued(machineId, (e) => e.type === 'cwd.prepare.request' && e.reqId === reqId)) this.#emitQueue();
+      throw err;
+    }
+    if (res.type !== 'cwd.prepare.response') throw new Error(`意外的应答 ${res.type}`);
+    if (!res.ok || res.path === undefined || res.status === undefined) {
+      throw new CwdPrepareError(res.error?.code ?? 'failed', res.error?.message ?? '检查工作目录失败');
+    }
+    return { path: res.path, status: res.status, missing: res.missing ?? [] };
+  }
+
+  /**
+   * 增删信任目录（agent ≥ 0.24.0，machine.info.files.roots 存在才支持）。成功后 agent 重发
+   * machine.info（列表以那里为准）；add 返回 agent 实际存下的路径。被拒抛 `FilesTrustError`。
+   */
+  async setDirTrusted(machineId: string, path: string, trusted: boolean): Promise<string> {
+    const res = await this.request<Extract<OutboundBody, { type: 'files.trust.add' | 'files.trust.remove' }>>(machineId, {
+      type: trusted ? 'files.trust.add' : 'files.trust.remove',
+      path,
+    });
+    if (res.type !== 'files.trust.response') throw new Error(`意外的应答 ${res.type}`);
+    if (!res.ok) throw new FilesTrustError(res.error?.code ?? 'failed', res.error?.message ?? '操作失败');
+    return res.path ?? path;
+  }
+
+  /**
+   * 增删文件书签（agent ≥ 0.30.0，machine.info.files.bookmarks 存在才支持）。成功后 agent 重发
+   * machine.info（列表以那里为准，所有设备同步）；返回 agent 规范化后的路径。被拒抛 `FilesBookmarkError`。
+   */
+  async setFileBookmark(machineId: string, path: string, kind: 'dir' | 'file' | null): Promise<string> {
+    const res =
+      kind === null
+        ? await this.request<Extract<OutboundBody, { type: 'files.bookmark.remove' }>>(machineId, { type: 'files.bookmark.remove', path })
+        : await this.request<Extract<OutboundBody, { type: 'files.bookmark.add' }>>(machineId, { type: 'files.bookmark.add', path, kind });
+    if (res.type !== 'files.bookmark.response') throw new Error(`意外的应答 ${res.type}`);
+    if (!res.ok) throw new FilesBookmarkError(res.error?.code ?? 'failed', res.error?.message ?? '操作失败');
+    return res.path ?? path;
   }
 
   /**
@@ -2308,9 +2458,60 @@ export interface OpenedFile {
 /** agent 拒绝了文件查看请求（code 见协议 FsErrorCode） */
 export class FsRequestError extends Error {
   readonly code: FsErrorCode;
-  constructor(code: FsErrorCode, message: string) {
+  /** denied 的细分（agent ≥ 0.24.0）：out_of_scope 可以去信任，sensitive 不行；旧 agent 不带 */
+  readonly reason: FsDeniedReason | undefined;
+  constructor(code: FsErrorCode, message: string, reason?: FsDeniedReason) {
     super(message);
     this.name = 'FsRequestError';
+    this.code = code;
+    this.reason = reason;
+  }
+}
+
+/** agent 拒绝了置顶重排（code 见协议 CwdPinMoveErrorCode） */
+export class CwdPinMoveError extends Error {
+  readonly code: CwdPinMoveErrorCode;
+  constructor(code: CwdPinMoveErrorCode, message: string) {
+    super(message);
+    this.name = 'CwdPinMoveError';
+    this.code = code;
+  }
+}
+
+/** cwd.prepare 的结果（见 CwdPrepareResponseSchema） */
+export interface CwdPrepareResult {
+  path: string;
+  status: CwdPrepareStatus;
+  /** missing / created：要新建（已新建）的各级目录，从浅到深 */
+  missing: string[];
+}
+
+/** agent 拒绝了工作目录的检查 / 创建（code 见协议 CwdPrepareErrorCode） */
+export class CwdPrepareError extends Error {
+  readonly code: CwdPrepareErrorCode;
+  constructor(code: CwdPrepareErrorCode, message: string) {
+    super(message);
+    this.name = 'CwdPrepareError';
+    this.code = code;
+  }
+}
+
+/** agent 拒绝了书签的增删（code 见协议 FilesBookmarkErrorCode） */
+export class FilesBookmarkError extends Error {
+  readonly code: FilesBookmarkErrorCode;
+  constructor(code: FilesBookmarkErrorCode, message: string) {
+    super(message);
+    this.name = 'FilesBookmarkError';
+    this.code = code;
+  }
+}
+
+/** agent 拒绝了信任目录的增删（code 见协议 FilesTrustErrorCode） */
+export class FilesTrustError extends Error {
+  readonly code: FilesTrustErrorCode;
+  constructor(code: FilesTrustErrorCode, message: string) {
+    super(message);
+    this.name = 'FilesTrustError';
     this.code = code;
   }
 }

@@ -17,8 +17,9 @@ import {
   machineVersionLine,
   parkedWarnLine,
 } from './machine-text.ts';
-import { claudeUpdateHint } from './claude-update.ts';
+import { engineUpdateHints } from './claude-update.ts';
 import { EngineUsageLines, PlanUsageLine } from '@/components/usage/PlanUsage.tsx';
+import { hasMultipleEngines } from '@/lib/engine-model.ts';
 import { MachineStatsLine } from './MachineStats.tsx';
 
 export function MachineCard({
@@ -39,7 +40,7 @@ export function MachineCard({
   const platform = machinePlatformLine(machine.info);
   const live = liveSessionsLine(liveCount, machine.info?.maxSessions);
   const warn = parkedWarnLine(machine.parkedCount);
-  const claudeHint = claudeUpdateHint(machine.info);
+  const updateHints = engineUpdateHints(machine.info);
 
   return (
     <NavLink
@@ -56,6 +57,15 @@ export function MachineCard({
         <span className="min-w-0 flex-1 truncate font-mono text-[15px] font-semibold">
           {machine.name}
         </span>
+        {updateHints.length > 0 && (
+          <span
+            className="bg-red-soft text-red shrink-0 rounded-full px-1.5 py-px text-[11px] font-medium"
+            data-testid="machine-update-badge"
+            title={updateHints.join('\n')}
+          >
+            有更新
+          </span>
+        )}
         {platform !== '' && <span className="text-text-3 shrink-0 text-[11.5px]">{platform}</span>}
       </div>
 
@@ -66,11 +76,11 @@ export function MachineCard({
         <span className="font-mono text-[11.5px]" data-testid="machine-versions">
           {machineVersionLine(machine.info)}
         </span>
-        {claudeHint !== '' && (
-          <span className="text-amber font-mono text-[11.5px]" data-testid="machine-claude-update">
-            {claudeHint}
+        {updateHints.map((hint) => (
+          <span key={hint} className="text-amber font-mono text-[11.5px]" data-testid="machine-engine-update">
+            {hint}
           </span>
-        )}
+        ))}
         {activeCount > 0 && <span className="text-brand-ink">{activeCount} 个活跃会话</span>}
         {live !== '' && (
           <span className="tabular" data-testid="machine-live">
@@ -79,7 +89,7 @@ export function MachineCard({
         )}
       </div>
 
-      <PlanUsageLine rateLimits={machine.info?.rateLimits} now={now ?? Date.now()} interactive={false} className="text-text-2 mt-1.5" />
+      <PlanUsageLine rateLimits={machine.info?.rateLimits} now={now ?? Date.now()} interactive={false} label={hasMultipleEngines(machine.info) ? 'icon' : 'none'} className="text-text-2 mt-1.5" />
       <EngineUsageLines info={machine.info} now={now ?? Date.now()} interactive={false} className="text-text-2 mt-1.5" />
       <MachineStatsLine machine={machine} now={now ?? Date.now()} intervalMs={statsIntervalMs} className="text-text-2 mt-1.5 flex" />
 

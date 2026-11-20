@@ -8,7 +8,7 @@
  * 列表页、PC 侧栏、归档视图、机器详情四个调用点共用这一个函数；零 React、
  * 零浏览器全局，全部单测覆盖（filtering.test.ts）。
  */
-import { CLAUDE_ENGINE_ID, type SessionMeta, type SessionState } from '@trine/core';
+import { CLAUDE_ENGINE_ID, mergePinnedCwds, normalizeCwdPath, type SessionMeta, type SessionState } from '@trine/core';
 import { comparePinned, compareSessions, STATE_RANK, type SessionRowData } from './sorting.ts';
 
 /**
@@ -129,10 +129,9 @@ export interface FilterResult {
   empty: EmptyReason | null;
 }
 
-/** cwd 规范化：去尾 `/`，但根目录 `/` 保持为 `/` */
+/** cwd 规范化：去尾 `/`，但根目录 `/` 保持为 `/`（与 agent 置顶的目录身份同一个函数） */
 export function normalizeCwd(cwd: string): string {
-  const trimmed = cwd.replace(/\/+$/, '');
-  return trimmed === '' && cwd !== '' ? '/' : trimmed;
+  return normalizeCwdPath(cwd);
 }
 
 export function groupKey(machineId: string, cwd: string): string {
@@ -191,24 +190,83 @@ export function workspaceCreatedAt(sessions: Record<string, Record<string, Sessi
 
 /** 某机器的置顶工作区按规范化 cwd 查（agent 按字面存，旧数据可能带尾 `/`） */
 function pinnedLookup(pinned: PinnedCwds, machineId: string): Map<string, number> {
-  const out = new Map<string, number>();
-  for (const [cwd, at] of Object.entries(pinned[machineId] ?? {})) out.set(normalizeCwd(cwd), at);
-  return out;
+  // 同一目录的多种拼写合并成一条（保留较早置顶时间），与 agent 读入时同一规则
+  return new Map(Object.entries(mergePinnedCwds(pinned[machineId] ?? {})));
+}
+
+/** 机器 → 置顶工作区的有效顺序（规范化 cwd，见 pin-order.ts effectivePinOrder） */
+export type PinOrders = Record<string, readonly string[] | undefined>;
+
+/** 置顶排序的上下文（plan §1） */
+export interface PinSortContext {
+  /** 每台机器的手动顺序；某台没有 = 按置顶时间倒序（旧 agent） */
+  pinOrder?: PinOrders;
+  /** 稳定的机器顺序：置顶区按它分段；不在里面的排后面、按 machineId */
+  machineOrder?: readonly string[];
 }
 
 /**
- * 按工作空间分组。组序：置顶（越晚置顶越靠上）→ 工作区创建时间倒序（新的在上）→ key。
+ * 置顶组之间的先后：先按机器分段（稳定的机器顺序），段内按该机器的手动顺序，没有就按置顶时间倒序。
+ * 只在两组都置顶时有意义。
+ */
+function comparePinnedGroups(a: SessionGroup, b: SessionGroup, ctx: PinSortContext, machineRank: Map<string, number>): number {
+  if (a.machineId !== b.machineId) {
+    const ra = machineRank.get(a.machineId) ?? Number.POSITIVE_INFINITY;
+    const rb = machineRank.get(b.machineId) ?? Number.POSITIVE_INFINITY;
+    if (ra !== rb) return ra < rb ? -1 : 1;
+    return a.machineId < b.machineId ? -1 : 1;
+  }
+  const order = ctx.pinOrder?.[a.machineId];
+  if (order !== undefined) {
+    const ia = order.indexOf(a.cwd);
+    const ib = order.indexOf(b.cwd);
+    const pa = ia < 0 ? Number.POSITIVE_INFINITY : ia;
+    const pb = ib < 0 ? Number.POSITIVE_INFINITY : ib;
+    if (pa !== pb) return pa < pb ? -1 : 1;
+  }
+  return comparePinned(a.pinnedAt, b.pinnedAt);
+}
+
+/**
+ * 按工作空间分组。组序：置顶区（按机器分段，段内按手动顺序 / 置顶时间倒序，见 comparePinnedGroups）
+ * → 工作区创建时间倒序（新的在上）→ key。
  * 刻意不看组内状态与最后活动——组不该因为某个会话开始跑或在等批准就跳位置
  * （sidebar-pin）；待批准靠组头角标和强制展开提示。组内 compareSessions。
  *
  * `createdAt` 给了就按它（全量会话推出来的，见 workspaceCreatedAt），没给的组用组内行算。
+ *
+ * `emptyPinnedFor` 给了：这些机器上置顶、但结果里没有行的工作区补成空组（plan §2），
+ * 按规范化 cwd 去重。调用方负责只在非归档、无搜索/筛选时给。
  */
 export function groupRows(
   rows: SessionRowData[],
-  ctx: { pinned?: PinnedCwds; createdAt?: ReadonlyMap<string, number> } = {},
+  ctx: {
+    pinned?: PinnedCwds;
+    createdAt?: ReadonlyMap<string, number>;
+    emptyPinnedFor?: Iterable<string>;
+  } & PinSortContext = {},
 ): SessionGroup[] {
   const map = new Map<string, SessionGroup>();
   const pins = new Map<string, Map<string, number>>();
+  for (const machineId of ctx.emptyPinnedFor ?? []) {
+    for (const [cwd, pinnedAt] of pinnedLookup(ctx.pinned ?? {}, machineId)) {
+      if (cwd === '') continue;
+      const key = groupKey(machineId, cwd);
+      if (map.has(key)) continue;
+      map.set(key, {
+        key,
+        machineId,
+        cwd,
+        rows: [],
+        rank: Number.POSITIVE_INFINITY,
+        lastActivityAt: 0,
+        createdAt: ctx.createdAt?.get(key) ?? Number.POSITIVE_INFINITY,
+        pinnedAt,
+        waitingCount: 0,
+        runningCount: 0,
+      });
+    }
+  }
   for (const row of rows) {
     const cwd = normalizeCwd(row.meta.cwd);
     const key = groupKey(row.machineId, cwd);
@@ -245,12 +303,17 @@ export function groupRows(
   }
   const groups = [...map.values()];
   for (const g of groups) g.rows.sort(compareSessions);
-  return groups.sort(
-    (a, b) =>
-      comparePinned(a.pinnedAt, b.pinnedAt) ||
+  const machineRank = new Map((ctx.machineOrder ?? []).map((id, i) => [id, i] as const));
+  return groups.sort((a, b) => {
+    const ap = a.pinnedAt !== undefined;
+    const bp = b.pinnedAt !== undefined;
+    if (ap !== bp) return ap ? -1 : 1;
+    return (
+      (ap ? comparePinnedGroups(a, b, ctx, machineRank) : 0) ||
       b.createdAt - a.createdAt ||
-      (a.key < b.key ? -1 : a.key > b.key ? 1 : 0),
-  );
+      (a.key < b.key ? -1 : a.key > b.key ? 1 : 0)
+    );
+  });
 }
 
 /**
@@ -316,6 +379,7 @@ export function filterSessions(
   machineNames: Record<string, string> = {},
   pinnedCwds: PinnedCwds = {},
   doneAt: Record<string, number> = {},
+  pinSort: PinSortContext = {},
 ): FilterResult {
   // 1. 机器（顺手带上「已完成」本地标记，后续状态筛选 / 排序要用）
   const scoped: SessionRowData[] = [];
@@ -361,13 +425,22 @@ export function filterSessions(
 
   // 6 + 7. 分组 / 排序
   const rows = searched.sort(compareSessions);
+  // 置顶的空工作区照常显示（plan §2）：归档视图、搜索 / 筛选中不补——那时要看的是命中结果。
+  // 机器范围取 pinnedCwds 的键（调用方从现存机器建，被移除的机器自然不在）
+  const emptyPinnedFor =
+    query.archived || isFiltering(query)
+      ? []
+      : query.machine === null
+        ? Object.keys(pinnedCwds)
+        : [query.machine];
   const groups =
     query.groupBy === 'workspace'
-      ? groupRows(rows, { pinned: pinnedCwds, createdAt: workspaceCreatedAt(sessions) })
+      ? groupRows(rows, { ...pinSort, pinned: pinnedCwds, createdAt: workspaceCreatedAt(sessions), emptyPinnedFor })
       : null;
 
   let empty: EmptyReason | null = null;
-  if (rows.length === 0) {
+  // 有可显示的分组（哪怕全是空的置顶组）就不走空态
+  if (rows.length === 0 && (groups === null || groups.length === 0)) {
     if (scoped.length === 0) empty = query.machine === null ? 'no-sessions' : 'machine-empty';
     else if (viewRows.length === 0) empty = query.archived ? 'archived-empty' : 'all-archived';
     else if (kept.length === 0) empty = 'all-temp';
@@ -389,7 +462,7 @@ export function emptyText(
   switch (reason) {
     case 'no-sessions':
       return opts.compact
-        ? '还没有会话，点下方「新建」开一个。'
+        ? '还没有会话，点「新建」开一个。'
         : '还没有会话，点右下角「+」新建一个。';
     case 'machine-empty':
       return '这台机器上还没有会话。';
