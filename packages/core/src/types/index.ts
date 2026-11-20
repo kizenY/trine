@@ -464,6 +464,23 @@ export const EngineInstallSchema = z.object({
 });
 export type EngineInstall = z.infer<typeof EngineInstallSchema>;
 
+/** 引擎自动更新的状态（EngineSummary.autoUpdate） */
+export const EngineAutoUpdateSchema = z.object({
+  enabled: z.boolean(),
+  /** 最近一次自动更新（手动更新不记在这里）；还没自动更新过就省略 */
+  last: z
+    .object({
+      at: TimestampSchema,
+      ok: z.boolean(),
+      fromVersion: z.string().max(64),
+      toVersion: z.string().max(64),
+      /** ok 为 false 时的原因 */
+      error: z.string().max(300).optional(),
+    })
+    .optional(),
+});
+export type EngineAutoUpdate = z.infer<typeof EngineAutoUpdateSchema>;
+
 export const MachineClaudeLatestSchema = z.object({
   /** 查询的渠道：claude settings 的 `autoUpdatesChannel`，默认 latest */
   channel: z.enum(['latest', 'stable']),
@@ -621,6 +638,11 @@ export const EngineSummarySchema = z.object({
     .optional(),
   /** 由包管理器安装时才有（agent ≥ 0.23.0）：更新走它，latest 也是它能装上的版本 */
   install: EngineInstallSchema.optional(),
+  /**
+   * 自动更新（agent ≥ 0.31.0）：有这个字段 = 支持，可用 machine.engine.autoupdate.set 开关。
+   * 开着时 agent 每次查到新版本（启动后约 30 秒、之后每 6 小时，或手动检查）就自动更新。
+   */
+  autoUpdate: EngineAutoUpdateSchema.optional(),
 });
 export type EngineSummary = z.infer<typeof EngineSummarySchema>;
 

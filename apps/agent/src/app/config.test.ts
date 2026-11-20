@@ -72,6 +72,7 @@ describe('loadAgentConfig', () => {
       cwd: '/h/cwd.json',
       filesTrust: '/h/files.json',
       fileBookmarks: '/h/bookmarks.json',
+      engineAutoUpdate: '/h/engine-auto-update.json',
       sessions: '/h/sessions.json',
       uploads: '/h/uploads',
       extensions: '/h/extensions.json',

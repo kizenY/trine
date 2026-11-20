@@ -83,7 +83,10 @@ import type {
 //   Codex 新会话首轮落盘前拉历史返回空页，不再撞上 rollout 空文件的内部错误
 // - 0.30.0 起文件书签存在 agent（files.bookmark.add / remove，`~/.trine/bookmarks.json`），
 //   MachineInfo.files 带 bookmarks，所有已配对设备同步（web 按 bookmarks 有无判断，旧 agent 退回本设备存储）
-export const AGENT_VERSION = '0.30.0';
+// - 0.31.0 起引擎可自动更新（machine.engine.autoupdate.set，`~/.trine/engine-auto-update.json`，
+//   EngineSummary.autoUpdate 有无即能力位）；扩展执行计划确认时可改新会话的引擎配置与首条消息
+//   （ext.action.commit.edits，MachineInfo.extensions.planEdit），扩展建会话可走 Codex
+export const AGENT_VERSION = '0.31.0';
 
 export function buildMachineInfo(input: {
   name: string;

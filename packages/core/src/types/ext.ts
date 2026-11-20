@@ -383,6 +383,11 @@ export const MachineExtensionsSummarySchema = z.object({
    * web 就什么都不声明，请求、应答和本地缓存的特性集两边一致（都是空）。
    */
   features: z.array(z.string().min(1).max(64)).max(16).optional(),
+  /**
+   * 确认执行计划时可改新会话的引擎配置与首条消息（ext.action.commit.edits，agent ≥ 0.31.0）。
+   * 旧 agent 会静默丢掉 edits、按原计划执行，所以 web 只在有这个能力位时开放编辑。
+   */
+  planEdit: z.boolean().optional(),
 });
 export type MachineExtensionsSummary = z.infer<typeof MachineExtensionsSummarySchema>;
 
@@ -431,6 +436,12 @@ export const ExtPlanStepSchema = z.discriminatedUnion('type', [
     model: z.string(),
     permissionMode: z.string(),
     links: z.array(ExtLinkRefSchema),
+    /** 引擎（省略 = Claude Code）；用户在确认时改了才会是别的（ext.action.commit.edits） */
+    engine: z.string().optional(),
+    /** 非 Claude 引擎的权限模式（见 SessionMeta.engineMode） */
+    engineMode: z.string().optional(),
+    /** 推理强度；省略 = 跟随引擎配置 */
+    effort: z.string().optional(),
   }),
   z.object({
     type: z.literal('prompt.send'),

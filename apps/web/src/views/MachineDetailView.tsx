@@ -12,6 +12,7 @@
 import { useEffect, useMemo, useState } from 'react';
 import { useNavigate, useParams } from 'react-router';
 import { toast } from 'sonner';
+import { CLAUDE_ENGINE_ID } from '@trine/core';
 import { Button } from '@/components/ui/button.tsx';
 import { Input } from '@/components/ui/input.tsx';
 import { Separator } from '@/components/ui/separator.tsx';
@@ -19,7 +20,7 @@ import { AppHead } from '@/components/shell/AppHead.tsx';
 import { StatusDot } from '@/components/shell/StatusDot.tsx';
 import { ConfirmDialog } from '@/components/machines/ConfirmDialog.tsx';
 import { AgentRestartSection } from '@/components/machines/AgentRestartSection.tsx';
-import { EngineCards } from '@/components/machines/EngineCards.tsx';
+import { autoUpdateProps, EngineCards } from '@/components/machines/EngineCards.tsx';
 import { EngineUpdateSection } from '@/components/machines/EngineUpdateSection.tsx';
 import { claudeLatestView, engineUpdateHints, supportsClaudeUpdate } from '@/components/machines/claude-update.ts';
 import { supportsAgentRestart } from '@/components/machines/agent-restart.ts';
@@ -226,6 +227,7 @@ export function MachineDetailView(): React.JSX.Element {
               update={() => client.updateClaude(machine.machineId)}
               latest={claudeLatestView(machine.info)}
               check={() => client.checkClaude(machine.machineId)}
+              autoUpdate={autoUpdateProps(client, machine.machineId, machine.info?.engines?.find((e) => e.id === CLAUDE_ENGINE_ID))}
               now={now}
             />
           </>

@@ -86,7 +86,10 @@ the agent runs on your own computer.
   actions leave a note in the session timeline. The browser never runs extension code; it only renders the
   data the agent returns, and actions run on the agent after a click. Install with
   `trine-agent ext add <dir>`; see [extensions](docs/EXTENSIONS.md). Requires agent 0.16.0 or later
-  (0.17.0 for starting from an item and timeline notes). From agent 0.26.0 an extension's buttons
+  (0.17.0 for starting from an item and timeline notes). From agent 0.31.0, when an extension
+  action asks to start a new session (such as resuming a task), the confirmation dialog lets you
+  switch the engine, model, reasoning effort and permission mode and edit the first message
+  before it runs. From agent 0.26.0 an extension's buttons
   in the session panel can open a file or directory in the file viewer (for example a task's
   folder); the usual file scope and trust rules apply, and an extension can never trust a
   directory for you.
@@ -95,6 +98,11 @@ the agent runs on your own computer.
   default) shortly after start and every 6 hours, and machine cards flag a newer version; "检查更新"
   on the machine page checks right away. Automatic checks are off when `DISABLE_AUTOUPDATER` or
   `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC` is set. Checking requires agent 0.19.0 or later.
+  From agent 0.31.0 each engine card has an "自动更新" switch (off by default, stored on the
+  agent and shared by every paired device): when a check finds a newer Claude Code or Codex, the
+  agent updates it the same way as the update button. Running sessions are not restarted, and
+  the card shows the last automatic update's result. Claude Code is offered only when the agent
+  uses a global `claude` (the SDK's bundled copy cannot be updated).
 - Restarts the agent safely after you update its checkout, from the machine page or with
   `trine-agent restart` (also from inside a trine session): it checks the new code first, waits
   until no session is busy, then exits for the service manager to start it again. Restarting

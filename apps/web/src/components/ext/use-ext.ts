@@ -23,6 +23,7 @@ import {
   supportsExtRecords,
   type ExtActionPlanEvent,
   type ExtActionResult,
+  type ConfirmOutcome,
   type ExtReadResponse,
   type ReadTarget,
 } from '@/lib/ext-model.ts';
@@ -263,7 +264,9 @@ function usePageVisible(): boolean {
 
 interface ConfirmRequest {
   plan: ExtPlan;
-  resolve: (ok: boolean) => void;
+  /** 计划来自哪台机器（确认框按它的引擎目录给编辑选项） */
+  machineId: string;
+  resolve: (outcome: ConfirmOutcome) => void;
 }
 
 export interface LinkPickerRequest {
@@ -300,16 +303,16 @@ export function useExtUi(): ExtUiState {
   );
 }
 
-export function requestConfirm(plan: ExtPlan): Promise<boolean> {
+export function requestConfirm(plan: ExtPlan, machineId: string): Promise<ConfirmOutcome> {
   // 同时只有一个确认：前一个视为取消
   uiState.confirm?.resolve(false);
-  return new Promise((resolve) => setUi({ confirm: { plan, resolve } }));
+  return new Promise((resolve) => setUi({ confirm: { plan, machineId, resolve } }));
 }
 
-export function settleConfirm(ok: boolean): void {
+export function settleConfirm(outcome: ConfirmOutcome): void {
   const pending = uiState.confirm;
   setUi({ confirm: null });
-  pending?.resolve(ok);
+  pending?.resolve(outcome);
 }
 
 export function openLinkPicker(request: LinkPickerRequest): void {
@@ -394,7 +397,7 @@ export function useExtAction(): (action: { local?: readonly ExtLocalEffect[]; to
       const outcome = await runTokenAction(action.token, {
         uuid: () => crypto.randomUUID(),
         newSessionDefaults: () => newSession,
-        confirm: requestConfirm,
+        confirm: (plan) => requestConfirm(plan, ctx.machineId),
         prepare: (token, invocationId, ns) =>
           client.extRequest(
             ctx.machineId,
@@ -408,8 +411,8 @@ export function useExtAction(): (action: { local?: readonly ExtLocalEffect[]; to
             } as never,
             ['ext.action.plan', 'ext.action.result'],
           ) as Promise<ExtActionPlanEvent | ExtActionResult>,
-        commit: (planId, invocationId) =>
-          client.extRequest(ctx.machineId, { type: 'ext.action.commit', planId, invocationId } as never, [
+        commit: (planId, invocationId, edits) =>
+          client.extRequest(ctx.machineId, { type: 'ext.action.commit', planId, invocationId, ...(edits === undefined ? {} : { edits }) } as never, [
             'ext.action.result',
             'ext.action.plan',
           ]) as Promise<ExtActionResult>,

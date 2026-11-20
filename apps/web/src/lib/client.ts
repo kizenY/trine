@@ -248,6 +248,7 @@ export type ClaudeUpdateResult = Extract<AgentToClientEvent, { type: 'machine.cl
 export type EngineUpdateResult = Extract<AgentToClientEvent, { type: 'machine.engine.update.response' }>;
 export type EngineCheckResult = Extract<AgentToClientEvent, { type: 'machine.engine.check.response' }>;
 export type EngineRestartResult = Extract<AgentToClientEvent, { type: 'machine.engine.restart.response' }>;
+export type EngineAutoUpdateResult = Extract<AgentToClientEvent, { type: 'machine.engine.autoupdate.response' }>;
 
 /** 重启引擎后台进程要等新进程起来、daemon 重启（agent 侧 daemon 上限 60 秒） */
 export const ENGINE_RESTART_TIMEOUT_MS = 2 * 60_000;
@@ -1921,6 +1922,17 @@ export class TrineClient {
       throw err;
     }
     if (res.type !== 'machine.engine.restart.response') throw new Error(`意外的应答 ${res.type}`);
+    return res;
+  }
+
+  /** 打开 / 关闭引擎自动更新（EngineSummary.autoUpdate 存在才支持）；ok 为 false 也照常返回 */
+  async setEngineAutoUpdate(machineId: string, engine: string, enabled: boolean): Promise<EngineAutoUpdateResult> {
+    const res = await this.request<Extract<OutboundBody, { type: 'machine.engine.autoupdate.set' }>>(machineId, {
+      type: 'machine.engine.autoupdate.set',
+      engine,
+      enabled,
+    });
+    if (res.type !== 'machine.engine.autoupdate.response') throw new Error(`意外的应答 ${res.type}`);
     return res;
   }
 

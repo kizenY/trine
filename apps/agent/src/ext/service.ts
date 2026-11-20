@@ -18,6 +18,7 @@
  */
 import { createHash, randomUUID } from 'node:crypto';
 import {
+  CLAUDE_ENGINE_ID,
   EXT_API_VERSION,
   ExtActionOutputSchema,
   ExtBadgeOutputSchema,
@@ -40,6 +41,7 @@ import {
   type ExtLinkRef,
   type ExtLocalEffect,
   type ExtPlan,
+  type ExtPlanEdit,
   type ExtPlanStep,
   type ExtPoint,
   type ExtRawAction,
@@ -120,6 +122,10 @@ export interface ExtHost {
     cwd: string;
     model: string;
     permissionMode: PermissionMode;
+    /** 省略 = Claude Code（用户在确认框里换了引擎才会有） */
+    engine?: string;
+    engineMode?: string;
+    effort?: string;
     title?: string;
     ext: string;
     links: readonly ExtLinkRef[];
@@ -234,6 +240,43 @@ interface Lease {
 interface CacheEntry {
   at: number;
   output: unknown;
+}
+
+/**
+ * 用户在确认框里的修改（ext.action.commit.edits）：只改 session.create 步骤的引擎配置与首条消息，
+ * 目录、标题、关联仍按计划。引擎是否可用、模式是否认识由建会话时检查。
+ */
+export function applyPlanEdits<S extends { view: ExtPlanStep }>(steps: readonly S[], edits: readonly ExtPlanEdit[] | undefined): S[] {
+  if (edits === undefined || edits.length === 0) return [...steps];
+  const next = [...steps];
+  const seen = new Set<number>();
+  for (const edit of edits) {
+    const step = next[edit.step];
+    if (step === undefined || step.view.type !== 'session.create' || seen.has(edit.step)) {
+      throw new ExtFailure('denied', '只能修改计划里新建会话的步骤');
+    }
+    seen.add(edit.step);
+    const { engine: oldEngine, engineMode: oldMode, effort: oldEffort, ...view } = step.view;
+    const from = oldEngine ?? CLAUDE_ENGINE_ID;
+    const engine = edit.engine ?? from;
+    const switched = engine !== from;
+    if (switched && edit.model === undefined) throw new ExtFailure('denied', '换引擎时要一并选模型');
+    const engineMode = engine === CLAUDE_ENGINE_ID ? undefined : (edit.engineMode ?? (switched ? undefined : oldMode));
+    const effort = edit.effort === null ? undefined : (edit.effort ?? (switched ? undefined : oldEffort));
+    next[edit.step] = {
+      ...step,
+      view: {
+        ...view,
+        ...(edit.prompt === undefined ? {} : { prompt: edit.prompt }),
+        ...(edit.model === undefined ? {} : { model: edit.model }),
+        ...(edit.permissionMode === undefined ? {} : { permissionMode: edit.permissionMode }),
+        ...(engine === CLAUDE_ENGINE_ID ? {} : { engine }),
+        ...(engineMode === undefined ? {} : { engineMode }),
+        ...(effort === undefined ? {} : { effort }),
+      },
+    };
+  }
+  return next;
 }
 
 class ExtFailure extends Error {
@@ -760,13 +803,14 @@ export class ExtensionService {
       if (plan.expiresAt <= this.#now()) throw new ExtFailure('stale', '确认已过期，请重新操作');
       const ext = this.#usable(plan.token.ext);
       if (ext.generation !== plan.token.generation) throw new ExtFailure('stale', '扩展已变更，请重新操作');
-      await this.#checkPreconditions(plan.steps);
-      if (plan.steps.length === 1 && plan.steps[0]!.effect.type === 'invoke') {
+      const steps = applyPlanEdits(plan.steps, event.edits);
+      await this.#checkPreconditions(steps);
+      if (steps.length === 1 && steps[0]!.effect.type === 'invoke') {
         // invoke 的确认在启动进程之前
         await this.#runInvoke(deviceId, event.reqId, plan.invocationId, plan.token, ext, plan.newSession);
         return;
       }
-      const result = await this.#execute(plan.token, plan.steps, plan);
+      const result = await this.#execute(plan.token, steps, plan);
       this.#finish(plan.invocationId, result);
       reply(result);
     } catch (err) {
@@ -1099,6 +1143,9 @@ export class ExtensionService {
             cwd: view.cwd,
             model: view.model,
             permissionMode: view.permissionMode as PermissionMode,
+            ...(view.engine === undefined ? {} : { engine: view.engine }),
+            ...(view.engineMode === undefined ? {} : { engineMode: view.engineMode }),
+            ...(view.effort === undefined ? {} : { effort: view.effort }),
             ...(view.title === undefined ? {} : { title: view.title }),
             ext: token.ext,
             links: view.links,

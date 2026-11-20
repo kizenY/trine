@@ -2,13 +2,13 @@ import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
 import { chmod, mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import type { ExtRawView, SessionMeta } from '@trine/core';
+import type { ExtPlanStep, ExtRawView, SessionMeta } from '@trine/core';
 import type { EventBody } from '../bridge/types.ts';
 import { SessionLinksStore } from './links-store.ts';
 import { recordLinkChanges, SessionRecordsStore } from './records-store.ts';
 import { ExtensionRegistry, MANIFEST_FILE } from './registry.ts';
 import type { RunRequest, RunResult } from './runner.ts';
-import { ExtensionService, REFRESH_DEBOUNCE_MS, type ExtHost } from './service.ts';
+import { applyPlanEdits, ExtensionService, REFRESH_DEBOUNCE_MS, type ExtHost } from './service.ts';
 
 let root: string;
 
@@ -315,6 +315,59 @@ describe('读取', () => {
 });
 
 describe('动作', () => {
+  test('新会话接续的确认：commit 带修改时按修改后的引擎配置与首条消息建会话', async () => {
+    const h = await harness();
+    h.outputs.set('view', { view: VIEW });
+    await read(h);
+    await prepare(h, tokenOf(h, 'resume-new'));
+    const plan = h.last('ext.action.plan');
+    expect(plan.plan.steps[0]).toMatchObject({ type: 'session.create', model: 'opus', permissionMode: 'bypassPermissions' });
+    await h.service.commit('d1', {
+      type: 'ext.action.commit',
+      ts: 1,
+      seq: 1,
+      dir: 'c2a',
+      reqId: 'c',
+      invocationId: 'inv-1',
+      planId: plan.planId,
+      edits: [{ step: 0, prompt: '改过的接续', engine: 'codex', model: 'gpt-5', permissionMode: 'default', engineMode: 'auto', effort: 'high' }],
+    } as never);
+    expect(h.last('ext.action.result')).toMatchObject({ ok: true, createdSessionId: 'new1' });
+    expect(h.created.map(({ precheck: _p, ...rest }) => rest)).toEqual([
+      {
+        cwd: '/work/repo',
+        model: 'gpt-5',
+        permissionMode: 'default',
+        engine: 'codex',
+        engineMode: 'auto',
+        effort: 'high',
+        ext: 'tasks',
+        links: [{ ref: 'task-a', label: 'Task A' }],
+        prompt: '改过的接续',
+      },
+    ]);
+  });
+
+  test('确认的修改只能落在 session.create 步骤上', async () => {
+    const h = await harness();
+    h.outputs.set('view', { view: VIEW });
+    await read(h);
+    await prepare(h, tokenOf(h, 'resume-here'));
+    const plan = h.last('ext.action.plan');
+    await h.service.commit('d1', {
+      type: 'ext.action.commit',
+      ts: 1,
+      seq: 1,
+      dir: 'c2a',
+      reqId: 'c',
+      invocationId: 'inv-1',
+      planId: plan.planId,
+      edits: [{ step: 0, prompt: '偷换的文字' }],
+    } as never);
+    expect(h.last('ext.action.result')).toMatchObject({ ok: false, error: { code: 'denied' } });
+    expect(h.prompts).toEqual([]);
+  });
+
   test('全托管：新会话接续直接执行，用发起设备的默认值，自动关联', async () => {
     const h = await harness({}, { trust: 'full' });
     h.outputs.set('view', { view: VIEW });
@@ -968,5 +1021,26 @@ describe('特性协商（files.open）', () => {
     h.outputs.set('view', { view: bad(`/${'a'.repeat(5000)}`) });
     await read(h, 'd1', { features: ['files.open'], force: true });
     expect(h.last('ext.read.response')).toMatchObject({ ok: false, error: { code: 'invalid_output' } });
+  });
+});
+
+describe('applyPlanEdits', () => {
+  const base: ExtPlanStep = { type: 'session.create', cwd: '/w', prompt: 'p', model: 'gpt-5', permissionMode: 'default', links: [], engine: 'codex', engineMode: 'auto', effort: 'high' };
+  test('不给修改：原样', () => {
+    expect(applyPlanEdits([{ view: base }], undefined)).toEqual([{ view: base }]);
+  });
+  test('换回 Claude：去掉 engine / engineMode，强度不带过去', () => {
+    expect(applyPlanEdits([{ view: base }], [{ step: 0, engine: 'claude', model: 'opus', permissionMode: 'plan' }])[0]!.view).toEqual({
+      type: 'session.create', cwd: '/w', prompt: 'p', model: 'opus', permissionMode: 'plan', links: [],
+    });
+  });
+  test('同引擎只改强度：null = 跟随配置；其余不变', () => {
+    expect(applyPlanEdits([{ view: base }], [{ step: 0, effort: null }])[0]!.view).toEqual({ ...base, effort: undefined } as never);
+    expect(applyPlanEdits([{ view: base }], [{ step: 0, effort: null }])[0]!.view).not.toHaveProperty('effort');
+  });
+  test('换引擎不给模型、下标越界、重复下标：拒绝', () => {
+    expect(() => applyPlanEdits([{ view: base }], [{ step: 0, engine: 'claude' }])).toThrow('模型');
+    expect(() => applyPlanEdits([{ view: base }], [{ step: 1, prompt: 'x' }])).toThrow();
+    expect(() => applyPlanEdits([{ view: base }], [{ step: 0, prompt: 'x' }, { step: 0, prompt: 'y' }])).toThrow();
   });
 });

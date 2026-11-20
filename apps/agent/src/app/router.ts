@@ -110,6 +110,7 @@ import type {
 } from '@trine/core';
 import { CLAUDE_ENGINE_ID } from '@trine/core';
 import { CODEX_DEFAULT_MODEL, CODEX_ENGINE_ID } from '../engine/codex/ids.ts';
+import { isCodexMode } from '../engine/codex/modes.ts';
 import { AttachmentError, type AttachmentStore, type PreparedInput } from '../bridge/attachments.ts';
 import { FileAccessError } from '../files/access.ts';
 import { TrustError, type FileService } from '../files/service.ts';
@@ -154,6 +155,7 @@ import type { EngineDaemonRestart, EngineRestartErrorCode } from '@trine/core';
 import type { EngineCheckOutcome } from '../engine/codex/update.ts';
 import type { ClaudeCheckOutcome } from './claude-latest.ts';
 import type { RestartOutcome } from './restart.ts';
+import type { AutoUpdateSetOutcome } from './engine-auto-update.ts';
 import type { PlanUsageRefreshOutcome } from './plan-usage.ts';
 import type { SessionFlagsStore } from './session-flags.ts';
 import { executeRewind, previewRewind, type RewindDeps } from './rewind.ts';
@@ -193,6 +195,7 @@ const MACHINE_LEVEL_TYPES = new Set<ClientToAgentEvent['type']>([
   'machine.engine.update.request',
   'machine.engine.check.request',
   'machine.engine.restart.request',
+  'machine.engine.autoupdate.set',
   'machine.usage.request',
   'machine.agent.restart.request',
   'machine.stats.request',
@@ -318,6 +321,8 @@ export interface RouterDeps {
   checkEngine?: (engine: string) => Promise<EngineCheckOutcome | undefined>;
   /** 重启引擎的后台进程（machine.engine.restart.request）；不能重启它时回 undefined。不抛 */
   restartEngine?: (engine: string) => Promise<EngineRestartOutcome | undefined>;
+  /** 引擎自动更新开关（machine.engine.autoupdate.set，见 engine-auto-update.ts）；不给 = 不支持。不抛 */
+  setAutoUpdate?: (engine: string, enabled: boolean) => Promise<AutoUpdateSetOutcome>;
   /**
    * 手动刷新订阅限额用量（app 的 PlanUsageTracker：单飞、超时；拿到后先广播
    * machine.info）。不抛——失败以 outcome 表达。不给 = 不支持（测试）。
@@ -1694,6 +1699,28 @@ export class Router {
         void task.finally(() => this.#background.delete(task));
         return;
       }
+      case 'machine.engine.autoupdate.set': {
+        // 只写一个小文件：在机器链上串行即可
+        let outcome: AutoUpdateSetOutcome;
+        try {
+          outcome = (await this.#deps.setAutoUpdate?.(event.engine, event.enabled)) ?? {
+            ok: false,
+            enabled: false,
+            error: { code: 'not_found', message: `这台机器不能自动更新引擎 ${event.engine}`.slice(0, 300) },
+          };
+        } catch (err) {
+          outcome = { ok: false, enabled: false, error: { code: 'failed', message: `agent 保存自动更新设置出错：${(err as Error).message}`.slice(0, 300) } };
+        }
+        this.#emitMachine({
+          type: 'machine.engine.autoupdate.response',
+          reqId: event.reqId,
+          engine: event.engine,
+          ok: outcome.ok,
+          enabled: outcome.enabled,
+          ...(outcome.ok ? {} : { error: { code: outcome.error.code, message: outcome.error.message.slice(0, 300) } }),
+        });
+        return;
+      }
       case 'machine.engine.restart.request': {
         // 不 await：daemon 重启要等几秒
         const task = this.#runEngineRestart(event.reqId, event.engine);
@@ -1763,6 +1790,8 @@ export class Router {
     engineMode: string | undefined,
     effort: string | undefined,
   ): Promise<string> {
+    // 引擎对不认识的模式会退回默认（完全访问）：明确给了却不认识就拒绝，不悄悄放宽
+    if (engineMode !== undefined && !isCodexMode(engineMode)) throw new Error(`Codex 不认识权限模式 ${engineMode}`);
     await this.#deps.manager.makeRoom();
     const started = await codex.startThread({ cwd, model, engineMode });
     const params: SessionParams = {
@@ -1921,7 +1950,15 @@ export class Router {
         // 建会话占机器链（与 session.create 串行，名额判断才可靠）
         const sessionId = await this.#onChain(MACHINE_CHAIN, async () => {
           args.precheck?.();
-          const sid = await this.#createSession(args.cwd, args.model, args.permissionMode);
+          // 用户在确认框里可能换了引擎（ext.action.commit.edits）
+          const codex = args.engine === CODEX_ENGINE_ID ? deps.codexEngine : undefined;
+          if (args.engine !== undefined && args.engine !== CLAUDE_ENGINE_ID && codex === undefined) {
+            throw new Error(`这台机器不支持引擎 ${args.engine}`);
+          }
+          const sid =
+            codex === undefined
+              ? await this.#createSession(args.cwd, args.model, args.permissionMode, args.effort)
+              : await this.#createCodexSession(codex, args.cwd, args.model, args.engineMode, args.effort);
           if (args.title !== undefined && args.title.trim() !== '') {
             await deps.flags.setPendingTitle(sid, args.title.trim().slice(0, 200), this.#now()).catch(() => {});
           }

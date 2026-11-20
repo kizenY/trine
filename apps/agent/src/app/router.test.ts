@@ -238,6 +238,7 @@ async function makeHarness(options: {
   updateEngine?: RouterDeps['updateEngine'];
   checkEngine?: RouterDeps['checkEngine'];
   restartEngine?: RouterDeps['restartEngine'];
+  setAutoUpdate?: RouterDeps['setAutoUpdate'];
   /** 注入限额用量刷新；省略 = router 回「不支持」 */
   refreshUsage?: () => Promise<PlanUsageRefreshOutcome>;
   /** 注入资源订阅；省略 = router 忽略 machine.stats.request */
@@ -336,6 +337,7 @@ async function makeHarness(options: {
     ...(options.updateEngine === undefined ? {} : { updateEngine: options.updateEngine }),
     ...(options.checkEngine === undefined ? {} : { checkEngine: options.checkEngine }),
     ...(options.restartEngine === undefined ? {} : { restartEngine: options.restartEngine }),
+    ...(options.setAutoUpdate === undefined ? {} : { setAutoUpdate: options.setAutoUpdate }),
     ...(options.machineStats === undefined ? {} : { machineStats: options.machineStats }),
     now,
     log: (l) => logs.push(l),
@@ -2910,6 +2912,32 @@ describe('Router · Codex 引擎', () => {
     expect(h.state.sessionParams('codex-new')).toMatchObject({ effort: 'high' });
   });
 
+  test('extHost.createSession 换成 Codex：走 thread/start；机器没有该引擎就拒绝', async () => {
+    const h = await makeHarness({ codexEngine });
+    const host = h.router.extHost();
+    const created = await host.createSession({
+      cwd: '/a',
+      model: 'gpt-x',
+      permissionMode: 'default',
+      engine: 'codex',
+      engineMode: 'full',
+      effort: 'high',
+      ext: 'tasks',
+      links: [],
+      prompt: '接续',
+    });
+    expect(created.sessionId).toBe('codex-new');
+    expect(h.created[0]!.args).toMatchObject({ engine: 'codex', effort: 'high' });
+    // 不认识的模式：拒绝，不退回完全访问
+    await expect(
+      host.createSession({ cwd: '/a', model: 'm', permissionMode: 'default', engine: 'codex', engineMode: 'bogus', ext: 'tasks', links: [], prompt: 'x' }),
+    ).rejects.toThrow('不认识权限模式');
+    const bare = await makeHarness({});
+    await expect(
+      bare.router.extHost().createSession({ cwd: '/a', model: 'm', permissionMode: 'default', engine: 'codex', ext: 'tasks', links: [], prompt: 'x' }),
+    ).rejects.toThrow('不支持引擎');
+  });
+
   test('推理强度：记下用户的选择，换模型调整后的值也记；不支持的引擎不理', async () => {
     const h = await makeHarness({ codexEngine });
     await h.router.handle({ type: 'session.create', ...c2a(), reqId: 'q', cwd: '/a', model: 'default', permissionMode: 'default', engine: 'codex', effort: 'high' }, phone);
@@ -2972,6 +3000,29 @@ describe('Router · Codex 引擎', () => {
     const checks = h.byType('machine.engine.check.response');
     expect(checks).toContainEqual(expect.objectContaining({ reqId: 'k1', ok: true, latest: { version: '1.1.0' } }));
     expect(checks).toContainEqual(expect.objectContaining({ reqId: 'k2', ok: false, error: expect.objectContaining({ code: 'failed' }) }));
+  });
+
+  test('machine.engine.autoupdate.set：转交结果；没接上回 not_found，出错回 failed', async () => {
+    const seen: [string, boolean][] = [];
+    const h = await makeHarness({
+      setAutoUpdate: async (engine: string, enabled: boolean) => {
+        seen.push([engine, enabled]);
+        if (engine === 'boom') throw new Error('写不了');
+        return { ok: true as const, enabled };
+      },
+    });
+    await h.router.handle({ type: 'machine.engine.autoupdate.set', ...c2a(), reqId: 'a1', engine: 'codex', enabled: true }, phone);
+    await h.router.handle({ type: 'machine.engine.autoupdate.set', ...c2a(), reqId: 'a2', engine: 'boom', enabled: true }, phone);
+    await h.router.idle();
+    expect(seen).toEqual([['codex', true], ['boom', true]]);
+    const res = h.byType('machine.engine.autoupdate.response');
+    expect(res).toContainEqual(expect.objectContaining({ reqId: 'a1', engine: 'codex', ok: true, enabled: true }));
+    expect(res).toContainEqual(expect.objectContaining({ reqId: 'a2', ok: false, error: expect.objectContaining({ code: 'failed' }) }));
+
+    const bare = await makeHarness({});
+    await bare.router.handle({ type: 'machine.engine.autoupdate.set', ...c2a(), reqId: 'a3', engine: 'codex', enabled: true }, phone);
+    await bare.router.idle();
+    expect(bare.byType('machine.engine.autoupdate.response')[0]).toMatchObject({ ok: false, enabled: false, error: { code: 'not_found' } });
   });
 
   test('machine.engine.restart.request：转交结果；不支持的引擎回 unavailable，出错回 failed', async () => {

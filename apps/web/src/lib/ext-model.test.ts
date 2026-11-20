@@ -79,6 +79,29 @@ describe('runTokenAction', () => {
     expect(d.calls.filter((c) => c === 'confirm')).toHaveLength(2);
   });
 
+  test('确认时带了修改：commit 带上 edits；没改动（true）不带', async () => {
+    const seen: unknown[] = [];
+    const edits = [{ step: 0, prompt: '改过' }];
+    const d = deps({
+      prepare: async () => planEvent('p1'),
+      confirm: async () => ({ edits }),
+      commit: async (_planId, _inv, e) => {
+        seen.push(e);
+        return result();
+      },
+    });
+    expect(await runTokenAction('t', d)).toMatchObject({ kind: 'done' });
+    const plain = deps({
+      prepare: async () => planEvent('p1'),
+      commit: async (_planId, _inv, e) => {
+        seen.push(e);
+        return result();
+      },
+    });
+    await runTokenAction('t', plain);
+    expect(seen).toEqual([edits, undefined]);
+  });
+
   test('用户取消：发 cancel，不 commit', async () => {
     const d = deps({ prepare: async () => planEvent('p1'), confirm: async () => false });
     const out = await runTokenAction('t', d);

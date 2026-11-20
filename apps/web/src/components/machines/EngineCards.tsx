@@ -13,6 +13,13 @@ import { EngineName } from '@/components/shell/EngineIcon.tsx';
 type Client = NonNullable<ReturnType<typeof useClient>>;
 type Info = MachineInfo | null | undefined;
 
+/** 引擎的自动更新开关；agent 不支持（没有 autoUpdate）→ undefined */
+export function autoUpdateProps(client: Client, machineId: string, engine: EngineSummary | undefined) {
+  const state = engine?.autoUpdate;
+  if (engine === undefined || state === undefined) return undefined;
+  return { state, set: (enabled: boolean) => client.setEngineAutoUpdate(machineId, engine.id, enabled) };
+}
+
 function EngineCard({
   engine,
   machineId,
@@ -57,6 +64,7 @@ function EngineCard({
           update={() => client.updateClaude(machineId)}
           latest={claudeLatestView(info)}
           check={() => client.checkClaude(machineId)}
+          autoUpdate={autoUpdateProps(client, machineId, engine)}
           now={now}
         />
       )}
@@ -73,6 +81,7 @@ function EngineCard({
           update={() => client.updateEngine(machineId, engine.id)}
           latest={latest}
           check={() => client.checkEngine(machineId, engine.id)}
+          autoUpdate={autoUpdateProps(client, machineId, engine)}
           now={now}
         />
       )}

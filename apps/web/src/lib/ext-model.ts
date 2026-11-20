@@ -16,6 +16,7 @@ import {
   type ExtFilesOpenEffect,
   type ExtLocalEffect,
   type ExtPlan,
+  type ExtPlanEdit,
   type ExtPoint,
   type ExtRecord,
   type MachineInfo,
@@ -25,6 +26,14 @@ import {
 export type ExtReadResponse = Extract<AgentToClientEvent, { type: 'ext.read.response' }>;
 export type ExtActionResult = Extract<AgentToClientEvent, { type: 'ext.action.result' }>;
 export type ExtActionPlanEvent = Extract<AgentToClientEvent, { type: 'ext.action.plan' }>;
+
+/** 确认时能改新会话的引擎配置与首条消息（agent ≥ 0.31.0 在摘要里带 planEdit） */
+export function supportsPlanEdit(info: MachineInfo | null | undefined): boolean {
+  return info?.extensions?.planEdit === true;
+}
+
+/** 确认框的结果：false = 取消；true = 按原计划；{ edits } = 带上用户的修改 */
+export type ConfirmOutcome = boolean | { edits: ExtPlanEdit[] };
 
 /** agent 支持时间线记录卡（agent ≥ 0.17.0 在摘要里带 records） */
 export function supportsExtRecords(info: MachineInfo | null | undefined): boolean {
@@ -147,10 +156,10 @@ export function isNewer(current: { rev: number } | undefined, next: { rev: numbe
 
 export interface ExtActionDeps {
   prepare: (token: string, invocationId: string, newSession: { model: string; permissionMode: PermissionMode }) => Promise<ExtActionPlanEvent | ExtActionResult>;
-  commit: (planId: string, invocationId: string) => Promise<ExtActionResult>;
+  commit: (planId: string, invocationId: string, edits?: ExtPlanEdit[]) => Promise<ExtActionResult>;
   cancel: (planId: string) => void;
-  /** 展示计划给用户确认；true = 确认 */
-  confirm: (plan: ExtPlan) => Promise<boolean>;
+  /** 展示计划给用户确认（见 ConfirmOutcome） */
+  confirm: (plan: ExtPlan) => Promise<ConfirmOutcome>;
   newSessionDefaults: () => { model: string; permissionMode: PermissionMode };
   uuid: () => string;
 }
@@ -168,11 +177,12 @@ export async function runTokenAction(token: string, deps: ExtActionDeps): Promis
     res = await deps.prepare(token, invocationId, deps.newSessionDefaults());
     for (let stage = 0; res.type === 'ext.action.plan' && stage < 3; stage++) {
       const confirmed = await deps.confirm(res.plan);
-      if (!confirmed) {
+      if (confirmed === false) {
         deps.cancel(res.planId);
         return { kind: 'cancelled' };
       }
-      const committed: ExtActionPlanEvent | ExtActionResult = await deps.commit(res.planId, invocationId);
+      const edits = typeof confirmed === 'object' && confirmed.edits.length > 0 ? confirmed.edits : undefined;
+      const committed: ExtActionPlanEvent | ExtActionResult = await deps.commit(res.planId, invocationId, edits);
       res = committed;
     }
   } catch (err) {

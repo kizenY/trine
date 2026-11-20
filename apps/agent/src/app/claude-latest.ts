@@ -87,6 +87,8 @@ export async function fetchLatestClaudeVersion(
 export interface ClaudeLatestCheckerOptions {
   /** 状态变了（查到新结果 / 失败原因变了）：app 广播 machine.info */
   onChange?: () => void;
+  /** 查成功后（广播之后）调：自动更新据此判断要不要更新 */
+  onChecked?: (version: string) => void;
   fetchImpl?: typeof fetch;
   /** 识别安装方式；不给 = 总是查发布源 */
   detectInstall?: () => Promise<PackageInstall | undefined>;
@@ -194,6 +196,7 @@ export class ClaudeLatestChecker {
       this.#log(`[claude] ${message}`);
     }
     if (!this.#disposed) this.#opts.onChange?.();
+    if (outcome.ok && !this.#disposed) this.#opts.onChecked?.(outcome.version);
     return outcome;
   }
 }

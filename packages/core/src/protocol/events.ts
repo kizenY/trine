@@ -1338,6 +1338,35 @@ export const MachineEngineCheckResponseSchema = z.object({
   error: z.object({ code: z.enum(['failed']), message: z.string().max(300) }).optional(),
 });
 
+// --- §3.1b' 引擎自动更新开关（agent 0.31.0 起，EngineSummary.autoUpdate 存在才发） ---
+//
+// 开关存在 agent（机器级，所有已配对设备共享），新状态随 machine.info 广播后再回应答。
+// 打开时 agent 立即查一次最新版本，有新版就更新；之后每次版本检查查到新版都自动更新。
+
+/** client → agent：打开 / 关闭某个引擎的自动更新（机器级帧） */
+export const MachineEngineAutoUpdateSetSchema = z.object({
+  type: z.literal('machine.engine.autoupdate.set'),
+  ...c2aBase,
+  reqId: ReqIdSchema,
+  engine: EngineIdSchema,
+  enabled: z.boolean(),
+});
+
+/**
+ * - `not_found` 这台机器不能自动更新这个引擎
+ * - `failed`    保存设置失败
+ */
+export const MachineEngineAutoUpdateResponseSchema = z.object({
+  type: z.literal('machine.engine.autoupdate.response'),
+  ...a2cBase,
+  reqId: ReqIdSchema,
+  engine: EngineIdSchema,
+  ok: z.boolean(),
+  /** 应答时的开关状态（失败时是原来的状态） */
+  enabled: z.boolean(),
+  error: z.object({ code: z.enum(['not_found', 'failed']), message: z.string().max(300) }).optional(),
+});
+
 // --- §3.1c 重启引擎的后台进程（agent 0.28.0 起，capabilities.restart 为真才发） ---
 //
 // 语义：换掉 trine 自己的引擎进程（Codex 是 `codex app-server`），下次调用起新进程、重新读登录；
@@ -1660,6 +1689,25 @@ export const ExtActionPlanSchema = z.object({
   expiresAt: TimestampSchema,
 });
 
+/**
+ * 确认时对计划里一个 session.create 步骤的修改（用户在确认框里改的，agent 校验后按它执行）。
+ * 只能改新会话的配置与首条消息；目录、标题、关联仍按计划。省略的字段不变。
+ * 换引擎时 model / permissionMode / engineMode 应一并给出（另一个引擎的模型名没有意义）。
+ */
+export const ExtPlanEditSchema = z.object({
+  /** plan.steps 的下标，必须是 session.create */
+  step: z.number().int().nonnegative().max(16),
+  prompt: z.string().min(1).max(EXT_LIMITS.prompt).optional(),
+  /** 引擎；Claude Code 写 `claude` */
+  engine: EngineIdSchema.optional(),
+  model: z.string().min(1).max(128).optional(),
+  permissionMode: PermissionModeSchema.optional(),
+  engineMode: EngineModeSchema.optional(),
+  /** null = 跟随引擎配置 */
+  effort: EngineEffortSchema.nullable().optional(),
+});
+export type ExtPlanEdit = z.infer<typeof ExtPlanEditSchema>;
+
 /** client → agent：确认执行 */
 export const ExtActionCommitSchema = z.object({
   type: z.literal('ext.action.commit'),
@@ -1667,6 +1715,8 @@ export const ExtActionCommitSchema = z.object({
   reqId: ReqIdSchema,
   invocationId: z.string().min(1).max(64),
   planId: z.string().min(1).max(64),
+  /** 用户在确认框里的修改（MachineExtensionsSummary.planEdit 为真才发）；省略 = 按原计划 */
+  edits: z.array(ExtPlanEditSchema).max(EXT_LIMITS.effectsPerAction + 1).optional(),
 });
 
 /** client → agent：放弃确认（不应答） */
@@ -2008,6 +2058,7 @@ export const AgentToClientEventSchema = z.discriminatedUnion('type', [
   MachineClaudeCheckResponseSchema,
   MachineEngineUpdateResponseSchema,
   MachineEngineCheckResponseSchema,
+  MachineEngineAutoUpdateResponseSchema,
   MachineEngineRestartResponseSchema,
   MachineUsageResponseSchema,
   MachineAgentRestartResponseSchema,
@@ -2068,6 +2119,7 @@ export const ClientToAgentEventSchema = z.discriminatedUnion('type', [
   MachineClaudeCheckRequestSchema,
   MachineEngineUpdateRequestSchema,
   MachineEngineCheckRequestSchema,
+  MachineEngineAutoUpdateSetSchema,
   MachineEngineRestartRequestSchema,
   MachineUsageRequestSchema,
   MachineAgentRestartRequestSchema,

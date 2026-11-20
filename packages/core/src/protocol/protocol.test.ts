@@ -880,6 +880,13 @@ describe('远程更新 claude（claude-update）', () => {
     expect(
       AgentToClientEventSchema.safeParse({ ...machine, type: 'machine.engine.check.response', reqId: 'r', engine: 'codex', ok: true, latest: { version: '2' } }).success,
     ).toBe(true);
+    // 自动更新开关
+    expect(ClientToAgentEventSchema.safeParse({ ...noSession, type: 'machine.engine.autoupdate.set', reqId: 'r', engine: 'codex', enabled: true }).success).toBe(true);
+    expect(ClientToAgentEventSchema.safeParse({ ...noSession, type: 'machine.engine.autoupdate.set', reqId: 'r', engine: 'codex' }).success).toBe(false);
+    const auto = { ...machine, type: 'machine.engine.autoupdate.response', reqId: 'r', engine: 'codex' } as const;
+    expect(AgentToClientEventSchema.safeParse({ ...auto, ok: true, enabled: true }).success).toBe(true);
+    expect(AgentToClientEventSchema.safeParse({ ...auto, ok: false, enabled: false, error: { code: 'not_found', message: 'x' } }).success).toBe(true);
+    expect(AgentToClientEventSchema.safeParse({ ...auto, ok: false, enabled: false, error: { code: 'busy', message: 'x' } }).success).toBe(false);
   });
 
   test('machine.claude.update.response：成功 / 各失败码 / 输出长度上限', () => {

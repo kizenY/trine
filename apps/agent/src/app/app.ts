@@ -20,7 +20,7 @@
  */
 import { homedir } from 'node:os';
 import { join, resolve } from 'node:path';
-import { FS_READ_DEFAULT_MAX_BYTES, type AgentToClientEvent, type EngineSummary, type MachineInfo, type TransportFrame } from '@trine/core';
+import { CLAUDE_ENGINE_ID, FS_READ_DEFAULT_MAX_BYTES, type AgentToClientEvent, type EngineSummary, type MachineInfo, type TransportFrame } from '@trine/core';
 import type {
   deleteSession,
   getSessionInfo,
@@ -64,6 +64,7 @@ import {
   type SpawnFn,
 } from './claude-cli.ts';
 import { ClaudeLatestChecker } from './claude-latest.ts';
+import { EngineAutoUpdater } from './engine-auto-update.ts';
 import { detectPackageInstall, updatePlan } from './package-install.ts';
 import { claudeEngineSummary } from '../engine/claude.ts';
 import { spawnCodexAppServer, type SpawnAppServer } from '../engine/codex/app-server.ts';
@@ -173,6 +174,8 @@ export class AgentApp {
   /** 由 create 在构造后接上（它的 onVersion 回调要写回本实例） */
   #updater!: ClaudeUpdater;
   #claudeLatest!: ClaudeLatestChecker;
+  /** 引擎自动更新开关与触发（见 engine-auto-update.ts） */
+  #autoUpdate!: EngineAutoUpdater;
   /** 斜杠命令探测（router 用；退出时收掉在跑的探测子进程） */
   #commandsProbe!: CommandsProbe;
   /** 文件查看；undefined = 关闭（machine.info 不带 files） */
@@ -233,6 +236,7 @@ export class AgentApp {
     const capabilities = new CapabilitiesCache();
     // 会话标记要在 manager 之前就位：manager 的每个 meta 出口都经它 decorate
     const flags = await SessionFlagsStore.load(paths.sessions, { log });
+    const autoUpdate = await EngineAutoUpdater.load(paths.engineAutoUpdate, { now, log });
     const links = await SessionLinksStore.load(paths.sessionLinks, { log, now });
     const records = await SessionRecordsStore.load(paths.sessionRecords, { log, now });
 
@@ -419,6 +423,7 @@ export class AgentApp {
       updateEngine: async (engine) => (engine === CODEX_ENGINE_ID ? app.#codexUpdate?.updater.run() : undefined),
       checkEngine: async (engine) => (engine === CODEX_ENGINE_ID ? app.#codexUpdate?.latest.check() : undefined),
       restartEngine: async (engine) => (engine === CODEX_ENGINE_ID ? app.#restartCodex() : undefined),
+      setAutoUpdate: (engine, enabled) => autoUpdate.set(engine, enabled),
       refreshUsage: () => {
         void app.#codex?.refresh();
         return app.#planUsage.refresh();
@@ -463,6 +468,8 @@ export class AgentApp {
       claudeVersion,
     );
     app.#commandsProbe = commandsProbe;
+    app.#autoUpdate = autoUpdate;
+    autoUpdate.onChange = () => app.#emitMachine({ type: 'machine.info', info: app.machineInfo() });
     app.#codex = codex;
     void codex?.refresh();
     app.#files = files;
@@ -509,6 +516,7 @@ export class AgentApp {
     app.#claudeLatest = new ClaudeLatestChecker({
       detectInstall: detectClaudeInstall,
       onChange: () => app.#emitMachine({ type: 'machine.info', info: app.machineInfo() }),
+      onChecked: (version) => void autoUpdate.onChecked(CLAUDE_ENGINE_ID, version),
       ...(deps.claudeLatest?.fetchImpl === undefined ? {} : { fetchImpl: deps.claudeLatest.fetchImpl }),
       ...(deps.claudeLatest?.configDir === undefined ? {} : { configDir: deps.claudeLatest.configDir }),
       now,
@@ -516,6 +524,14 @@ export class AgentApp {
     });
 
     void app.#claudeLatest.loadInstall();
+    // SDK 内置的 claude 无从更新：找不到全局 claude 就不提供自动更新
+    if (claude.path !== undefined) {
+      autoUpdate.register(CLAUDE_ENGINE_ID, {
+        currentVersion: () => app.claudeVersion,
+        update: () => app.#updater.run(),
+        check: () => app.#claudeLatest.check(),
+      });
+    }
     const codexPath = config.codexEnabled === true ? (Bun.which(config.codexBin ?? 'codex') ?? undefined) : undefined;
     if (codex !== undefined && codexPath !== undefined && deps.spawnCodexAppServer === undefined) {
       const spawn = deps.spawnFn;
@@ -536,9 +552,21 @@ export class AgentApp {
           ...(spawn === undefined ? {} : { spawn }),
           log,
         }),
-        latest: new CodexLatestChecker({ onChange: emitInfo, now, log, detectInstall: detectCodexInstall }),
+        latest: new CodexLatestChecker({
+          onChange: emitInfo,
+          onChecked: (version) => void autoUpdate.onChecked(CODEX_ENGINE_ID, version),
+          now,
+          log,
+          detectInstall: detectCodexInstall,
+        }),
       };
       void app.#codexUpdate.latest.loadInstall();
+      const codexUpdate = app.#codexUpdate;
+      autoUpdate.register(CODEX_ENGINE_ID, {
+        currentVersion: () => codex.summary().version,
+        update: () => codexUpdate.updater.run(),
+        check: () => codexUpdate.latest.check(),
+      });
       app.#codexDaemon = () => restartCodexDaemon(codexPath, spawn === undefined ? {} : { spawn });
     }
 
@@ -645,6 +673,7 @@ export class AgentApp {
     this.router.dispose();
     this.#updater.dispose();
     this.#claudeLatest.dispose();
+    this.#autoUpdate.dispose();
     this.#codexUpdate?.updater.dispose();
     this.#codexUpdate?.latest.dispose();
     this.#commandsProbe.dispose();
@@ -716,12 +745,12 @@ export class AgentApp {
       activeSessionCount: this.manager.activeCount,
       maxSessions: this.manager.maxConcurrent,
       rateLimits: this.#planUsage.current,
-      extensions: this.#extRegistry === undefined ? undefined : { ...this.#extRegistry.summary(), records: true, features: [...AGENT_EXT_FEATURES] },
+      extensions: this.#extRegistry === undefined ? undefined : { ...this.#extRegistry.summary(), records: true, features: [...AGENT_EXT_FEATURES], planEdit: true },
       restart: this.#restart === undefined ? undefined : this.#restartInfo(),
       claudeLatest: this.#claudeLatest?.current,
       files: this.#files === undefined ? undefined : this.#filesInfo(this.#files),
       engines: [
-        claudeEngineSummary(this.claudeVersion),
+        withAutoUpdate(claudeEngineSummary(this.claudeVersion), this.#autoUpdate?.state(CLAUDE_ENGINE_ID)),
         ...(this.#codex === undefined ? [] : [this.#codexSummary(this.#codex)]),
       ],
     });
@@ -732,12 +761,15 @@ export class AgentApp {
     const summary = { ...base, capabilities: { ...base.capabilities, restart: true } };
     if (this.#codexUpdate === undefined) return summary;
     const { install, ...latest } = this.#codexUpdate.latest.current;
-    return {
-      ...summary,
-      capabilities: { ...summary.capabilities, update: true },
-      latest,
-      ...(install === undefined ? {} : { install }),
-    };
+    return withAutoUpdate(
+      {
+        ...summary,
+        capabilities: { ...summary.capabilities, update: true },
+        latest,
+        ...(install === undefined ? {} : { install }),
+      },
+      this.#autoUpdate?.state(CODEX_ENGINE_ID),
+    );
   }
 
   /**
@@ -948,3 +980,7 @@ export class AgentApp {
 }
 
 export type { AgentToClientEvent };
+
+function withAutoUpdate(summary: EngineSummary, autoUpdate: EngineSummary['autoUpdate']): EngineSummary {
+  return autoUpdate === undefined ? summary : { ...summary, autoUpdate };
+}
