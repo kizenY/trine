@@ -133,8 +133,8 @@ export function SessionList({
     return { pinOrder, machineOrder };
   }, [machines]);
   const result = useMemo(
-    () => filterSessions(sessions, query, machineNames, pinnedCwds, doneAt, pinSort),
-    [sessions, query, machineNames, pinnedCwds, doneAt, pinSort],
+    () => filterSessions(sessions, query, machineNames, pinnedCwds, pinSort, doneAt),
+    [sessions, query, machineNames, pinnedCwds, pinSort, doneAt],
   );
   /** 置顶组的重排入口：旧 agent 不给（undefined）；离线 / 搜索筛选中给原因（禁用） */
   const pinMoveFor = (group: SessionGroup): PinMoveProps | undefined => {

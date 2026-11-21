@@ -858,6 +858,13 @@ export function SettingsView(): React.JSX.Element {
   return (
     <>
       <AppHead back="/" title="设置" />
+      <div className="@container/settings min-h-0 flex-1 overflow-y-auto px-4 pb-10 text-sm sm:px-6" data-testid="settings-scroll">
+        <div className="mx-auto grid w-full max-w-5xl gap-5 @min-[800px]/settings:grid-cols-[136px_minmax(0,1fr)] @min-[800px]/settings:gap-7">
+          <nav aria-label="设置分区" className="bg-background sticky top-0 z-10 -mx-4 flex gap-1 overflow-x-auto border-b border-border px-4 py-3 @min-[800px]/settings:mx-0 @min-[800px]/settings:mt-6 @min-[800px]/settings:flex-col @min-[800px]/settings:self-start @min-[800px]/settings:rounded-xl @min-[800px]/settings:border @min-[800px]/settings:p-2">
+            {SETTINGS_SECTIONS.map(([id, label]) => (
+              <a key={id} href={`#${id}`} className="text-text-2 hover:bg-surface-2 hover:text-text focus-visible:ring-brand shrink-0 rounded-lg px-3 py-2 text-xs font-medium outline-none focus-visible:ring-2">
+                {label}
+              </a>
             ))}
           </nav>
           <div className="flex min-w-0 flex-col gap-6 @min-[800px]/settings:pt-6">

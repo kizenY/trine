@@ -55,3 +55,6 @@ Thumbs.db
 .vscode/
 *.swp
 *.swo
+
+# Per-machine agent launcher / watchdog (holds relay URL and paths)
+ensure-agent.ps1

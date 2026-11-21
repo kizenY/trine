@@ -378,8 +378,8 @@ export function filterSessions(
   query: ListQuery,
   machineNames: Record<string, string> = {},
   pinnedCwds: PinnedCwds = {},
-  doneAt: Record<string, number> = {},
   pinSort: PinSortContext = {},
+  doneAt: Record<string, number> = {},
 ): FilterResult {
   // 1. 机器（顺手带上「已完成」本地标记，后续状态筛选 / 排序要用）
   const scoped: SessionRowData[] = [];
