@@ -1,4 +1,6 @@
 /** AgentApp → ControlHost 适配（控制通道只依赖这层窄接口，便于单测） */
+import { CLAUDE_ENGINE_ID, type PermissionMode } from '@trine/core';
+import { httpBase } from '@trine/core/net';
 import type { AgentApp } from '../app/app.ts';
 import type { PairingSession } from '../net/pairing.ts';
 import { toListItem } from '../ext/commands.ts';
@@ -34,6 +36,27 @@ export function agentControlHost(app: AgentApp): ControlHost {
       request: ({ now, notice }) => app.restartAgent({ mode: now ? 'now' : 'when_idle', notice }),
       cancel: () => app.cancelRestart(),
       pending: () => app.machineInfo().restart?.pending,
+    },
+    createSession: async ({ cwd, prompt, engine, model, permissionMode, engineMode }) => {
+      // 复用 Web 端建会话的同一条内部路径（router.extHost().createSession）。
+      // ext / links 走空值：命令行建会话没有扩展关联，其余（首条消息、标题）与网页一致。
+      const result = await app.router.extHost().createSession({
+        cwd,
+        model: model ?? app.defaultModel,
+        permissionMode: (permissionMode ?? 'default') as PermissionMode,
+        ...(engine === undefined ? {} : { engine }),
+        ...(engineMode === undefined ? {} : { engineMode }),
+        ext: '',
+        links: [],
+        prompt,
+      });
+      const resolvedEngine = engine ?? CLAUDE_ENGINE_ID;
+      return {
+        sessionId: result.sessionId,
+        engine: resolvedEngine,
+        ...(result.sendError === undefined ? {} : { sendError: result.sendError }),
+        deepLink: `${httpBase(app.node.serverUrl)}/s/${app.node.machineId}/${result.sessionId}`,
+      };
     },
   };
 }

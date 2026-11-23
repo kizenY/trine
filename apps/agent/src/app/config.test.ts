@@ -1,4 +1,5 @@
 import { describe, expect, test } from 'bun:test';
+import { resolve } from 'node:path';
 import { ConfigError, DEFAULT_MODEL, agentPaths, loadAgentConfig, parseSubcommand } from './config.ts';
 
 const env = { TRINE_SERVER: 'https://relay.example' };
@@ -146,5 +147,25 @@ describe('parseSubcommand', () => {
     expect(() => parseSubcommand(['devices', 'revoke'], {})).toThrow(ConfigError);
     expect(() => parseSubcommand(['pair', '--server', 'https://x'], {})).toThrow(/不认识的开关/);
     expect(() => parseSubcommand(['pair', '--home'], {})).toThrow(/需要一个值/);
+  });
+
+  test('session new：cwd 解析成绝对路径，必填与枚举校验', () => {
+    expect(parseSubcommand(['session', 'new', '--cwd', '/repo', '--prompt', 'hi'], {})?.command).toEqual({
+      name: 'session.new',
+      cwd: resolve('/repo'),
+      prompt: 'hi',
+    });
+    expect(
+      parseSubcommand(
+        ['session', 'new', '--cwd', '/r', '--prompt', 'x', '--engine', 'codex', '--model', 'gpt-5', '--engine-mode', 'full'],
+        {},
+      )?.command,
+    ).toEqual({ name: 'session.new', cwd: resolve('/r'), prompt: 'x', engine: 'codex', model: 'gpt-5', engineMode: 'full' });
+    // 必填缺失 / 非法枚举 / 未知动词
+    expect(() => parseSubcommand(['session', 'new', '--prompt', 'x'], {})).toThrow(/--cwd/);
+    expect(() => parseSubcommand(['session', 'new', '--cwd', '/r'], {})).toThrow(/--prompt/);
+    expect(() => parseSubcommand(['session', 'new', '--cwd', '/r', '--prompt', 'x', '--engine', 'bogus'], {})).toThrow(/--engine/);
+    expect(() => parseSubcommand(['session', 'new', '--cwd', '/r', '--prompt', 'x', '--permission-mode', 'nope'], {})).toThrow(/--permission-mode/);
+    expect(() => parseSubcommand(['session', 'bogus'], {})).toThrow(ConfigError);
   });
 });

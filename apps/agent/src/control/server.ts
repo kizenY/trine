@@ -46,6 +46,21 @@ export interface ControlHost {
     /** 排空进度（restart.result 附带给命令行看） */
     pending(): { busySessions: number; deadline?: number } | undefined;
   };
+  /** 新建会话（session.new）；不给 = 不支持（测试） */
+  createSession?: (args: {
+    cwd: string;
+    prompt: string;
+    engine?: 'claude' | 'codex';
+    model?: string;
+    permissionMode?: string;
+    engineMode?: string;
+  }) => Promise<{
+    sessionId: string;
+    deepLink: string;
+    engine: string;
+    engineMode?: string;
+    sendError?: string;
+  }>;
 }
 
 export interface ControlServerOptions {
@@ -291,6 +306,38 @@ export class ControlServer {
                 ...(outcome.output === undefined ? {} : { output: outcome.output }),
               },
         );
+        return;
+      }
+      case 'session.new': {
+        const create = this.host.createSession;
+        if (create === undefined) throw new Error('这个 agent 不支持新建会话');
+        let result;
+        try {
+          result = await create({
+            cwd: request.cwd,
+            prompt: request.prompt,
+            ...(request.engine === undefined ? {} : { engine: request.engine }),
+            ...(request.model === undefined ? {} : { model: request.model }),
+            ...(request.permissionMode === undefined ? {} : { permissionMode: request.permissionMode }),
+            ...(request.engineMode === undefined ? {} : { engineMode: request.engineMode }),
+          });
+        } catch (err) {
+          this.#send(conn, {
+            ev: 'session.new.response',
+            ok: false,
+            message: err instanceof Error ? err.message : String(err),
+          });
+          return;
+        }
+        this.#send(conn, {
+          ev: 'session.new.response',
+          ok: true,
+          sessionId: result.sessionId,
+          deepLink: result.deepLink,
+          engine: result.engine,
+          ...(result.engineMode === undefined ? {} : { engineMode: result.engineMode }),
+          ...(result.sendError === undefined ? {} : { sendError: result.sendError }),
+        });
         return;
       }
     }

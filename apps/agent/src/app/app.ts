@@ -209,6 +209,8 @@ export class AgentApp {
     readonly outbox: Outbox,
     readonly cwdStore: CwdStore,
     readonly flags: SessionFlagsStore,
+    /** 未指明模型时新建会话用的兜底（TRINE_DEFAULT_MODEL；控制通道 session.new 复用） */
+    readonly defaultModel: string,
     private readonly log: (line: string) => void,
     private readonly now: () => number,
     private claudeVersion: string,
@@ -469,6 +471,7 @@ export class AgentApp {
       outbox,
       cwdStore,
       flags,
+      config.defaultModel,
       log,
       now,
       claudeVersion,

@@ -28,6 +28,15 @@ export type Subcommand =
   | { name: 'selfcheck' }
   | { name: 'restart'; now: boolean; sessionId?: string; note?: string; continuePrompt?: string }
   | { name: 'restart.cancel' }
+  | {
+      name: 'session.new';
+      cwd: string;
+      prompt: string;
+      engine?: 'claude' | 'codex';
+      model?: string;
+      permissionMode?: 'default' | 'acceptEdits' | 'plan' | 'bypassPermissions';
+      engineMode?: 'read-only' | 'workspace' | 'full';
+    }
   | ExtSubcommand;
 
 export interface CommandIO {
@@ -146,6 +155,28 @@ async function runOnline(command: Subcommand, client: ControlClient, io: Command
     case 'restart':
     case 'restart.cancel':
       return runRestart(command, client, io);
+    case 'session.new': {
+      const event = await client.request({
+        op: 'session.new',
+        cwd: command.cwd,
+        prompt: command.prompt,
+        ...(command.engine === undefined ? {} : { engine: command.engine }),
+        ...(command.model === undefined ? {} : { model: command.model }),
+        ...(command.permissionMode === undefined ? {} : { permissionMode: command.permissionMode }),
+        ...(command.engineMode === undefined ? {} : { engineMode: command.engineMode }),
+      });
+      if (event?.ev !== 'session.new.response') return unexpected(event, io);
+      if (!event.ok) {
+        io.print(`新建会话失败：${event.message ?? '未知原因'}`);
+        return 1;
+      }
+      io.print(`已新建会话 ${event.sessionId}`);
+      if (event.deepLink !== undefined) io.print(`深链：${event.deepLink}`);
+      if (event.sendError !== undefined) {
+        io.print(`注意：首条消息发送失败（会话已建好，可在网页里重发）：${event.sendError}`);
+      }
+      return 0;
+    }
     default:
       return 2;
   }
@@ -333,6 +364,10 @@ async function runOffline(command: Subcommand, home: string, io: CommandIO): Pro
       'agent 没有在运行。先启动它（例如 systemctl --user start trine-agent），' +
         (command.name === 'pair' ? '再运行 pair；或者前台运行 trine-agent --pair。' : '再查看状态。'),
     );
+    return 1;
+  }
+  if (command.name === 'session.new') {
+    io.print('agent 没有在运行。先启动它（例如 systemctl --user start trine-agent），再新建会话。');
     return 1;
   }
 

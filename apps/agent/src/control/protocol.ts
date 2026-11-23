@@ -53,6 +53,20 @@ export const ControlRequestSchema = z.discriminatedUnion('op', [
     continuePrompt: z.string().max(4000).optional(),
   }),
   z.object({ op: z.literal('restart.cancel') }),
+  /**
+   * 新建会话（`session new` 子命令）：复用 Web 端 session.create 的同一条内部路径。
+   * cwd 由子命令解析成绝对路径再发；model 省略时用 agent 自己的 defaultModel。
+   * permissionMode / engineMode 的枚举与 core 的 PermissionMode / Codex 模式一致。
+   */
+  z.object({
+    op: z.literal('session.new'),
+    cwd: z.string().min(1).max(4096),
+    prompt: z.string().max(4000),
+    engine: z.enum(['claude', 'codex']).optional(),
+    model: z.string().min(1).max(256).optional(),
+    permissionMode: z.enum(['default', 'acceptEdits', 'plan', 'bypassPermissions']).optional(),
+    engineMode: z.enum(['read-only', 'workspace', 'full']).optional(),
+  }),
 ]);
 export type ControlRequest = z.infer<typeof ControlRequestSchema>;
 
@@ -106,6 +120,17 @@ export const ControlEventSchema = z.discriminatedUnion('ev', [
     code: z.string().optional(),
     message: z.string().optional(),
     output: z.string().optional(),
+  }),
+  z.object({
+    ev: z.literal('session.new.response'),
+    ok: z.boolean(),
+    sessionId: z.string().optional(),
+    deepLink: z.string().optional(),
+    engine: z.string().optional(),
+    engineMode: z.string().optional(),
+    /** 会话已建好，但首条消息发送失败（可在网页里重发） */
+    sendError: z.string().optional(),
+    message: z.string().optional(),
   }),
   /** 请求出错；`fatal` 时 daemon 随后关闭连接 */
   z.object({ ev: z.literal('error'), message: z.string(), fatal: z.boolean().optional() }),

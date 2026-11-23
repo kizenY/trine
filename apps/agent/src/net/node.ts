@@ -137,6 +137,11 @@ export class AgentNode {
     return this.identity.machineId;
   }
 
+  /** 服务端根地址（拼深链、回退端点等用） */
+  get serverUrl(): string {
+    return this.options.serverUrl;
+  }
+
   /**
    * 入站 seq 游标（按发送方 × 会话）。暴露出来是为了让接线层持久化它：
    * 游标本身是内存态，进程重启后不补发、重放防护清零，都要靠上层在

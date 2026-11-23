@@ -98,6 +98,7 @@ export const USAGE = `用法：trine-agent [--enroll] [--pair] [--server URL] [-
       trine-agent ext <list | add DIR | remove ID | reload [ID] | validate DIR | test ID OP [...]> [--home DIR]
       trine-agent restart [--now] [--note TEXT] [--continue PROMPT] [--session ID] [--home DIR]
       trine-agent restart cancel [--home DIR]
+      trine-agent session new --cwd DIR --prompt TEXT [--engine claude|codex] [--model M] [--permission-mode MODE] [--engine-mode MODE] [--home DIR]
 
   --enroll        未注册时从隐藏终端输入（或 stdin 一行）读取短期邀请，不保存
   --pair          启动后打出配对二维码，等 client 扫码并在终端确认 SAS
@@ -128,6 +129,13 @@ export const USAGE = `用法：trine-agent [--enroll] [--pair] [--server URL] [-
     --continue PROMPT  重启后把这段话作为一条消息发进发起会话（让 Claude 接着核实）
     --session ID    发起会话（默认取会话里的 env TRINE_SESSION_ID）
   restart cancel  取消还没执行的重启
+  session new     在运行中的 agent 上新建一个会话，指定工作目录与首条消息，打印 sessionId 与深链
+    --cwd DIR       会话工作目录（相对路径按本终端 cwd 解析成绝对路径）
+    --prompt TEXT   首条消息
+    --engine claude|codex  引擎，默认 claude
+    --model M       模型；省略用 agent 自己的默认模型
+    --permission-mode MODE  Claude 权限模式（default/acceptEdits/plan/bypassPermissions），默认 default
+    --engine-mode MODE     Codex 权限模式（read-only/workspace/full），仅 --engine codex 时用
   selfcheck       加载全部代码后退出（重启预检用）
 
 env：TRINE_DEFAULT_MODEL  TRINE_MAX_SESSIONS  TRINE_IDLE_TIMEOUT_MS
@@ -159,6 +167,8 @@ export function parseSubcommand(
   const isRestart = first === 'restart';
   const restartFlags: Record<string, string> = {};
   let restartNow = false;
+  const isSession = first === 'session';
+  const sessionFlags: Record<string, string> = {};
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i]!;
     if (arg === '--home' || arg.startsWith('--home=')) {
@@ -184,6 +194,12 @@ export function parseSubcommand(
       const value = argv[++i];
       if (value === undefined) throw new ConfigError(`${arg} 需要一个值`);
       restartFlags[arg.slice(2)] = value;
+      continue;
+    }
+    if (isSession && ['--cwd', '--prompt', '--engine', '--model', '--permission-mode', '--engine-mode'].includes(arg)) {
+      const value = argv[++i];
+      if (value === undefined || value === '') throw new ConfigError(`${arg} 需要一个值`);
+      sessionFlags[arg.slice(2)] = value;
       continue;
     }
     if (arg.startsWith('--')) throw new ConfigError(`子命令不认识的开关：${arg}\n\n${USAGE}`);
@@ -234,6 +250,38 @@ export function parseSubcommand(
         ...(extFlags.session === undefined ? {} : { session: extFlags.session }),
         ...(extFlags.args === undefined ? {} : { args: extFlags.args }),
         ...(extFlags.features === undefined ? {} : { features: extFlags.features }),
+      };
+    }
+  } else if (name === 'session') {
+    const [verb, ...args] = rest;
+    if (verb === 'new' && args.length === 0) {
+      const cwd = sessionFlags.cwd;
+      if (cwd === undefined) throw new ConfigError('session new 需要 --cwd DIR');
+      const prompt = sessionFlags.prompt;
+      if (prompt === undefined) throw new ConfigError('session new 需要 --prompt TEXT');
+      const engine = sessionFlags.engine;
+      if (engine !== undefined && engine !== 'claude' && engine !== 'codex') {
+        throw new ConfigError('--engine 只能是 claude 或 codex');
+      }
+      const permissionMode = sessionFlags['permission-mode'];
+      if (permissionMode !== undefined && !['default', 'acceptEdits', 'plan', 'bypassPermissions'].includes(permissionMode)) {
+        throw new ConfigError('--permission-mode 只能是 default / acceptEdits / plan / bypassPermissions');
+      }
+      const engineMode = sessionFlags['engine-mode'];
+      if (engineMode !== undefined && !['read-only', 'workspace', 'full'].includes(engineMode)) {
+        throw new ConfigError('--engine-mode 只能是 read-only / workspace / full');
+      }
+      command = {
+        name: 'session.new',
+        // cwd 在这里解析成绝对路径：控制通道那头的 agent 不知道本终端的 cwd
+        cwd: resolve(cwd),
+        prompt,
+        ...(engine === undefined ? {} : { engine: engine as 'claude' | 'codex' }),
+        ...(sessionFlags.model === undefined ? {} : { model: sessionFlags.model }),
+        ...(permissionMode === undefined
+          ? {}
+          : { permissionMode: permissionMode as 'default' | 'acceptEdits' | 'plan' | 'bypassPermissions' }),
+        ...(engineMode === undefined ? {} : { engineMode: engineMode as 'read-only' | 'workspace' | 'full' }),
       };
     }
   }

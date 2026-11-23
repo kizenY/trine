@@ -116,6 +116,15 @@ describe('控制通道 · 端到端', () => {
     browser.close();
   });
 
+  test('session new 子命令：复用 Web 路径建会话，打印 sessionId 与深链', async () => {
+    const io = new ScriptIO([]);
+    const cwd = join(home, 'proj');
+    expect(await runSubcommand({ name: 'session.new', cwd, prompt: '你好，世界' }, home, io)).toBe(0);
+    expect(io.output).toContain('已新建会话 ');
+    expect(io.output).toMatch(/深链：http:\/\/127\.0\.0\.1:\d+\/s\/mbp\/[0-9a-f-]{36}/);
+    expect(app.manager.activeSessionIds).toHaveLength(1);
+  });
+
   test('devices revoke：运行中的 agent 立即移除，status 反映新数目', async () => {
     await app.node.recipients.add({ deviceId: 'web-stale', boxPubKey: 'b', signPubKey: 's', pairedAt: 1 });
     const io = new ScriptIO([]);

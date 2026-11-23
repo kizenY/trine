@@ -51,6 +51,9 @@ class FakeHost implements ControlHost {
     cancel: (): RestartOutcome => ({ ok: true, phase: 'cancelled' }),
     pending: () => ({ busySessions: 1, deadline: Date.UTC(2026, 9, 21, 4, 30) }),
   };
+  /** session.new 的参数记录与可替换结果（测试按需接上 createSession） */
+  createSessionCalls: Parameters<NonNullable<ControlHost['createSession']>>[0][] = [];
+  createSession: ControlHost['createSession'] | undefined = undefined;
 
   status() {
     return { machineId: 'm-test', name: 'test-box', online: true, devices: this.devices.length };
@@ -186,6 +189,63 @@ describe('控制通道：查询与设备管理（agent 在运行）', () => {
     writeFileSync(path, 'not a socket');
     const s = new ControlServer(new FakeHost());
     await expect(s.listen(path)).rejects.toThrow(/不是 socket/);
+  });
+});
+
+describe('控制通道：session.new', () => {
+  test('转发参数并打印 sessionId 与深链', async () => {
+    const host = new FakeHost();
+    host.createSession = async (args) => {
+      host.createSessionCalls.push(args);
+      return { sessionId: 'sess-1', deepLink: 'https://relay.example/s/m-test/sess-1', engine: 'codex', engineMode: 'full' };
+    };
+    await startServer(host);
+    const io = new ScriptIO([]);
+    expect(
+      await run(
+        { name: 'session.new', cwd: '/repo', prompt: 'hi', engine: 'codex', model: 'gpt-5', permissionMode: 'default', engineMode: 'full' },
+        io,
+      ),
+    ).toBe(0);
+    expect(host.createSessionCalls).toEqual([
+      { cwd: '/repo', prompt: 'hi', engine: 'codex', model: 'gpt-5', permissionMode: 'default', engineMode: 'full' },
+    ]);
+    expect(io.output).toContain('已新建会话 sess-1');
+    expect(io.output).toContain('深链：https://relay.example/s/m-test/sess-1');
+  });
+
+  test('首条消息发送失败也返回成功，附 sendError 提示', async () => {
+    const host = new FakeHost();
+    host.createSession = async () => ({ sessionId: 'sess-2', deepLink: 'https://relay.example/s/m-test/sess-2', engine: 'claude', sendError: '会话已删除' });
+    await startServer(host);
+    const io = new ScriptIO([]);
+    expect(await run({ name: 'session.new', cwd: '/r', prompt: 'x' }, io)).toBe(0);
+    expect(io.output).toContain('已新建会话 sess-2');
+    expect(io.output).toContain('首条消息发送失败');
+  });
+
+  test('daemon 报错 → 退出码 1 并打印原因', async () => {
+    const host = new FakeHost();
+    host.createSession = async () => {
+      throw new Error('活跃会话已达上限 10');
+    };
+    await startServer(host);
+    const io = new ScriptIO([]);
+    expect(await run({ name: 'session.new', cwd: '/r', prompt: 'x' }, io)).toBe(1);
+    expect(io.output).toContain('新建会话失败：活跃会话已达上限 10');
+  });
+
+  test('agent 不支持新建会话（旧版本）→ 退出码 1', async () => {
+    await startServer(new FakeHost()); // 没接 createSession
+    const io = new ScriptIO([]);
+    expect(await run({ name: 'session.new', cwd: '/r', prompt: 'x' }, io)).toBe(1);
+    expect(io.output).toContain('不支持新建会话');
+  });
+
+  test('agent 没在运行 → 提示先启动', async () => {
+    const io = new ScriptIO([]);
+    expect(await run({ name: 'session.new', cwd: '/r', prompt: 'x' }, io)).toBe(1);
+    expect(io.output).toContain('agent 没有在运行');
   });
 });
 
