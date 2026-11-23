@@ -91,6 +91,11 @@ export interface ServerConfig {
    */
   pushAliases: string;
   /**
+   * 在默认白名单之外追加的推送服务主机后缀，逗号分隔
+   * （默认已含 FCM / Apple / Mozilla autopush / WNS）。
+   */
+  pushAllowedHosts: string;
+  /**
    * Web Push 的 VAPID subject（RFC 8292）：mailto: 或 https:// 开头。
    * iOS 的推送服务拒绝 localhost 域的 mailto（403 BadJwtToken），iPhone
    * 用户务必配成本服务的 https 地址。
@@ -264,6 +269,7 @@ function buildConfig(overrides: Partial<ServerConfig>): ServerConfig {
     pushSuppressWhenOnline: process.env.TRINE_PUSH_SUPPRESS_ONLINE !== '0',
     pushDedupeWindowMs: envInt('TRINE_PUSH_DEDUPE_MS', 30_000),
     pushAliases: process.env.TRINE_PUSH_ALIAS ?? '',
+    pushAllowedHosts: process.env.TRINE_PUSH_ALLOWED_HOSTS ?? '',
     vapidSubject: (process.env.TRINE_VAPID_SUBJECT ?? '').trim(),
 
     corsOrigins: parseCorsOrigins(process.env.TRINE_CORS_ORIGINS ?? ''),

@@ -84,6 +84,73 @@ const PENDING_HINTS: ReadonlySet<PushHint> = new Set<PushHint>([
 ]);
 
 /**
+ * 已知推送服务的主机后缀。
+ *
+ * endpoint 由客户端上报，relay 会拿它发 POST；不设边界的话，一个已认证的
+ * client 就能让中转去请求任意 https 地址。这里只放行真实存在的推送服务，
+ * 需要接新服务时用 env `TRINE_PUSH_ALLOWED_HOSTS` 追加。
+ */
+const DEFAULT_ALLOWED_PUSH_HOSTS = [
+  'fcm.googleapis.com', // Chrome / Edge（Android）
+  'push.apple.com', // Safari / iOS PWA（web.push.apple.com、*.push.apple.com）
+  'push.services.mozilla.com', // Firefox autopush（updates.push.services.mozilla.com）
+  'notify.windows.com', // Edge（Windows，WNS）
+];
+
+/** VAPID 初始化失败后的静默期：别每来一帧就重试并打一条日志 */
+const VAPID_RETRY_MS = 60_000;
+
+/** 内网 / 回环 / 链路本地地址：即便通过了域名白名单也不该被 POST */
+function isPrivateHost(hostname: string): boolean {
+  const host = hostname.toLowerCase().replace(/^\[|\]$/g, '');
+  const v4 = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(host);
+  if (v4) {
+    const a = Number(v4[1]);
+    const b = Number(v4[2]);
+    if (a === 0 || a === 10 || a === 127) return true;
+    if (a === 169 && b === 254) return true; // 链路本地
+    if (a === 172 && b >= 16 && b <= 31) return true;
+    if (a === 192 && b === 168) return true;
+    return false;
+  }
+  if (host.includes(':')) {
+    // IPv6 字面量：::1、::、fc00::/7（唯一本地）、fe80::/10（链路本地）
+    if (host === '::1' || host === '::') return true;
+    if (/^f[cd]/.test(host)) return true;
+    if (/^fe[89ab]/.test(host)) return true;
+    return false;
+  }
+  return host === 'localhost' || host.endsWith('.localhost');
+}
+
+/**
+ * 订阅端点校验：https + 已知推送服务 + 非内网。
+ *
+ * 返回错误文案是给人看的（设置页会原样展示回执里的 `error`）。
+ */
+export function checkPushEndpoint(
+  endpoint: string,
+  extraHosts: readonly string[] = [],
+): { ok: true } | { ok: false; error: string } {
+  let url: URL;
+  try {
+    url = new URL(endpoint);
+  } catch {
+    return { ok: false, error: '推送端点不是合法 URL' };
+  }
+  if (url.protocol !== 'https:') return { ok: false, error: '推送端点必须 https' };
+  const host = url.hostname.toLowerCase();
+  if (isPrivateHost(host)) return { ok: false, error: '推送端点指向内网地址' };
+  const allowed = [
+    ...DEFAULT_ALLOWED_PUSH_HOSTS,
+    ...extraHosts.map((h) => h.trim().toLowerCase()).filter((h) => h !== ''),
+  ];
+  const matches = allowed.some((h) => host === h || host.endsWith(`.${h}`));
+  if (!matches) return { ok: false, error: '推送端点不是已知的推送服务' };
+  return { ok: true };
+}
+
+/**
  * 通知 tag：机器 + 会话 + 类别。
  *
  * tag 相同会替换旧通知（这是 SW 折叠的机制），所以必须细到会话——否则同机器
@@ -114,6 +181,8 @@ export interface WebPushDeps {
   isDeviceOnline: (deviceId: string) => boolean;
   /** 机器标识别名，与 Bark 渠道同一份 TRINE_PUSH_ALIAS 原串 */
   rawAlias?: string;
+  /** 在默认白名单之外追加允许的推送服务主机后缀（env TRINE_PUSH_ALLOWED_HOSTS） */
+  allowedHostSuffixes?: readonly string[];
   /** VAPID subject（env TRINE_VAPID_SUBJECT）；iOS 需配 https 域名，见 DEFAULT_VAPID_SUBJECT 注释 */
   vapidSubject?: string;
   fetchImpl?: PushFetch;
@@ -126,7 +195,17 @@ export interface WebPushDeps {
 
 export type DeliverOutcome =
   | { kind: 'sent' }
-  | { kind: 'skipped'; reason: 'no_subscription' | 'device_online' | 'revoked' | 'muted' | 'deduped' | 'disabled' }
+  | {
+      kind: 'skipped';
+      reason:
+        | 'no_subscription'
+        | 'device_online'
+        | 'revoked'
+        | 'untrusted_endpoint'
+        | 'muted'
+        | 'deduped'
+        | 'disabled';
+    }
   | { kind: 'failed'; status?: number };
 
 export class WebPushService {
@@ -139,14 +218,21 @@ export class WebPushService {
   readonly #dedupeWindowMs: number;
   readonly #timeoutMs: number;
   readonly #subject: string;
-  /** 去抖记录：key = device|machine|session|hint → 上次推送时刻 */
+  readonly #allowedHosts: readonly string[];
+  /** 去抖记录：key = device|machine|session|hint → 上次**成功**推送时刻 */
   readonly #lastSentAt = new Map<string, number>();
+  /** 正在投递中的 key：HTTP 完成前不放行同键重入（去抖改为成功后回填） */
+  readonly #inflight = new Set<string>();
+  /** 页面前后台状态：只有**在线且可见**才做在线抑制 */
+  readonly #visible = new Map<string, boolean>();
   #vapid: { publicKey: string; privateKey: string } | null = null;
+  #vapidRetryAt = 0;
 
   constructor(deps: WebPushDeps) {
     this.#store = deps.store;
     this.#isDeviceOnline = deps.isDeviceOnline;
     this.#aliases = parseAliases(deps.rawAlias);
+    this.#allowedHosts = deps.allowedHostSuffixes ?? [];
     this.#fetchImpl = deps.fetchImpl ?? globalThis.fetch;
     this.#log = deps.log ?? (() => {});
     this.#now = deps.now ?? (() => Date.now());
@@ -161,16 +247,20 @@ export class WebPushService {
    */
   get vapidPublicKey(): string | null {
     if (this.#vapid === null) {
+      const now = this.#now();
+      // 失败后静默一分钟再试：每来一帧都重试既白费也刷日志
+      if (now < this.#vapidRetryAt) return null;
       try {
         this.#vapid = this.#store.getOrInitVapid(() => {
           const keys = generateVAPIDKeys();
           return { publicKey: keys.publicKey, privateKey: keys.privateKey };
-        }, this.#now());
+        }, now);
         setVapidDetails(
           this.#subject, this.#vapid.publicKey, this.#vapid.privateKey,
         );
       } catch (err) {
         // 推送是旁路，初始化失败只记日志：订阅/投递会各自返回 disabled/failed
+        this.#vapidRetryAt = now + VAPID_RETRY_MS;
         this.#log(`[webpush] VAPID 初始化失败：${String((err as Error).message ?? err)}`);
         return null;
       }
@@ -182,12 +272,27 @@ export class WebPushService {
   subscribe(
     deviceId: string,
     sub: { endpoint: string; keys: { p256dh: string; auth: string } },
-  ): void {
+  ): { ok: true } | { ok: false; error: string } {
+    // endpoint 是 relay 的出站目标：只允许已知推送服务，别让它变成任意地址的 POST 代理
+    const check = checkPushEndpoint(sub.endpoint, this.#allowedHosts);
+    if (!check.ok) {
+      this.#log(`[webpush] 拒绝订阅 ${deviceId}：${check.error}`);
+      return check;
+    }
     this.#store.upsertPushSubscription(
       { deviceId, endpoint: sub.endpoint, p256dh: sub.keys.p256dh, auth: sub.keys.auth },
       this.#now(),
     );
     this.#log(`[webpush] 设备已订阅 ${deviceId}`);
+    return { ok: true };
+  }
+
+  /**
+   * 页面前后台状态（hub 在 push.visibility 帧处调用）。
+   * `hidden` 时不做在线抑制：锁屏/切后台正是要收通知的时候。
+   */
+  setVisibility(deviceId: string, visible: boolean): void {
+    this.#visible.set(deviceId, visible);
   }
 
   /** client 退订；endpoint 对不上也无妨（幂等，删的是该设备的行） */
@@ -221,8 +326,16 @@ export class WebPushService {
 
     const sub = this.#store.getPushSubscription(event.recipientDeviceId);
     if (sub === null) return { kind: 'skipped', reason: 'no_subscription' };
+    // 库里可能有白名单生效前写入的旧端点，投递前再查一次
+    if (!checkPushEndpoint(sub.endpoint, this.#allowedHosts).ok) {
+      return { kind: 'skipped', reason: 'untrusted_endpoint' };
+    }
 
-    if (this.#isDeviceOnline(event.recipientDeviceId)) {
+    // 在线抑制只在「在线且可见」时生效：锁屏/切后台后 WebSocket 可能半死
+    // 到 idleTimeoutMs，那段时间不收通知恰好错过主场景。老客户端不上报
+    // 可见性（get 为 undefined）时沿用原行为
+    if (this.#isDeviceOnline(event.recipientDeviceId)
+      && this.#visible.get(event.recipientDeviceId) !== false) {
       // 在线设备不推也**不记去抖**（与 dispatcher 同款细节：否则人一下线，
       // 本该推的第一条会被抑制期的记录压掉）
       return { kind: 'skipped', reason: 'device_online' };
@@ -242,8 +355,9 @@ export class WebPushService {
     if (last !== undefined && now - last < this.#dedupeWindowMs) {
       return { kind: 'skipped', reason: 'deduped' };
     }
-    this.#lastSentAt.set(key, now);
-    if (this.#lastSentAt.size > 256) this.#sweepDedupe(now);
+    // 同一 key 的上一发还在路上：别并发重发（去抖改为成功后回填，
+    // 这里补上窗口内重入保护）
+    if (this.#inflight.has(key)) return { kind: 'skipped', reason: 'deduped' };
 
     const message = renderPushMessage(
       { machineId: event.machineId, hint: event.hint, at: now },
@@ -263,8 +377,10 @@ export class WebPushService {
         JSON.stringify(payload),
         { TTL: TTL_BY_HINT[event.hint], urgency: URGENCY_BY_HINT[event.hint] },
       );
-      this.#post(event.recipientDeviceId, req.endpoint as string, req.headers as Record<string, string>, req.body as Buffer)
-        .catch(() => { /* 错误在 #post 内已处理 */ });
+      this.#inflight.add(key);
+      this.#post(key, event.recipientDeviceId, req.endpoint as string, req.headers as Record<string, string>, req.body as Buffer)
+        .catch(() => { /* 错误在 #post 内已处理 */ })
+        .finally(() => { this.#inflight.delete(key); });
     } catch (err) {
       this.#log(`[webpush] 构造请求失败：${String((err as Error).message ?? err)}`);
       return { kind: 'failed' };
@@ -274,6 +390,7 @@ export class WebPushService {
 
   /** 单次投递：5s 超时；4xx 不重试；404/410 = 订阅失效，清掉 */
   async #post(
+    key: string,
     deviceId: string,
     url: string,
     headers: Record<string, string>,
@@ -294,7 +411,12 @@ export class WebPushService {
       }
       if (!res.ok) {
         this.#log(`[webpush] 投递失败 HTTP ${res.status}`);
+        return;
       }
+      // 只有送达才占用去抖窗口：超时/5xx 不该挡住紧接着的下一条事件
+      const now = this.#now();
+      this.#lastSentAt.set(key, now);
+      if (this.#lastSentAt.size > 256) this.#sweepDedupe(now);
     } catch (err) {
       this.#log(`[webpush] 投递异常：${String((err as Error).message ?? err)}`);
     }

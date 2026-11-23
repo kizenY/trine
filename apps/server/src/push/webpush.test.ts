@@ -9,7 +9,7 @@ import { describe, expect, test } from 'bun:test';
 import { generateVAPIDKeys } from 'web-push';
 import { loadConfig, type ServerConfig } from '../config.ts';
 import { Store } from '../store/index.ts';
-import { WebPushService, pushTag } from './webpush.ts';
+import { WebPushService, pushTag, checkPushEndpoint } from './webpush.ts';
 import { RelayHub } from '../ws/hub.ts';
 import { ConnectionRegistry, type Conn, type Sendable } from '../ws/registry.ts';
 
@@ -78,8 +78,8 @@ describe('订阅存取', () => {
     svc.subscribe('phone', SUB);
     expect(store.getPushSubscription('phone')?.endpoint).toBe(SUB.endpoint);
     // 同设备换 endpoint(浏览器轮换) → 覆盖
-    svc.subscribe('phone', { ...SUB, endpoint: 'https://fcm.example/new' });
-    expect(store.getPushSubscription('phone')?.endpoint).toBe('https://fcm.example/new');
+    svc.subscribe('phone', { ...SUB, endpoint: 'https://fcm.googleapis.com/fcm/send/new' });
+    expect(store.getPushSubscription('phone')?.endpoint).toBe('https://fcm.googleapis.com/fcm/send/new');
     svc.unsubscribe('phone');
     expect(store.getPushSubscription('phone')).toBeNull();
     svc.unsubscribe('phone'); // 再删不炸
@@ -120,18 +120,22 @@ describe('deliverTo:按设备定向的抑制与去抖', () => {
       .toBe('sent');
   });
 
-  test('同(设备,机器,会话,hint)窗口内去抖,不同会话不去抖', () => {
+  test('同(设备,机器,会话,hint)窗口内去抖,不同会话不去抖', async () => {
     let clock = 1_000_000;
     const svc = makeService({ now: () => clock });
     svc.subscribe('phone', SUB);
+    // 去抖只在投递成功后才登记,所以每次投递后要等 FakeFetch 的 promise 落地
+    const settle = () => new Promise((r) => setTimeout(r, 10));
     const e1 = svc.deliverTo({ machineId: 'mbp', recipientDeviceId: 'phone', sessionId: 's1', hint: 'permission_pending' });
     expect(e1.kind).toBe('sent');
+    await settle();
     clock += 5_000; // 30s 窗口内
     expect(svc.deliverTo({ machineId: 'mbp', recipientDeviceId: 'phone', sessionId: 's1', hint: 'permission_pending' }))
       .toEqual({ kind: 'skipped', reason: 'deduped' });
     // 另一个会话同时要权限:是另一件事,该推
     expect(svc.deliverTo({ machineId: 'mbp', recipientDeviceId: 'phone', sessionId: 's2', hint: 'permission_pending' }).kind)
       .toBe('sent');
+    await settle();
     clock += 31_000; // 窗口过期
     expect(svc.deliverTo({ machineId: 'mbp', recipientDeviceId: 'phone', sessionId: 's1', hint: 'permission_pending' }).kind)
       .toBe('sent');
@@ -169,6 +173,88 @@ describe('deliverTo:按设备定向的抑制与去抖', () => {
     expect(fetch.calls.length).toBe(1);
     expect(svc.deliverTo({ machineId: 'mbp', recipientDeviceId: 'phone', hint: 'run_done' }))
       .toEqual({ kind: 'skipped', reason: 'no_subscription' });
+  });
+});
+
+describe('订阅端点白名单', () => {
+  test('已知推送服务放行;内网、非 https、未知域名拒绝', () => {
+    expect(checkPushEndpoint('https://fcm.googleapis.com/fcm/send/x').ok).toBe(true);
+    expect(checkPushEndpoint('https://web.push.apple.com/x').ok).toBe(true);
+    expect(checkPushEndpoint('https://updates.push.services.mozilla.com/x').ok).toBe(true);
+    expect(checkPushEndpoint('https://wns2-sg2p.notify.windows.com/x').ok).toBe(true);
+
+    expect(checkPushEndpoint('http://fcm.googleapis.com/x').ok).toBe(false);
+    expect(checkPushEndpoint('https://127.0.0.1/x').ok).toBe(false);
+    expect(checkPushEndpoint('https://192.168.1.5/x').ok).toBe(false);
+    expect(checkPushEndpoint('https://[::1]/x').ok).toBe(false);
+    expect(checkPushEndpoint('https://evil.example/x').ok).toBe(false);
+    expect(checkPushEndpoint('not a url').ok).toBe(false);
+  });
+
+  test('env 追加的白名单后缀生效', () => {
+    expect(checkPushEndpoint('https://push.example.com/x').ok).toBe(false);
+    expect(checkPushEndpoint('https://push.example.com/x', ['push.example.com']).ok).toBe(true);
+    // 后缀匹配只认点在前的子域,不能拿 example.com 冒充别的子串
+    expect(checkPushEndpoint('https://notpush.example.com/x', ['push.example.com']).ok).toBe(false);
+  });
+
+  test('subscribe 被拒时不落库;库里的旧端点投递前再拦一次', () => {
+    const store = new Store(':memory:');
+    const svc = makeService({ store });
+    const rejected = svc.subscribe('phone', { ...SUB, endpoint: 'https://evil.example/x' });
+    expect(rejected.ok).toBe(false);
+    expect(store.getPushSubscription('phone')).toBeNull();
+
+    // 白名单生效前写进来的行:投递时复查
+    store.upsertPushSubscription(
+      { deviceId: 'phone', endpoint: 'https://evil.example/x', p256dh: SUB.keys.p256dh, auth: SUB.keys.auth },
+      1,
+    );
+    expect(svc.deliverTo({ machineId: 'mbp', recipientDeviceId: 'phone', hint: 'run_done' }))
+      .toEqual({ kind: 'skipped', reason: 'untrusted_endpoint' });
+  });
+});
+
+describe('可见性:只有在线且可见才抑制', () => {
+  test('在线 + visible=false 照推;未上报时沿用在线抑制', () => {
+    const online = new Set<string>(['phone']);
+    const svc = makeService({ online });
+    svc.subscribe('phone', SUB);
+
+    // 老客户端:没上报过可见性 → 在线即抑制
+    expect(svc.deliverTo({ machineId: 'mbp', recipientDeviceId: 'phone', sessionId: 's1', hint: 'run_done' }))
+      .toEqual({ kind: 'skipped', reason: 'device_online' });
+
+    // 锁屏/切后台:连接还在,但明确不可见 → 该推
+    svc.setVisibility('phone', false);
+    expect(svc.deliverTo({ machineId: 'mbp', recipientDeviceId: 'phone', sessionId: 's1', hint: 'run_done' }).kind)
+      .toBe('sent');
+
+    // 回到前台 → 恢复抑制
+    svc.setVisibility('phone', true);
+    expect(svc.deliverTo({ machineId: 'mbp', recipientDeviceId: 'phone', sessionId: 's2', hint: 'run_done' }))
+      .toEqual({ kind: 'skipped', reason: 'device_online' });
+  });
+});
+
+describe('去抖只记成功投递', () => {
+  test('5xx 不占窗口;成功后才抑制同键', async () => {
+    const fetch = new FakeFetch();
+    const svc = makeService({ fetch });
+    svc.subscribe('phone', SUB);
+    const event = { machineId: 'mbp', recipientDeviceId: 'phone', sessionId: 's1', hint: 'permission_pending' } as const;
+
+    fetch.respondWith = () => ({ status: 500 });
+    expect(svc.deliverTo(event).kind).toBe('sent');
+    await new Promise((r) => setTimeout(r, 10)); // 等失败的投递落地
+
+    // 失败没有占用窗口:同样的事件立刻还能推
+    fetch.respondWith = () => ({ status: 201 });
+    expect(svc.deliverTo(event).kind).toBe('sent');
+    await new Promise((r) => setTimeout(r, 10)); // 等成功的投递落地
+
+    // 成功之后才进入 30s 去抖
+    expect(svc.deliverTo(event)).toEqual({ kind: 'skipped', reason: 'deduped' });
   });
 });
 
@@ -301,6 +387,33 @@ describe('hub:push.* 帧接线', () => {
       { type: 'push.mute', sessionIds: ['a'] },
     );
     expect(rejected.kind).toBe('rejected');
+  });
+
+  test('push.visibility 无回执,但影响在线抑制', () => {
+    const store = new Store(':memory:');
+    const svc = makeService({ store, online: new Set(['phone']) });
+    const { hub } = makeHub({ webpush: svc });
+    svc.subscribe('phone', SUB);
+    const ws = new FakeSocket();
+    const outcome = hub.handleFrame(clientConn(ws), { type: 'push.visibility', visible: false });
+    expect(outcome.kind).toBe('ignored');
+    expect(ws.sent.length).toBe(0); // 可见性无回执
+    expect(svc.deliverTo({ machineId: 'mbp', recipientDeviceId: 'phone', sessionId: 's1', hint: 'run_done' }).kind)
+      .toBe('sent');
+  });
+
+  test('push.subscribe 端点不在白名单:回执 ok:false 并带原因', () => {
+    const store = new Store(':memory:');
+    const svc = makeService({ store });
+    const { hub } = makeHub({ webpush: svc });
+    const ws = new FakeSocket();
+    hub.handleFrame(clientConn(ws), {
+      type: 'push.subscribe', endpoint: 'https://evil.example/x', keys: SUB.keys,
+    });
+    const ack = ws.frame(0) as { type: string; ok: boolean; error?: string };
+    expect(ack.ok).toBe(false);
+    expect(ack.error).toBeTruthy();
+    expect(store.getPushSubscription('phone')).toBeNull();
   });
 
   test('未启用 webpush 的 hub:订阅回执 ok:false,client 上线不下发 config', () => {

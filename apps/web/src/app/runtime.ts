@@ -129,7 +129,12 @@ export async function boot(): Promise<void> {
     elector.start();
 
     document.addEventListener('visibilitychange', () => {
-      if (document.visibilityState === 'visible') runtimeState.getState().client?.wake();
+      const client = runtimeState.getState().client;
+      if (document.visibilityState === 'visible') client?.wake();
+      // 前后台状态也报给中转：锁屏/切后台时不该做在线抑制
+      if (client) {
+        void import('../lib/push.ts').then((m) => m.syncPushVisibility(client));
+      }
     });
     // beforeunload 在移动端后台被杀时不触发，pagehide 更可靠；两个都挂，flush 幂等
     const flush = (): void => runtimeState.getState().client?.flushSaves();

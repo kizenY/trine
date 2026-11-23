@@ -208,6 +208,7 @@ export async function startServer(
     isDeviceOnline: (deviceId) =>
       registry.allClients().some((c) => c.deviceId === deviceId),
     rawAlias: config.pushAliases,
+    allowedHostSuffixes: config.pushAllowedHosts.split(','),
     // env 缺省时服务用兜底 subject;iOS 部署应配 TRINE_VAPID_SUBJECT(见 config)
     ...(config.vapidSubject ? { vapidSubject: config.vapidSubject } : {}),
     log: (line) => console.info(line),

@@ -177,9 +177,24 @@ export async function disablePush(client: TrineClient | null): Promise<void> {
   } catch { /* 同上 */ }
 }
 
-/** 启动时的再上报：静音名单总是报；开关开着再把当前订阅重报一遍（幂等,收敛两端漂移） */
+/**
+ * 上报页面前后台状态：在线抑制只看「在线且可见」。
+ * visibilitychange 时调用；offline/从未上报的老客户端沿用「在线即抑制」。
+ */
+export function syncPushVisibility(client: TrineClient, visible?: boolean): void {
+  try {
+    // 无 document（非浏览器/测试环境）时按可见算，保持原行为
+    const state = visible ?? (typeof document === 'undefined' ? true : !document.hidden);
+    client.sendPushVisibility(state);
+  } catch {
+    // 推送是旁路
+  }
+}
+
+/** 启动时的再上报：静音名单与可见性总是报；开关开着再把当前订阅重报一遍（幂等,收敛两端漂移） */
 export async function resyncPushOnBoot(client: TrineClient): Promise<void> {
   syncPushMutes(client);
+  syncPushVisibility(client);
   if (!pushSupported() || !pushWanted() || Notification.permission !== 'granted') return;
   try {
     const reg = await ensureSW();

@@ -431,6 +431,21 @@ export const PushMuteSchema = z.object({
 });
 
 /**
+ * client → server：页面前后台 / 锁屏状态。
+ *
+ * 在线抑制的含义是「人在看屏幕，别再响」；但 iOS 切后台或锁屏后 WebSocket
+ * 可能半死到 `idleTimeoutMs` 才被清，这段时间的 run_done / 权限请求会被误判
+ * 成「人在线」而吞掉，正是需要通知的主场景。客户端把可见性报上来，中转把
+ * 「在线且不可见」当作可以推。
+ *
+ * † 判据：一个布尔值，不含任何业务内容；老客户端不上报时沿用「在线即抑制」。
+ */
+export const PushVisibilitySchema = z.object({
+  type: z.literal('push.visibility'),
+  visible: z.boolean(),
+});
+
+/**
  * server → client：client 连接建立后立刻下发（没启用 Web Push 的部署不发）。
  * 告知本服务的 VAPID 公钥，client 拿它 `pushManager.subscribe`。
  * VAPID 公钥本就是公开值（每个订阅者都要拿到），不构成泄露。
@@ -468,6 +483,7 @@ export const TransportFrameSchema = z.discriminatedUnion('type', [
   PushSubscribeSchema,
   PushUnsubscribeSchema,
   PushMuteSchema,
+  PushVisibilitySchema,
   PushConfigSchema,
   PushSubscribedSchema,
 ]);

@@ -932,6 +932,14 @@ export class TrineClient {
   }
 
   /**
+   * Web Push：上报页面前后台状态。服务端据此决定在线抑制——只有「在线且
+   * 可见」才算人在看。无回执：后到的覆盖先到的。
+   */
+  sendPushVisibility(visible: boolean): boolean {
+    return this.#connection?.send({ type: 'push.visibility', visible }) ?? false;
+  }
+
+  /**
    * 撤回 agent 端排队中的消息（`input.recall`）。
    *
    * 条目先进「撤回中…」：成功的回执是 `input.cancelled(recalled)`（条目删除，`edit` 的

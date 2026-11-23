@@ -166,6 +166,7 @@ export class RelayHub<T extends Sendable = Sendable> {
       case 'push.subscribe':
       case 'push.unsubscribe':
       case 'push.mute':
+      case 'push.visibility':
         return this.handlePushSubs(conn, frame);
       case 'pair.begin':
       case 'pair.confirm':
@@ -185,31 +186,45 @@ export class RelayHub<T extends Sendable = Sendable> {
   }
 
   /**
-   * push.subscribe / push.unsubscribe / push.mute：client 的 Web Push 订阅与
-   * 会话静音名单。deviceId 一律取连接身份（token 换回的），帧上没有自报字段可骗。
+   * push.subscribe / push.unsubscribe / push.mute / push.visibility：client 的
+   * Web Push 订阅、会话静音名单与页面前后台状态。deviceId 一律取连接身份
+   * （token 换回的），帧上没有自报字段可骗。
    * 仅 client 角色可发——agent 机器没有「收通知的浏览器」。
    */
   private handlePushSubs(
     conn: Conn<T>,
-    frame: Extract<TransportFrame, { type: 'push.subscribe' | 'push.unsubscribe' | 'push.mute' }>,
+    frame: Extract<
+      TransportFrame,
+      { type: 'push.subscribe' | 'push.unsubscribe' | 'push.mute' | 'push.visibility' }
+    >,
   ): HandleOutcome {
     if (conn.role !== 'client') {
       return { kind: 'rejected', reason: 'push_sub_from_agent' };
     }
     const webpush = this.deps.webpush;
     if (!webpush) {
-      // 该部署没启用 Web Push（理论上不会发生：装配总造服务；留作测试兜底）
-      this.send(conn, encodeTransportFrame({
-        type: 'push.subscribed', ok: false, error: '本服务未启用 Web Push',
-      }));
+      // 该部署没启用 Web Push（理论上不会发生：装配总造服务；留作测试兜底）。
+      // 只有订阅类帧有回执；静音/可见性本就无回执，静默忽略
+      if (frame.type === 'push.subscribe' || frame.type === 'push.unsubscribe') {
+        this.send(conn, encodeTransportFrame({
+          type: 'push.subscribed', ok: false, error: '本服务未启用 Web Push',
+        }));
+      }
       return { kind: 'ignored', reason: 'webpush_disabled' };
     }
     if (frame.type === 'push.subscribe') {
-      webpush.subscribe(conn.deviceId, frame);
-      this.send(conn, encodeTransportFrame({ type: 'push.subscribed', ok: true }));
+      const outcome = webpush.subscribe(conn.deviceId, frame);
+      this.send(conn, encodeTransportFrame(
+        outcome.ok
+          ? { type: 'push.subscribed', ok: true }
+          : { type: 'push.subscribed', ok: false, error: outcome.error },
+      ));
     } else if (frame.type === 'push.mute') {
       // 静音名单无回执：全量覆盖幂等，客户端重连重报即收敛
       webpush.setMutes(conn.deviceId, frame.sessionIds);
+    } else if (frame.type === 'push.visibility') {
+      // 可见性无回执（同静音）：每次都报，后到的覆盖先到的
+      webpush.setVisibility(conn.deviceId, frame.visible);
     } else {
       webpush.unsubscribe(conn.deviceId);
       this.send(conn, encodeTransportFrame({ type: 'push.subscribed', ok: true }));
@@ -882,6 +897,9 @@ export class RelayHub<T extends Sendable = Sendable> {
   /** client 上线：把全部已知机器的在线状态与排队数推一遍 */
   onClientOnline(conn: Conn<T>): void {
     const now = this.now();
+    // 新连接默认按「可见」算：客户端随后会按真实状态上报 hidden；
+    // 不清掉上一次连接残留的 hidden，会让重连后多推一阵
+    if (conn.role === 'client') this.deps.webpush?.setVisibility(conn.deviceId, true);
     // Web Push 公钥随首次连接下发（没启用的部署不发，client 据此隐藏通知开关）
     const vapid = this.deps.webpush?.vapidPublicKey;
     if (vapid) {
