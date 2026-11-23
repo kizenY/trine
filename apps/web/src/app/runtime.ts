@@ -91,10 +91,25 @@ export async function boot(): Promise<void> {
       },
       onClient: (client) => {
         runtimeState.setState({ client });
-        // Web Push 启动重报：本地开关开着就把当前订阅重报一遍（幂等收敛漂移）。
-        // fire-and-forget——推送是旁路，拖不得启动
-        void import('../lib/push.ts').then((m) => m.resyncPushOnBoot(client));
-        return bindClient(store, client);
+        // Web Push 启动/重连重报：本地开关开着就把当前订阅重报一遍（幂等收敛漂移）。
+        // 不能直接在 onClient 里报——lifecycle 是先 onClient 后 start()，这时连接
+        // 还没 open，send 直接回落 false，两次上报都会静默失败。挂到连接的 open
+        // 上：首次连上和每次重连各报一次，endpoint 轮换 / 服务端库重建 / 离线改
+        // 过静音这些漂移都能收敛。fire-and-forget——推送是旁路，拖不得启动
+        const resync = (): void => {
+          void import('../lib/push.ts')
+            .then((m) => m.resyncPushOnBoot(client))
+            .catch(() => { /* 推送是旁路，失败不值得打扰 */ });
+        };
+        if (client.connection.status === 'open') resync();
+        const offConnection = client.on('connection', (snapshot) => {
+          if (snapshot.status === 'open') resync();
+        });
+        const unbind = bindClient(store, client);
+        return () => {
+          offConnection();
+          unbind();
+        };
       },
       onClientGone: () => runtimeState.setState({ client: null }),
       onError: (message) => runtimeState.setState({ phase: 'error', error: message, client: null }),

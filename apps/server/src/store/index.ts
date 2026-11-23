@@ -196,13 +196,16 @@ export class Store {
     }));
   }
 
-  /** 吊销设备：同时清掉其全部 token，已建立的连接由调用方负责断开 */
+  /** 吊销设备：同时清掉其全部 token 与推送登记，已建立的连接由调用方负责断开 */
   revokeDevice(deviceId: string, now = Date.now()): void {
     this.db.transaction(() => {
       this.db
         .query('UPDATE devices SET revoked_at = ? WHERE device_id = ?')
         .run(now, deviceId);
       this.db.query('DELETE FROM auth_tokens WHERE device_id = ?').run(deviceId);
+      // 推送登记不跟着吊销走的话，被吊销的设备在名册清空之前还会继续收通知
+      this.db.query('DELETE FROM push_subscriptions WHERE device_id = ?').run(deviceId);
+      this.db.query('DELETE FROM push_mutes WHERE device_id = ?').run(deviceId);
     })();
   }
 

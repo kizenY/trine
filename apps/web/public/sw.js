@@ -30,12 +30,15 @@ async function sessionTitle(machineId, sessionId) {
       req.onupgradeneeded = () => req.transaction.abort(); // 没建过库=没有数据
     });
     try {
-      return await new Promise((resolve, reject) => {
+      // 必须先 await 出文档再取字段：`await p?.sessions` 的 await 优先级低于成员
+      // 访问，那样读到的是 Promise 本身，标题恒为 null。
+      const doc = await new Promise((resolve, reject) => {
         const tx = db.transaction('docs', 'readonly');
         const req = tx.objectStore('docs').get('machine:' + machineId);
         req.onsuccess = () => resolve(req.result);
         req.onerror = () => reject(req.error);
-      })?.sessions?.[sessionId]?.title ?? null;
+      });
+      return doc?.sessions?.[sessionId]?.title ?? null;
     } finally {
       db.close();
     }

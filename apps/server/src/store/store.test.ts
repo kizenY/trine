@@ -123,13 +123,21 @@ describe('设备表', () => {
     expect(store.getDevice('mbp')?.signPubKey).toBe('PK-original');
   });
 
-  test('吊销设备同时清掉其 token', () => {
+  test('吊销设备同时清掉其 token 与推送登记', () => {
     store.registerDevice('mbp', 'agent', 'PK', 100);
     store.putToken('hash1', 'mbp', 100, 999_999_999_999);
+    store.upsertPushSubscription(
+      { deviceId: 'mbp', endpoint: 'https://push.example/1', p256dh: 'P', auth: 'A' },
+      100,
+    );
+    store.setPushMutes('mbp', ['s1'], 100);
     expect(store.lookupToken('hash1', 200)).not.toBeNull();
     store.revokeDevice('mbp', 300);
     expect(store.getDevice('mbp')?.revokedAt).toBe(300);
     expect(store.lookupToken('hash1', 400)).toBeNull();
+    // 推送登记跟着吊销一起清:否则名册里还有这行就会继续往它推
+    expect(store.getPushSubscription('mbp')).toBeNull();
+    expect(store.isPushMuted('mbp', 's1')).toBe(false);
   });
 
   test('listDevices 可按角色过滤', () => {

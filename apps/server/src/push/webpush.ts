@@ -71,6 +71,31 @@ const URGENCY_BY_HINT: Record<PushHint, 'high' | 'normal'> = {
   run_error: 'normal',
 };
 
+/**
+ * 提醒类 hint：需要人当场处理的，和「跑完了」这类结果通知分开折叠。
+ *
+ * 同一会话里「等待权限确认」是待办，「任务完成」是结果；一条顶掉另一条会让
+ * 最该处理的那条消失，所以两类用不同 tag。
+ */
+const PENDING_HINTS: ReadonlySet<PushHint> = new Set<PushHint>([
+  'permission_pending',
+  'question_pending',
+  'plan_pending',
+]);
+
+/**
+ * 通知 tag：机器 + 会话 + 类别。
+ *
+ * tag 相同会替换旧通知（这是 SW 折叠的机制），所以必须细到会话——否则同机器
+ * 的会话 B 会把会话 A 的待确认提醒顶掉。没有 sessionId 的机器级事件退回
+ * 机器标识（与 Bark 的 group 一致）。
+ */
+export function pushTag(event: { machineId: string; sessionId?: string; hint: PushHint }, label: string): string {
+  if (event.sessionId === undefined) return label;
+  const kind = PENDING_HINTS.has(event.hint) ? 'pending' : 'result';
+  return `${label}|${event.sessionId}|${kind}`;
+}
+
 /** 传给 SW 的 payload（RFC 8291 加密，推送服务读不到） */
 interface PushPayload {
   title: string;
@@ -101,7 +126,7 @@ export interface WebPushDeps {
 
 export type DeliverOutcome =
   | { kind: 'sent' }
-  | { kind: 'skipped'; reason: 'no_subscription' | 'device_online' | 'muted' | 'deduped' | 'disabled' }
+  | { kind: 'skipped'; reason: 'no_subscription' | 'device_online' | 'revoked' | 'muted' | 'deduped' | 'disabled' }
   | { kind: 'failed'; status?: number };
 
 export class WebPushService {
@@ -189,6 +214,11 @@ export class WebPushService {
   }): DeliverOutcome {
     if (this.vapidPublicKey === null) return { kind: 'skipped', reason: 'disabled' };
 
+    // 吊销检查放在最前：吊销行还在（没删设备）也不该继续收通知
+    if (this.#store.getDevice(event.recipientDeviceId)?.revokedAt != null) {
+      return { kind: 'skipped', reason: 'revoked' };
+    }
+
     const sub = this.#store.getPushSubscription(event.recipientDeviceId);
     if (sub === null) return { kind: 'skipped', reason: 'no_subscription' };
 
@@ -222,7 +252,7 @@ export class WebPushService {
     const payload: PushPayload = {
       title: message.title,
       body: message.body,
-      tag: message.group,
+      tag: pushTag(event, message.group),
       machineId: event.machineId,
       ...(event.sessionId !== undefined ? { sessionId: event.sessionId } : {}),
     };

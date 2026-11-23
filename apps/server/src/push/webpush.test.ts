@@ -9,7 +9,7 @@ import { describe, expect, test } from 'bun:test';
 import { generateVAPIDKeys } from 'web-push';
 import { loadConfig, type ServerConfig } from '../config.ts';
 import { Store } from '../store/index.ts';
-import { WebPushService } from './webpush.ts';
+import { WebPushService, pushTag } from './webpush.ts';
 import { RelayHub } from '../ws/hub.ts';
 import { ConnectionRegistry, type Conn, type Sendable } from '../ws/registry.ts';
 
@@ -169,6 +169,38 @@ describe('deliverTo:按设备定向的抑制与去抖', () => {
     expect(fetch.calls.length).toBe(1);
     expect(svc.deliverTo({ machineId: 'mbp', recipientDeviceId: 'phone', hint: 'run_done' }))
       .toEqual({ kind: 'skipped', reason: 'no_subscription' });
+  });
+});
+
+describe('通知 tag:折叠范围细到会话与类别', () => {
+  test('同机器不同会话不互相覆盖;同一会话 pending 与 result 分开', () => {
+    const label = 'mbp';
+    const aPending = pushTag({ machineId: 'm', sessionId: 's1', hint: 'permission_pending' }, label);
+    const bDone = pushTag({ machineId: 'm', sessionId: 's2', hint: 'run_done' }, label);
+    const aDone = pushTag({ machineId: 'm', sessionId: 's1', hint: 'run_done' }, label);
+    expect(aPending).not.toBe(bDone); // 会话 B 的提醒不能顶掉会话 A 的
+    expect(aPending).not.toBe(aDone); // 待确认不能被后续完成顶掉
+    // 同类同会话仍然折叠(去抖之外的重复提醒不堆楼)
+    expect(pushTag({ machineId: 'm', sessionId: 's1', hint: 'question_pending' }, label)).toBe(aPending);
+    // 机器级事件没有会话维度,退回机器标识
+    expect(pushTag({ machineId: 'm', hint: 'run_done' }, label)).toBe(label);
+  });
+});
+
+describe('吊销设备', () => {
+  test('revokeDevice 一并清掉订阅与静音,投递返回 revoked', () => {
+    const store = new Store(':memory:');
+    store.registerDevice('phone', 'client', 'PK', 1);
+    const svc = makeService({ store });
+    svc.subscribe('phone', SUB);
+    svc.setMutes('phone', ['s1']);
+    store.revokeDevice('phone', 2);
+    expect(store.getPushSubscription('phone')).toBeNull();
+    expect(store.isPushMuted('phone', 's1')).toBe(false);
+    // 即便订阅行曾被其他路径写回,投递前的吊销检查也会拦住
+    svc.subscribe('phone', SUB);
+    expect(svc.deliverTo({ machineId: 'mbp', recipientDeviceId: 'phone', hint: 'run_done' }))
+      .toEqual({ kind: 'skipped', reason: 'revoked' });
   });
 });
 

@@ -58,3 +58,4 @@ Thumbs.db
 
 # Per-machine agent launcher / watchdog (holds relay URL and paths)
 ensure-agent.ps1
+run-watchdog.vbs
